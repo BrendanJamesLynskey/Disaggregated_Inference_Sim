@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "disagg-sim"
+version = "0.1.0"
+description = "A SimPy discrete-event simulator for prefill/decode-disaggregated LLM inference, with latency, utilisation and hot-spot metrics."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Educational use" }
+authors = [{ name = "Brendan Lynskey" }]
+
+dependencies = [
+    "simpy>=4.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "hypothesis>=6.0",
+]
+
+[project.scripts]
+disagg-sim = "disagg_sim.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -q"
+pythonpath = ["src"]
