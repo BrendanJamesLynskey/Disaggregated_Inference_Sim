@@ -26,8 +26,11 @@
     function derive(m) {
         const hd = m.d / m.h, kv = m.kvh * hd;
         const ppl = 2 * m.d * m.d + 2 * m.d * kv + 3 * m.d * m.ff;
+        // weightBytes: resident (both vocab tables); weightStream: read by every step (layers +
+        // LM head); embRow: one embedding row, read per token looked up (corrected 2026-10-03)
         return { ...m, params: m.L * ppl + 2 * m.V * m.d, matmul: m.L * ppl + m.V * m.d,
-                 weightBytes: 2 * (m.L * ppl + 2 * m.V * m.d), kvTok: 2 * m.L * kv * 2 };
+                 weightBytes: 2 * (m.L * ppl + 2 * m.V * m.d), weightStream: 2 * (m.L * ppl + m.V * m.d),
+                 embRow: 2 * m.d, kvTok: 2 * m.L * kv * 2 };
     }
 
     const cbrt = x => Math.sign(x) * Math.pow(Math.abs(x), 1 / 3);
@@ -65,12 +68,14 @@
             prefill(lens) {
                 let tok = 0, fl = 0;
                 for (const s of lens) { tok += s; fl += 2 * model.L * model.d * s * (s + 1); }
-                return t(2 * model.matmul * tok + fl, model.weightBytes + tok * model.kvTok);
+                return t(2 * model.matmul * tok + fl, model.weightStream + tok * model.embRow + tok * model.kvTok);
             },
             decode(ctx) {
                 let c = 0; for (const x of ctx) c += x;
                 const b = ctx.length;
-                return t(2 * model.matmul * b + 4 * model.L * model.d * c, model.weightBytes + (c + b) * model.kvTok);
+                // each new token attends to its context and to itself: c + b positions
+                return t(2 * model.matmul * b + 4 * model.L * model.d * (c + b),
+                         model.weightStream + b * model.embRow + (c + b) * model.kvTok);
             },
         };
     }
@@ -241,13 +246,15 @@
     }
 
     // ── metrics (mirror of metrics.py) ─────────────────────────────────
-    function percentile(xs, p) {
-        if (!xs.length) return NaN;
-        const s = Float64Array.from(xs).sort(), k = (s.length - 1) * p / 100, lo = Math.floor(k), hi = Math.ceil(k);
+    function pctSorted(s, p) {
+        if (!s.length) return NaN;
+        const k = (s.length - 1) * p / 100, lo = Math.floor(k), hi = Math.ceil(k);
         return s[lo] + (s[hi] - s[lo]) * (k - lo);
     }
+    const percentile = (xs, p) => pctSorted(Float64Array.from(xs).sort(), p);
     const mean = xs => xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : NaN;
-    const dist = xs => ({ mean: mean(xs), p50: percentile(xs, 50), p90: percentile(xs, 90), p99: percentile(xs, 99) });
+    const dist = xs => { const s = Float64Array.from(xs).sort();     // sort once for all three
+                         return { mean: mean(xs), p50: pctSorted(s, 50), p90: pctSorted(s, 90), p99: pctSorted(s, 99) }; };
     function stages(r) {
         const hand = r.kvReady !== null ? r.kvReady : r.firstToken;
         const s = { prefill_queue: r.prefillStart - r.arrival, prefill: r.firstToken - r.prefillStart,

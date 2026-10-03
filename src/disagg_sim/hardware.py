@@ -60,7 +60,28 @@ class ModelSpec:
 
     @cached_property
     def weight_bytes_total(self) -> float:
+        """Bytes the weights occupy in memory (residency). Not what one step reads: see below."""
         return self.params * self.weight_bytes
+
+    @cached_property
+    def weight_bytes_streamed(self) -> float:
+        """Weights every forward pass reads in full: all layers plus the LM head."""
+        return self.matmul_params * self.weight_bytes
+
+    @cached_property
+    def embedding_row_bytes(self) -> float:
+        return self.d_model * self.weight_bytes
+
+    def weight_bytes_read(self, tokens: int) -> float:
+        """Weight traffic of one forward pass over ``tokens`` tokens.
+
+        The layers and the LM head are read in full; the input embedding table is a
+        lookup, so only the ``tokens`` rows actually indexed are read. (Before
+        2026-10-03 every step was charged the whole table, ``weight_bytes_total``:
+        1.05 GB too much per step for Llama-3-8B. An operator trace of the real
+        model, in Torch_Sim_Frontend, found it.)
+        """
+        return self.weight_bytes_streamed + tokens * self.embedding_row_bytes
 
     @cached_property
     def kv_bytes_per_token(self) -> float:
@@ -262,10 +283,13 @@ class CostModel:
         """One prefill step over whole prompts (no chunking)."""
         m = self.model
         tokens = sum(prompt_lens)
+        # The LM head is charged for every prompt token, as a plain forward pass computes
+        # (HF transformers by default, and Torch_Sim_Frontend's trace of it); serving
+        # engines that keep only the last position's logits do less.
         flops = 2 * m.matmul_params * tokens
-        # causal attention: QK^T and AV, each 2*d*c FLOPs at position c
+        # causal attention: QK^T and AV, each 2*d*c FLOPs at position c (diagonal included)
         flops += sum(2 * m.n_layers * m.d_model * s * (s + 1) for s in prompt_lens)
-        nbytes = m.weight_bytes_total + tokens * m.kv_bytes_per_token
+        nbytes = m.weight_bytes_read(tokens) + tokens * m.kv_bytes_per_token
         return self._time(flops, nbytes)
 
     def decode(self, context_lens: list[int]) -> StepCost:
@@ -274,10 +298,14 @@ class CostModel:
 
     def decode_sum(self, ctx: int, batch: int) -> StepCost:
         """Decode cost depends only on the batch size and the *total* context, so a
-        caller that keeps a running sum avoids an O(batch) pass per step."""
+        caller that keeps a running sum avoids an O(batch) pass per step.
+
+        ``ctx`` is the cached context; each new token attends to it *and to itself*,
+        hence ``ctx + batch`` positions (the self term was missing before 2026-10-03).
+        """
         m = self.model
-        flops = 2 * m.matmul_params * batch + 4 * m.n_layers * m.d_model * ctx
-        nbytes = m.weight_bytes_total + (ctx + batch) * m.kv_bytes_per_token
+        flops = 2 * m.matmul_params * batch + 4 * m.n_layers * m.d_model * (ctx + batch)
+        nbytes = m.weight_bytes_read(batch) + (ctx + batch) * m.kv_bytes_per_token
         return self._time(flops, nbytes)
 
     def with_devices(self, n: int) -> "CostModel":

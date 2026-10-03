@@ -8,7 +8,9 @@ The tests are layered the way a pre-silicon verification plan would be:
 4. behaviour – the qualitative effects the model exists to show
 """
 
+import json
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -49,7 +51,41 @@ def test_decode_is_memory_bound_and_prefill_compute_bound():
 def test_decode_step_is_roughly_weights_over_bandwidth():
     cm = CostModel(L8B, H100, step_overhead=0.0)
     t = cm.decode([1]).time
-    assert t == pytest.approx(L8B.weight_bytes_total / (H100.mem_bw * H100.bw_eff), rel=0.01)
+    assert t == pytest.approx(L8B.weight_bytes_read(1) / (H100.mem_bw * H100.bw_eff), rel=0.01)
+
+
+def test_step_weight_traffic_reads_embedding_rows_not_the_table():
+    # Layers + LM head are read in full every step; the embedding table only by the rows looked up.
+    per_layer = 2 * 4096 * 4096 + 2 * 4096 * 1024 + 3 * 4096 * 14336
+    streamed = (32 * per_layer + 128256 * 4096) * 2
+    assert L8B.weight_bytes_streamed == streamed == 15_009_316_864
+    assert L8B.weight_bytes_read(16) == streamed + 16 * 4096 * 2
+    # Residency still holds both tables: the difference is the input embedding, 1.05 GB.
+    assert L8B.weight_bytes_total - L8B.weight_bytes_streamed == 128256 * 4096 * 2 == 1_050_673_152
+    cm = CostModel(L8B, H100)
+    assert cm.decode([1000, 2000]).bytes == streamed + 2 * 8192 + (3000 + 2) * 131072
+    assert cm.prefill([300, 200]).bytes == streamed + 500 * 8192 + 500 * 131072
+
+
+def test_decode_attention_includes_the_new_token_itself():
+    cm = CostModel(L8B, H100)
+    # Each new token attends to its cached context and to itself: ctx + batch positions.
+    assert cm.decode([1000, 2000]).flops == 2 * L8B.matmul_params * 2 + 4 * 32 * 4096 * (3000 + 2)
+    # Prefill's s(s+1) already includes the diagonal; decode of one token after a prompt of s
+    # therefore adds exactly the attention prefill would add going from s to s+1 tokens.
+    att = lambda s: 2 * 32 * 4096 * s * (s + 1)
+    assert cm.decode([512]).flops - 2 * L8B.matmul_params == att(513) - att(512)
+
+
+def test_cost_model_matches_traced_llama3_8b():
+    """Pin the closed form against an operator trace of the real model (Torch_Sim_Frontend's recorded run)."""
+    fx = json.loads((Path(__file__).parent / "fixtures" / "simfront_llama3_8b.json").read_text())
+    d = fx["decode"]
+    cm = CostModel(L8B, H100)
+    step = cm.decode([d["context"]] * d["batch"])
+    assert step.flops + d["rotary_flops"] == d["matmul_flops"]
+    assert L8B.weight_bytes_read(d["batch"]) + d["norm_weight_bytes"] == d["weight_bytes"]
+    assert 2 * L8B.matmul_params * fx["prefill"]["tokens"] == fx["prefill"]["weight_matmul_flops"]
 
 
 def test_model_that_does_not_fit_is_rejected():

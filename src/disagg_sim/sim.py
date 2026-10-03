@@ -248,7 +248,7 @@ class FastDecodeInstance(DecodeInstance):
         # Hoisted constants; no StepCost object per step.
         m, cm = self.cost.model, self.cost
         fa, fb = 2 * m.matmul_params, 4 * m.n_layers * m.d_model
-        w, kv = m.weight_bytes_total, m.kv_bytes_per_token
+        w, er, kv = m.weight_bytes_streamed, m.embedding_row_bytes, m.kv_bytes_per_token
         step_time = cm.step_time
         horizon = 16                         # adaptive look-ahead, in steps
         while True:
@@ -262,7 +262,7 @@ class FastDecodeInstance(DecodeInstance):
             k = min(self.finish_heap[0][0] - len(self.step_end) + 1, horizon)
             t, ctx, ends, steps = self.env.now, self.ctx_sum, [], []
             for _ in range(k):
-                flops, nbytes = fa * b + fb * ctx, w + (ctx + b) * kv
+                flops, nbytes = fa * b + fb * (ctx + b), w + b * er + (ctx + b) * kv
                 dt, ec, em, bound = step_time(flops, nbytes)
                 t += dt
                 ends.append(t)

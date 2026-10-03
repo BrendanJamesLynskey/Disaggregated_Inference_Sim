@@ -21,14 +21,28 @@ queueing theory.
   DVFS and per-pool power caps as a third "power roof"; average and peak power,
   joules per token and the static/compute/memory/link energy split.
 * Chrome trace-event export for [Perfetto](https://ui.perfetto.dev).
-* An **exact fast path** (2.0–2.6× faster, bit-identical results) and experiment
+* An **exact fast path** (2.0–2.5× faster, bit-identical results) and experiment
   accelerators: analytic capacity bounds, bisection search, and parallel sweeps.
 * A JavaScript port (`web/sim_engine.js`) that runs live in
   [deck 05](https://brendanjameslynskey.github.io/InfSim_05_Disaggregated_Inference/)
   and is tested to match the Python exactly.
-* 32 tests: unit, invariant, analytic (M/D/1, Little's law), behavioural,
-  property-based (Hypothesis), power and energy, and differential (fast path vs
-  baseline, JS vs Python).
+* 36 tests: unit, invariant, analytic (M/D/1, Little's law), behavioural,
+  property-based (Hypothesis), power and energy, differential (fast path vs
+  baseline, JS vs Python), and the cost model pinned against an operator trace
+  of the real Llama-3-8B.
+* Every number below comes from [`examples/results.md`](examples/results.md),
+  written by `examples/results.py`.
+
+> **Cost model corrected on 2026-10-03.** An operator trace of the real model, in
+> [Torch_Sim_Frontend](https://github.com/BrendanJamesLynskey/Torch_Sim_Frontend), found two
+> errors. Every step was charged the whole input-embedding table (1.05 GB too much per step
+> for Llama-3-8B, 6.4% of a batch-1 decode step), where a lookup reads only one row per token.
+> And decode attention left out each new token's attention to itself (`ctx + batch`
+> positions, not `ctx`). Both are fixed in Python, in the JavaScript port and in the
+> [Rust port](https://github.com/BrendanJamesLynskey/Rust_DES_Kernel). Every table here was
+> regenerated: decode steps are 1–6% shorter, decode is still memory-bound, and no hot-spot,
+> SLO verdict, power-bound flag or J/token ranking changed. `examples/results.md` has the
+> before/after figures, rerun on the pre-fix commit.
 
 ---
 
@@ -38,7 +52,7 @@ queueing theory.
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .[dev]
-pytest                                   # 32 tests, about ten seconds
+pytest                                   # 36 tests, about ten seconds
 
 disagg-sim                               # one disaggregated run (70B, 4xH100 per instance)
 disagg-sim --compare                     # colocated vs disaggregated, same request stream
@@ -50,13 +64,14 @@ disagg-sim --dvfs --decode-power-cap 250 # energy savings that cost (almost) no 
 disagg-sim --power-cap 400 --dvfs        # cap everything: watch TTFT pay for it
 
 python examples/benchmark_acceleration.py   # measure every acceleration technique
+python examples/results.py               # regenerate examples/results.md (every quoted number)
 ```
 
 Example report (`disagg-sim --prefill 2 --rate 6 --link eth-25g`):
 
 ```
 utilisation  prefill-0 47%  prefill-1 13%  decode-0 100%  kv-link 96%
-where time goes  prefill 1%  kv_wait 80%  kv_transfer 1%  decode 18%
+where time goes  prefill 1%  kv_wait 81%  kv_transfer 1%  decode 18%
 hot-spot     stage=kv_wait -> kv-link (busy 96%)   busy>90%: decode-0, kv-link
 ```
 
@@ -75,28 +90,29 @@ hot-spot     stage=kv_wait -> kv-link (busy 96%)   busy>90%: decode-0, kv-link
 | `src/disagg_sim/cli.py` | The `disagg-sim` command |
 | `web/sim_engine.js` | The browser port used in the deck |
 | `examples/benchmark_acceleration.py` | Speed and exactness of each acceleration technique |
+| `examples/results.py` | Regenerates `examples/results.md`, the source of every quoted number (with before/after for the 2026-10-03 correction) |
 | `tests/` | The verification ladder |
 
-### Measured acceleration (8-core laptop, Python 3.12, SimPy 4.1, power model on)
+### Measured acceleration (i7-3770, 8 threads, Python 3.12, SimPy 4.1, power model on)
 
 | Technique | Result |
 |-----------|--------|
-| One event per batch step (not per token / per layer) | 36.6k events instead of 506k / 2.9M |
-| Fast path: incremental state + lazy bookkeeping + macro-steps | 2.0–2.6× faster, bit-identical |
-| Probe sampling 5 ms → off | 1.9× faster |
-| Parallel sweep, 8 processes | 1.9× (short runs; overhead-bound) |
-| Analytic bracket + bisection vs 40-point grid | 7 runs instead of 40, 6.5× less time |
+| One event per batch step (not per token / per layer) | 37.1k events instead of 506k / 3.0M |
+| Fast path: incremental state + lazy bookkeeping + macro-steps | 2.0–2.5× faster, bit-identical |
+| Probe sampling 5 ms → off | 2.1× faster |
+| Parallel sweep, 8 processes | 1.6× (short runs; overhead-bound) |
+| Analytic bracket + bisection vs 40-point grid | 7 runs instead of 40, 6.4× less time |
 
 ### Power and energy (Llama-3-70B, 4×H100 per instance, 4 req/s)
 
 | Configuration | TTFT p99 | TPOT p99 | SLO met | Avg power | J / token |
 |---------------|----------|----------|---------|-----------|-----------|
-| Colocated, 2 instances | 681 ms | 27.6 ms | 97.8% | 2,987 W | 3.09 |
-| Disaggregated 1P1D | 854 ms | 15.3 ms | 99.7% | 2,687 W | 2.77 |
-| … `--dvfs` | 854 ms | 15.3 ms | 99.7% | 2,570 W | 2.65 |
-| … `--dvfs --decode-power-cap 250` | 854 ms | 17.4 ms | 99.7% | 2,503 W | 2.60 |
-| 1P1D `--power-cap 400 --dvfs` | 1,240 ms | 15.4 ms | 95.3% | 2,190 W | 2.26 |
-| 2P1D `--power-cap 400 --dvfs` | 689 ms | 15.3 ms | 100% | 2,593 W | 2.68 |
+| Colocated, 2 instances | 630 ms | 25.9 ms | 97.8% | 2,993 W | 3.09 |
+| Disaggregated 1P1D | 854 ms | 15.2 ms | 99.7% | 2,687 W | 2.77 |
+| … `--dvfs` | 854 ms | 15.2 ms | 99.7% | 2,570 W | 2.65 |
+| … `--dvfs --decode-power-cap 250` | 854 ms | 17.2 ms | 99.7% | 2,503 W | 2.59 |
+| 1P1D `--power-cap 400 --dvfs` | 1,240 ms | 15.2 ms | 95.3% | 2,190 W | 2.26 |
+| 2P1D `--power-cap 400 --dvfs` | 689 ms | 15.1 ms | 100% | 2,593 W | 2.68 |
 
 The power coefficients in `hardware.py` are **illustrative**, chosen so prefill runs
 near the H100's 700 W TDP and decode near 300 W. Calibrate them for real hardware by

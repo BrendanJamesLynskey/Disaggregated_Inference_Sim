@@ -27,18 +27,24 @@ STAGE_OWNER = {"prefill_queue": "prefill", "prefill": "prefill", "kv_wait": "kv-
 
 def percentile(xs: list[float], p: float) -> float:
     """Linear-interpolated percentile (same convention as numpy's default)."""
-    if not xs:
+    return _percentile_sorted(sorted(xs), p)
+
+
+def _percentile_sorted(s: list[float], p: float) -> float:
+    if not s:
         return math.nan
-    s = sorted(xs)
     k = (len(s) - 1) * p / 100
     lo, hi = math.floor(k), math.ceil(k)
     return s[lo] + (s[hi] - s[lo]) * (k - lo)
 
 
 def _dist(xs: list[float]) -> dict:
-    return {"mean": fmean(xs) if xs else math.nan, "p50": percentile(xs, 50),
-            "p90": percentile(xs, 90), "p99": percentile(xs, 99),
-            "max": max(xs) if xs else math.nan}
+    # Sort once for all three percentiles (profiling showed the repeated sorts dominating
+    # summarise). The mean stays fmean of the data, so every value is unchanged.
+    s = sorted(xs)
+    return {"mean": fmean(xs) if xs else math.nan, "p50": _percentile_sorted(s, 50),
+            "p90": _percentile_sorted(s, 90), "p99": _percentile_sorted(s, 99),
+            "max": s[-1] if s else math.nan}
 
 
 def summarise(res: SimResult) -> dict:
