@@ -1,0 +1,17 @@
+{
+ "source": "Torch_Sim_Frontend examples/results.md section 4 (commit-recorded run, 2026-10-03): Llama-3-8B traced without weights by simfront",
+ "model": "llama3-8b",
+ "decode": {
+  "context": 2048,
+  "batch": 1,
+  "matmul_flops": 16083583104,
+  "rotary_flops": 128,
+  "weight_bytes": 15009857536,
+  "norm_weight_bytes": 532480
+ },
+ "prefill": {
+  "tokens": 2048,
+  "weight_matmul_flops": 30739080937472
+ },
+ "notes": "rotary_flops is the frequency outer product (2 x head_dim/2 per token) and norm_weight_bytes the RMSNorm weights ((2 x layers + 1) x d_model x 2); InfSim's closed form models neither, so the test adds them."
+}
