@@ -23,6 +23,13 @@ An operator trace of the real Llama-3-8B (Torch_Sim_Frontend) found two errors i
 * For Llama-3-8B at batch 1 the step reads 1.05 GB less (6.4% of the old figure) and adds 524,288 FLOPs.
 * Every decode step stays memory-bound: arithmetic intensity stays far below the ridge point.
 
+Weights resident against weights read by a batch-1 step, and the step-time floor that weight read sets (H100 at 80% of peak bandwidth):
+
+| Model | Resident GB | Read per step GB before | after | Floor ms before | after |
+|---|---|---|---|---|---|
+| Llama-3-8B, 1xH100 | 16.06 | 16.06 | 15.01 | 5.99 | 5.60 |
+| Llama-3-70B, 4xH100 | 141.10 | 141.10 | 139.00 | 13.16 | 12.97 |
+
 ## 2. Per-step power, Llama-3-70B on 4xH100
 
 Power per device = (static power + dynamic energy / step time) / devices; step time includes the 0.5 ms overhead.
@@ -138,25 +145,25 @@ hot-spot     stage=kv_wait -> kv-link (busy 96%)   busy>90%: decode-0, kv-link
 ```
 
 ── 1 · event abstraction (one event per batch step) ──────────────────
-simulated 511 s of serving in 0.62 s (820x real time)
+simulated 511 s of serving in 0.61 s (844x real time)
 batch-step events: 37,099   per-token events would be 505,895 (14x)   per-layer events 2,967,920 (80x)
 
 ── 2 · probe overhead (sampling period) ──────────────────────────────
-sample_dt=0.005    1.10 s
-sample_dt=0.05     0.63 s
-sample_dt=1e+09    0.53 s
+sample_dt=0.005    1.02 s
+sample_dt=0.05     0.61 s
+sample_dt=1e+09    0.55 s
 
 ── 3 · exact fast path: incremental state + lazy bookkeeping + macro-steps 
-defaults                     baseline 0.72 s   fast 0.31 s   2.4x   max |diff| 0.0e+00 s
-1k-token outputs, 1 req/s    baseline 2.14 s   fast 0.86 s   2.5x   max |diff| 0.0e+00 s
-2P2D                         baseline 0.74 s   fast 0.36 s   2.0x   max |diff| 0.0e+00 s
+defaults                     baseline 0.74 s   fast 0.35 s   2.1x   max |diff| 0.0e+00 s
+1k-token outputs, 1 req/s    baseline 2.20 s   fast 0.87 s   2.5x   max |diff| 0.0e+00 s
+2P2D                         baseline 0.72 s   fast 0.36 s   2.0x   max |diff| 0.0e+00 s
 
 ── 4 · parallel sweep (independent runs) ─────────────────────────────
-8 runs: serial 1.44 s   8 processes 0.88 s   1.6x (identical results)
+8 runs: serial 1.46 s   8 processes 0.90 s   1.6x (identical results)
 
 ── 5 · search: analytic bracket + bisection vs a fine grid ───────────
 analytic ceilings (req/s): prefill 7.49, decode 28.84, kv-link 74.45  -> bottleneck prefill
-bisection: 5.97 req/s in 7 simulations, 1.25 s
-grid:      5.75 req/s in 40 simulations, 8.04 s   (6.4x more time)
+bisection: 5.97 req/s in 7 simulations, 1.23 s
+grid:      5.75 req/s in 40 simulations, 7.96 s   (6.5x more time)
 ```
 

@@ -78,6 +78,13 @@ def collect() -> dict:
         steps[key] = {"flops": s.flops, "bytes": s.bytes, "time": s.time, "bound": s.bound,
                       "intensity": s.flops / s.bytes, "ridge": cm.device.ridge_point}
     out["steps"] = steps
+    floor = {}
+    for name, m, n in [("Llama-3-8B", LLAMA3_8B, 1), ("Llama-3-70B", LLAMA3_70B, 4)]:
+        cm = CostModel(m, H100_SXM, n)
+        read = m.weight_bytes_read(1) if hasattr(m, "weight_bytes_read") else m.weight_bytes_total
+        floor[name] = {"resident": m.weight_bytes_total, "read_b1": read, "devices": n,
+                       "floor_ms": 1e3 * read / cm.byte_rate}
+    out["weights"] = floor
 
     # 2. per-step power (deck 07 slide 04): power per device includes static power
     power_steps = {}
@@ -195,6 +202,15 @@ def render(new: dict, old: dict, timings: str | None) -> str:
       f" and adds {int(new['steps'][k]['flops'] - old['steps'][k]['flops']):,} FLOPs.")
     p("* Every decode step stays memory-bound: arithmetic intensity stays far below the ridge point.")
     p("")
+    p("Weights resident against weights read by a batch-1 step, and the step-time floor that weight read sets"
+      " (H100 at 80% of peak bandwidth):")
+    p("")
+    rows = []
+    for k, b in new["weights"].items():
+        a = old["weights"][k]
+        rows.append([f"{k}, {b['devices']}xH100", f"{b['resident'] / 1e9:.2f}", f"{a['read_b1'] / 1e9:.2f}",
+                     f"{b['read_b1'] / 1e9:.2f}", f"{a['floor_ms']:.2f}", f"{b['floor_ms']:.2f}"])
+    table(L, ["Model", "Resident GB", "Read per step GB before", "after", "Floor ms before", "after"], rows)
 
     # 2
     p("## 2. Per-step power, Llama-3-70B on 4xH100")

@@ -99,9 +99,9 @@ hot-spot     stage=kv_wait -> kv-link (busy 96%)   busy>90%: decode-0, kv-link
 |-----------|--------|
 | One event per batch step (not per token / per layer) | 37.1k events instead of 506k / 3.0M |
 | Fast path: incremental state + lazy bookkeeping + macro-steps | 2.0–2.5× faster, bit-identical |
-| Probe sampling 5 ms → off | 2.1× faster |
+| Probe sampling 5 ms → off | 1.9× faster |
 | Parallel sweep, 8 processes | 1.6× (short runs; overhead-bound) |
-| Analytic bracket + bisection vs 40-point grid | 7 runs instead of 40, 6.4× less time |
+| Analytic bracket + bisection vs 40-point grid | 7 runs instead of 40, 6.5× less time |
 
 ### Power and energy (Llama-3-70B, 4×H100 per instance, 4 req/s)
 
