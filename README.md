@@ -137,6 +137,16 @@ Each of these is an exercise in deck 05, slide 10.
 
 ---
 
+## How the measurements are made
+
+The tools and methods this repository measures with are explained, with their overheads, accuracy and pitfalls, in [SimEng 12: Measurement Tools and Methods](https://brendanjameslynskey.github.io/SimEng_12_Measurement_Tools_and_Methods/) and the series glossaries:
+
+* [roofline cost model](https://brendanjameslynskey.github.io/LLM_Hub_Inference_Simulators/#g-roofline)
+* [queueing-theory checks (M/D/1)](https://brendanjameslynskey.github.io/LLM_Hub_Inference_Simulators/#g-queueing)
+* [hot-spot attribution](https://brendanjameslynskey.github.io/LLM_Hub_Inference_Simulators/#g-hotspot)
+* [Perfetto traces](https://brendanjameslynskey.github.io/LLM_Hub_Inference_Simulators/#g-perfetto)
+* [calibrating power coefficients with DCGM](https://brendanjameslynskey.github.io/SimEng_12_Measurement_Tools_and_Methods/#card-dcgm)
+
 ## Part of
 
 The [LLM Inference Simulators](https://github.com/BrendanJamesLynskey/LLM_Hub_Inference_Simulators)
