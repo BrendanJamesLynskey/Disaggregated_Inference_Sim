@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install
+        run: pip install -e ".[dev]"
+      - name: Tests (simulator, properties, closed forms, JavaScript port bit-exact with Python)
+        run: pytest -rs
+      - name: CLI smoke test (disaggregated vs colocated)
+        run: disagg-sim --compare --requests 300
