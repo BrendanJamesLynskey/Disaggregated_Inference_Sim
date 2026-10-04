@@ -23,13 +23,26 @@ queueing theory.
 * Chrome trace-event export for [Perfetto](https://ui.perfetto.dev).
 * An **exact fast path** (2.0–2.5× faster, bit-identical results) and experiment
   accelerators: analytic capacity bounds, bisection search, and parallel sweeps.
+* **Heterogeneous pools** (added 2026-10-04): a device and device count per pool
+  (`--prefill-device h100 --decode-device a100`), the Splitwise idea.
+* **FFT-mixing models, an optical transform engine and KV hand-off compression**
+  (added 2026-10-04, for the [Fourier Optics for Inference](https://github.com/BrendanJamesLynskey/LLM_Hub_Fourier_Optics_Inference)
+  series): Hyena-2, a 1:3 hybrid, block-circulant weights and distilled decode;
+  `optical-fft`, a Fourier-optical transform engine co-packaged with a digital part;
+  fp8 / fp4 / frequency-domain compression of the KV hand-off, in the link or on the GPU;
+  PPA (area, silicon cost, perf/W, perf/mm², perf/$) with FHE_Accelerator_Sim's method.
 * A JavaScript port (`web/sim_engine.js`) that runs live in
-  [deck 05](https://brendanjameslynskey.github.io/InfSim_05_Disaggregated_Inference/)
-  and is tested to match the Python exactly.
-* 36 tests: unit, invariant, analytic (M/D/1, Little's law), behavioural,
+  [deck 05](https://brendanjameslynskey.github.io/InfSim_05_Disaggregated_Inference/) and
+  [FOptInf deck 03](https://brendanjameslynskey.github.io/FOptInf_03_Optical_Prefill_Pools/),
+  and is tested to match the Python exactly, every new feature included.
+* 130 tests: unit, invariant, analytic (M/D/1, Little's law), behavioural,
   property-based (Hypothesis), power and energy, differential (fast path vs
-  baseline, JS vs Python), and the cost model pinned against an operator trace
-  of the real Llama-3-8B.
+  baseline, JS vs Python), the cost model pinned against an operator trace
+  of the real Llama-3-8B, and (94, added 2026-10-04) the new features: identical pools
+  reproduce the homogeneous run bit-exactly, the FFT-mixing op ledger equals the FOptInf
+  analysis to the FLOP, a transformer on the transform device equals its digital part,
+  the averaging-pass rule, monotone energy in static power, and JS parity on 21 new
+  configurations.
 * Every number below comes from [`examples/results.md`](examples/results.md),
   written by `examples/results.py`.
 
@@ -52,7 +65,7 @@ queueing theory.
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .[dev]
-pytest                                   # 36 tests, about ten seconds
+pytest                                   # 130 tests, about a minute
 
 disagg-sim                               # one disaggregated run (70B, 4xH100 per instance)
 disagg-sim --compare                     # colocated vs disaggregated, same request stream
@@ -62,6 +75,12 @@ disagg-sim --trace run.json              # open in https://ui.perfetto.dev
 disagg-sim --fast                        # exact accelerated decode path
 disagg-sim --dvfs --decode-power-cap 250 # energy savings that cost (almost) no latency
 disagg-sim --power-cap 400 --dvfs        # cap everything: watch TTFT pay for it
+
+# heterogeneous pools, FFT-mixing models, the optical transform engine, KV compression
+disagg-sim --model llama3-8b --devices-per-instance 1 --prefill-device h100 --decode-device a100 --ppa
+disagg-sim --model llama3-8b-hyena-circ --prefill-lm-head last --devices-per-instance 1 \
+           --prefill-device optical-fft --ft-enob 11 --ft-mask-rate 20000 --ft-overlap --fft-efficiency 0.0625
+disagg-sim --model llama3-8b --devices-per-instance 1 --link eth-25g --rate 14 --kv-compress fp8 --kv-compress-at transit
 
 python examples/benchmark_acceleration.py   # measure every acceleration technique
 python examples/results.py               # regenerate examples/results.md (every quoted number)
@@ -85,6 +104,7 @@ hot-spot     stage=kv_wait -> kv-link (busy 96%)   busy>90%: decode-0, kv-link
 | `src/disagg_sim/workload.py` | `Request` and all its timestamps; lognormal lengths; Poisson arrivals; JSON replay |
 | `src/disagg_sim/sim.py` | SimPy processes for prefill, decode and colocated instances; the KV link as a `simpy.Resource`; routers; `FastDecodeInstance` |
 | `src/disagg_sim/metrics.py` | Percentiles, goodput, utilisation, MFU/MBU, stage breakdown, hot-spot attribution, Little's law |
+| `src/disagg_sim/ppa.py` | Area, silicon cost and perf/W, perf/mm², perf/$ per pool (FHE_Accelerator_Sim's method, illustrative) |
 | `src/disagg_sim/trace.py` | Chrome trace-event export |
 | `src/disagg_sim/search.py` | Analytic capacity bounds, parallel sweeps, bisection for the maximum sustainable load |
 | `src/disagg_sim/cli.py` | The `disagg-sim` command |
@@ -118,6 +138,36 @@ The power coefficients in `hardware.py` are **illustrative**, chosen so prefill 
 near the H100's 700 W TDP and decode near 300 W. Calibrate them for real hardware by
 regressing measured power (DCGM) on FLOP and byte rates.
 
+### Optical prefill pools and heterogeneous pools (results.md sections 10–15)
+
+Llama-3-8B shape, one device per instance, 1P1D, 8 req/s, 800 requests. Every coefficient of the
+optical engine is **illustrative**, and the block-circulant model is **speculative**:
+
+| Configuration | TTFT p99 | TPOT p99 | SLO met | J / token |
+|---------------|----------|----------|---------|-----------|
+| H100 prefill + H100 decode | 353.6 ms | 8.8 ms | 100.0% | 0.326 |
+| H100 prefill + A100 decode | 353.6 ms | 16.8 ms | 100.0% | 0.299 |
+| Hyena-2 on H100s | 374.9 ms | 114.4 ms | 0.0% | 0.371 |
+| Hyena-2, `optical-fft` prefill (defaults: ENOB 8, 1,031 Hz mask) | 172.0 s | 12.5 ms | 0.0% | 0.660 |
+| Circulant, last-token head, on H100s | 5.4 ms | 13.5 ms | 100.0% | 0.185 |
+| … same, GPU FFTs at 1/16 of the matmul rate | 40.0 ms | 13.5 ms | 100.0% | 0.210 |
+| … `optical-fft` prefill (optimistic: ENOB 11, 20 kHz, overlapped) | 90.5 ms | 13.5 ms | 100.0% | 0.194 |
+
+An optical transform engine does not pay for attention or Hyena models; for the circulant variant the
+optimistic engine wins TTFT only if GPU FFTs run below 1/30.9 of the matmul rate (or, at 1/16, with a
+mask rewriting at 47,942 Hz). Compressing the KV hand-off helps only where the link is the bottleneck
+(GQA KV over 25 GbE at 14 req/s: hand-off p99 9,657.8 ms → 166.6 ms with fp8, SLO 41.0% → 100.0%), and
+there the GPU does the same compression nearly free. Explained in
+[FOptInf 03](https://brendanjameslynskey.github.io/FOptInf_03_Optical_Prefill_Pools/).
+
+**Ports.** JavaScript: everything, bit-exact. Rust
+([Rust_DES_Kernel](https://github.com/BrendanJamesLynskey/Rust_DES_Kernel)): heterogeneous pools only,
+bit-exact; the FFT-mixing models, the optical transform engine and KV hand-off compression are
+**Python and JS only, not in the Rust port**, and the Rust side rejects them by name.
+
+`examples/results.py --keep-timings` regenerates sections 1–8 and 10–15 and keeps section 9 (wall
+clock) from the previous run; `--optical-from-json` re-renders 10–15 from `examples/results_optical.json`.
+
 ---
 
 ## Modelling assumptions (read before trusting a number)
@@ -128,7 +178,11 @@ regressing measured power (DCGM) on FLOP and byte rates.
 * Each sequence reserves its full KV (prompt + output) at admission; no pre-emption,
   swapping, prefix caching or chunked prefill.
 * Efficiency factors (MFU/MBU derating) are constants, not shape-dependent.
-* Disaggregated TPOT includes the KV transfer and decode queueing (DistServe's definition).
+* Disaggregated TPOT includes the KV transfer and decode queueing (DistServe's definition); TTFT
+  does not (the first token leaves the prefill pool).
+* The optical transform engine is first-order: noise as ENOB with ideal gain control, passes
+  `4^(required − ENOB)`, integer mask rewrites, static lasers and tuning; no crosstalk or drift.
+  Relaxed-tiling decode (FFTs at decode) and the accuracy of compressed KV are not modelled.
 * DVFS is continuous (compute clock fraction `s ≥ s_min`, energy per op ∝ s²); real parts
   have discrete operating points, voltage floors and transition latency. Static power is
   charged for the whole run (no power gating).

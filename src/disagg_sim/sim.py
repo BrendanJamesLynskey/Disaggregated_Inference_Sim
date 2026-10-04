@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 
 import simpy
 
-from .hardware import (H100_SXM, LINKS, LLAMA3_70B, Accelerator, CostModel, Link,
+from .hardware import (H100_SXM, LINKS, LLAMA3_70B, Accelerator, CostModel, KVTransit, Link,
                        ModelSpec)
 from .trace import Tracer
 from .workload import Request
@@ -53,6 +53,27 @@ class SimConfig:
     prefill_power_cap_w: float | None = None   # overrides power_cap_w for the prefill pool
     decode_power_cap_w: float | None = None    # overrides power_cap_w for the decode pool
     dvfs: bool = False                 # lower compute clocks on memory-bound steps
+    # Heterogeneous pools (Splitwise-style): None means "use device / devices_per_instance",
+    # so every existing configuration is unchanged. Colocated mode uses ``device`` only.
+    prefill_device: Accelerator | None = None
+    decode_device: Accelerator | None = None
+    prefill_devices_per_instance: int | None = None
+    decode_devices_per_instance: int | None = None
+    kv_transit: KVTransit | None = None   # compress the KV hand-off in the link or at the GPU
+
+    @property
+    def heterogeneous(self) -> bool:
+        return any(x is not None for x in (self.prefill_device, self.decode_device,
+                                           self.prefill_devices_per_instance,
+                                           self.decode_devices_per_instance))
+
+    def pool(self, role: str) -> tuple[Accelerator, int]:
+        """The device and devices per instance that a pool's instances use."""
+        dev = {"prefill": self.prefill_device, "decode": self.decode_device}.get(role)
+        n = {"prefill": self.prefill_devices_per_instance,
+             "decode": self.decode_devices_per_instance}.get(role)
+        return (dev if dev is not None else self.device,
+                n if n is not None else self.devices_per_instance)
 
 
 # ──────────────────────────────────────────────────────────── instances ──
@@ -68,7 +89,12 @@ class Instance:
         self.queue: deque[Request] = deque()
         self.running: list[Request] = []
         self.kv_used = 0
-        self.kv_cap = self.cost.kv_capacity_tokens
+        try:
+            self.kv_cap = self.cost.kv_capacity_tokens
+        except ValueError as e:
+            raise ValueError(f"{self.role} pool: {e}") from None
+        if not sim.cfg.model.kv_bytes_per_token:     # a distilled-state model reserves one state
+            self.kv_need = lambda r: 1
         self.busy = 0.0
         self.steps = 0
         self.compute_bound_time = 0.0
@@ -79,6 +105,9 @@ class Instance:
         self.memory_j = 0.0
         self.peak_power = 0.0       # highest average power over any single step, W
         self.power_bound_time = 0.0
+        self.optical_j = 0.0        # transform engine: conversion energy
+        self.optical_flops = 0.0    # transform engine: FLOPs it took
+        self.optical_bound_time = 0.0
         self._wake: simpy.Event | None = None
         self.proc = self.env.process(self.run())
 
@@ -103,7 +132,10 @@ class Instance:
         self.flops += cost.flops
         self.bytes += cost.bytes
         self.batch_sum += batch
-        self.account_power(cost.time, cost.compute_j, cost.memory_j, cost.bound)
+        if cost.optical_j or cost.bound == "optical":
+            self.account_optical(cost)
+        else:
+            self.account_power(cost.time, cost.compute_j, cost.memory_j, cost.bound)
         if cost.bound == "compute":
             self.compute_bound_time += cost.time
         self.sim.tracer.span(self.name, kind, label, start, cost.time)
@@ -116,6 +148,21 @@ class Instance:
             self.peak_power = p
         if bound == "power":
             self.power_bound_time += dt
+
+    def account_optical(self, cost) -> None:
+        """A step with transform-engine work: conversion energy and the optical bound."""
+        self.compute_j += cost.compute_j
+        self.memory_j += cost.memory_j
+        self.optical_j += cost.optical_j
+        self.optical_flops += cost.optical_flops
+        dt = cost.time
+        p = self.cost.idle_w + self.cost.optical_static_w + (cost.compute_j + cost.memory_j + cost.optical_j) / dt
+        if p > self.peak_power:
+            self.peak_power = p
+        if cost.bound == "power":
+            self.power_bound_time += dt
+        elif cost.bound == "optical":
+            self.optical_bound_time += dt
 
     # Token bookkeeping shared by decode and colocated instances.
     def kv_need(self, r: Request) -> int:
@@ -174,6 +221,9 @@ class PrefillInstance(Instance):
             for r in batch:
                 r.prefill_start = self.env.now
             cost = self.cost.prefill([r.prompt_len for r in batch])
+            tr = self.sim.cfg.kv_transit
+            if tr is not None and tr.where == "endpoint":
+                cost = self.sim.endpoint_compress(self.cost, cost, batch)
             yield from self.step("prefill", cost, f"prefill n={len(batch)} tok={tokens}",
                                  len(batch))
             for r in batch:
@@ -249,7 +299,8 @@ class FastDecodeInstance(DecodeInstance):
         m, cm = self.cost.model, self.cost
         fa, fb = 2 * m.matmul_params, 4 * m.n_layers * m.d_model
         w, er, kv = m.weight_bytes_streamed, m.embedding_row_bytes, m.kv_bytes_per_token
-        step_time = cm.step_time
+        step_time, overhead = cm.step_time_raw, cm.step_overhead
+        generic = not m.is_transformer        # FFT-mixing variants: the cost model's own ledger
         horizon = 16                         # adaptive look-ahead, in steps
         while True:
             self.admit_decode()
@@ -262,8 +313,13 @@ class FastDecodeInstance(DecodeInstance):
             k = min(self.finish_heap[0][0] - len(self.step_end) + 1, horizon)
             t, ctx, ends, steps = self.env.now, self.ctx_sum, [], []
             for _ in range(k):
-                flops, nbytes = fa * b + fb * (ctx + b), w + b * er + (ctx + b) * kv
-                dt, ec, em, bound = step_time(flops, nbytes)
+                if generic:
+                    c = cm.decode_sum(ctx, b)
+                    flops, nbytes, dt, ec, em, bound = c.flops, c.bytes, c.time, c.compute_j, c.memory_j, c.bound
+                else:
+                    flops, nbytes = fa * b + fb * (ctx + b), w + b * er + (ctx + b) * kv
+                    dt, ec, em, bound = step_time(flops, nbytes)
+                    dt = dt + overhead
                 t += dt
                 ends.append(t)
                 steps.append((dt, flops, nbytes, bound, ec, em))
@@ -359,10 +415,13 @@ class ColocatedInstance(Instance):
 @dataclass
 class LinkStats:
     busy: float = 0.0
-    bytes: float = 0.0
+    bytes: float = 0.0               # bytes on the link (after any compression)
     transfers: int = 0
     wait: float = 0.0
-    energy: float = 0.0
+    energy: float = 0.0              # the link's own energy
+    handoff_bytes: float = 0.0       # hand-off bytes before compression
+    transit_j: float = 0.0           # in-transit stage energy
+    transit_bound: int = 0           # transfers the in-transit stage's compute slowed
 
 
 @dataclass
@@ -392,6 +451,8 @@ class Simulation:
         self._area, self._area_t = 0.0, 0.0
         self.samples: list[dict] = []
 
+        if cfg.kv_transit is not None and cfg.mode != "disagg":
+            raise ValueError("kv_transit compresses the prefill-to-decode hand-off: mode='disagg' only")
         if cfg.mode == "disagg":
             self.prefill = [PrefillInstance(self, i) for i in range(cfg.n_prefill)]
             dec = FastDecodeInstance if cfg.fast_forward else DecodeInstance
@@ -408,11 +469,27 @@ class Simulation:
         self.env.process(self.sampler())
 
     def cost_for(self, role: str) -> CostModel:
-        """Each pool gets its own cost model, so pools can have different power caps."""
+        """Each pool gets its own cost model, so pools can have different power caps and,
+        with ``prefill_device`` / ``decode_device``, different hardware."""
         cfg = self.cfg
         cap = {"prefill": cfg.prefill_power_cap_w, "decode": cfg.decode_power_cap_w}.get(role)
-        return CostModel(cfg.model, cfg.device, cfg.devices_per_instance, cfg.step_overhead,
+        dev, n = cfg.pool(role)
+        return CostModel(cfg.model, dev, n, cfg.step_overhead,
                          power_cap_w=cap if cap is not None else cfg.power_cap_w, dvfs=cfg.dvfs)
+
+    def endpoint_compress(self, cm: CostModel, cost, batch: list[Request]):
+        """Compress each request's hand-off on the prefill GPU after the step."""
+        tr, m = self.cfg.kv_transit, self.cfg.model
+        if tr.compression.ratio == 1.0 and not tr.compression.ops_per_value:
+            return cost                       # "none": nothing to do
+        ops = nbytes = 0.0
+        for r in batch:
+            if r.output_len <= 1:
+                continue                      # finished at prefill: nothing to hand off
+            hb = m.handoff_bytes(r.prompt_len)
+            ops += tr.ops(hb, r.prompt_len, m.kv_bytes, True)
+            nbytes += hb + hb / tr.compression.ratio      # read the KV, write the compressed copy
+        return cm.compress_pass(cost, ops, nbytes) if nbytes else cost
 
     # ── population accounting (exact time-average for Little's law) ──────
     def _population(self, delta: int) -> None:
@@ -433,13 +510,14 @@ class Simulation:
         for r in self.requests:
             yield self.env.timeout(max(0.0, r.arrival - self.env.now))
             self._population(+1)
+            units = self.cfg.model.cache_units(r.prompt_len, r.output_len)
             if self.cfg.mode == "disagg":
-                if r.prompt_len + r.output_len > self.decode[0].kv_cap:
+                if units > self.decode[0].kv_cap:
                     self._reject(r)
                     continue
                 min(self.prefill, key=lambda i: i.load()).submit(r)
             else:
-                if r.prompt_len + r.output_len > self.colocated[0].kv_cap:
+                if units > self.colocated[0].kv_cap:
                     self._reject(r)
                     continue
                 min(self.colocated, key=lambda i: i.load()).submit(r)
@@ -450,19 +528,39 @@ class Simulation:
         if self.n_done + len(self.rejected) == len(self.requests):
             self.done.succeed()
 
+    def transfer(self, r: Request) -> tuple[float, float, float, float, bool]:
+        """(seconds, bytes on the link, link joules, in-transit joules, transit-bound)."""
+        link, tr, m = self.cfg.link, self.cfg.kv_transit, self.cfg.model
+        nbytes = m.handoff_bytes(r.prompt_len)
+        if tr is None:
+            return link.transfer_time(nbytes), nbytes, nbytes * 8 * link.pj_per_bit * 1e-12, 0.0, False
+        wire = nbytes / tr.compression.ratio
+        if tr.where == "endpoint":            # compressed on the GPU already
+            return link.transfer_time(wire), wire, wire * 8 * link.pj_per_bit * 1e-12, 0.0, False
+        # In transit: the stage streams at line rate with a budget of ops_per_byte per line
+        # byte; if its work does not fit, its compute time sets the transfer time.
+        t_wire = wire / link.bandwidth
+        t_ops = tr.ops(nbytes, r.prompt_len, m.kv_bytes, False) / (tr.ops_per_byte * link.bandwidth)
+        t = link.latency + tr.latency + max(t_wire, t_ops)
+        return (t, wire, wire * 8 * link.pj_per_bit * 1e-12, nbytes * 8 * tr.pj_per_bit * 1e-12,
+                t_ops > t_wire)
+
     def kv_transfer(self, r: Request):
-        link, stats = self.cfg.link, self.link_stats
-        nbytes = r.prompt_len * self.cfg.model.kv_bytes_per_token
+        stats = self.link_stats
         with self.link.request() as grant:
             yield grant
             r.kv_start = self.env.now
             stats.wait += r.kv_start - r.first_token
-            t = link.transfer_time(nbytes)
+            t, nbytes, joules, transit_j, transit_bound = self.transfer(r)
             yield self.env.timeout(t)
         stats.busy += t
         stats.bytes += nbytes
         stats.transfers += 1
-        stats.energy += nbytes * 8 * link.pj_per_bit * 1e-12
+        stats.energy += joules
+        if self.cfg.kv_transit is not None:
+            stats.handoff_bytes += self.cfg.model.handoff_bytes(r.prompt_len)
+            stats.transit_j += transit_j
+            stats.transit_bound += transit_bound
         r.kv_ready = self.env.now
         self.tracer.span("kv-link", "kv", f"kv r{r.rid} {nbytes / 1e6:.0f} MB", r.kv_start, t)
         min(self.decode, key=lambda i: i.load()).submit(r)

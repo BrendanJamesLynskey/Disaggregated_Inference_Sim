@@ -6,3 +6,4 @@ __pycache__/
 !web/*.json
 !tests/fixtures/*.json
 .venv/
+!examples/results_optical.json

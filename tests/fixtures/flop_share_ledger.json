@@ -1,0 +1,291 @@
+{
+ "source": "FOptInf _foptinf_build/analysis/flop_share.py (2026-10-04), prefill() and decode_per_token()",
+ "prefill": [
+  {
+   "variant": "transformer",
+   "prompt": 512,
+   "lm_head": "all",
+   "dense": 7684770234368.0,
+   "attention": 68853694464.0,
+   "transform": 0.0,
+   "spectral": 0.0,
+   "other": 0.0,
+   "total": 7753623928832.0
+  },
+  {
+   "variant": "transformer",
+   "prompt": 512,
+   "lm_head": "last",
+   "dense": 7147876253696.0,
+   "attention": 68853694464.0,
+   "transform": 0.0,
+   "spectral": 0.0,
+   "other": 0.0,
+   "total": 7216729948160.0
+  },
+  {
+   "variant": "transformer",
+   "prompt": 2048,
+   "lm_head": "all",
+   "dense": 30739080937472.0,
+   "attention": 1100048498688.0,
+   "transform": 0.0,
+   "spectral": 0.0,
+   "other": 0.0,
+   "total": 31839129436160.0
+  },
+  {
+   "variant": "transformer",
+   "prompt": 2048,
+   "lm_head": "last",
+   "dense": 28588352995328.0,
+   "attention": 1100048498688.0,
+   "transform": 0.0,
+   "spectral": 0.0,
+   "other": 0.0,
+   "total": 29688401494016.0
+  },
+  {
+   "variant": "transformer",
+   "prompt": 8192,
+   "lm_head": "all",
+   "dense": 122956323749888.0,
+   "attention": 17594333528064.0,
+   "transform": 0.0,
+   "spectral": 0.0,
+   "other": 0.0,
+   "total": 140550657277952.0
+  },
+  {
+   "variant": "transformer",
+   "prompt": 8192,
+   "lm_head": "last",
+   "dense": 114350259961856.0,
+   "attention": 17594333528064.0,
+   "transform": 0.0,
+   "spectral": 0.0,
+   "other": 0.0,
+   "total": 131944593489920.0
+  },
+  {
+   "variant": "hyena",
+   "prompt": 512,
+   "lm_head": "all",
+   "dense": 8509403955200.0,
+   "attention": 0.0,
+   "transform": 13421772800.0,
+   "spectral": 806879232.0,
+   "other": 1342177280.0,
+   "total": 8524974784512.0
+  },
+  {
+   "variant": "hyena",
+   "prompt": 512,
+   "lm_head": "last",
+   "dense": 7972509974528.0,
+   "attention": 0.0,
+   "transform": 13421772800.0,
+   "spectral": 806879232.0,
+   "other": 1342177280.0,
+   "total": 7988080803840.0
+  },
+  {
+   "variant": "hyena",
+   "prompt": 2048,
+   "lm_head": "all",
+   "dense": 34037615820800.0,
+   "attention": 0.0,
+   "transform": 64424509440.0,
+   "spectral": 3222798336.0,
+   "other": 5368709120.0,
+   "total": 34110631837696.0
+  },
+  {
+   "variant": "hyena",
+   "prompt": 2048,
+   "lm_head": "last",
+   "dense": 31886887878656.0,
+   "attention": 0.0,
+   "transform": 64424509440.0,
+   "spectral": 3222798336.0,
+   "other": 5368709120.0,
+   "total": 31959903895552.0
+  },
+  {
+   "variant": "hyena",
+   "prompt": 8192,
+   "lm_head": "all",
+   "dense": 136150463283200.0,
+   "attention": 0.0,
+   "transform": 300647710720.0,
+   "spectral": 12886474752.0,
+   "other": 21474836480.0,
+   "total": 136485472305152.0
+  },
+  {
+   "variant": "hyena",
+   "prompt": 8192,
+   "lm_head": "last",
+   "dense": 127544399495168.0,
+   "attention": 0.0,
+   "transform": 300647710720.0,
+   "spectral": 12886474752.0,
+   "other": 21474836480.0,
+   "total": 127879408517120.0
+  },
+  {
+   "variant": "hybrid",
+   "prompt": 512,
+   "lm_head": "all",
+   "dense": 8303245524992.0,
+   "attention": 17213423616.0,
+   "transform": 10066329600.0,
+   "spectral": 605159424.0,
+   "other": 1006632960.0,
+   "total": 8332137070592.0
+  },
+  {
+   "variant": "hybrid",
+   "prompt": 512,
+   "lm_head": "last",
+   "dense": 7766351544320.0,
+   "attention": 17213423616.0,
+   "transform": 10066329600.0,
+   "spectral": 605159424.0,
+   "other": 1006632960.0,
+   "total": 7795243089920.0
+  },
+  {
+   "variant": "hybrid",
+   "prompt": 2048,
+   "lm_head": "all",
+   "dense": 33212982099968.0,
+   "attention": 275012124672.0,
+   "transform": 48318382080.0,
+   "spectral": 2417098752.0,
+   "other": 4026531840.0,
+   "total": 33542756237312.0
+  },
+  {
+   "variant": "hybrid",
+   "prompt": 2048,
+   "lm_head": "last",
+   "dense": 31062254157824.0,
+   "attention": 275012124672.0,
+   "transform": 48318382080.0,
+   "spectral": 2417098752.0,
+   "other": 4026531840.0,
+   "total": 31392028295168.0
+  },
+  {
+   "variant": "hybrid",
+   "prompt": 8192,
+   "lm_head": "all",
+   "dense": 132851928399872.0,
+   "attention": 4398583382016.0,
+   "transform": 225485783040.0,
+   "spectral": 9664856064.0,
+   "other": 16106127360.0,
+   "total": 137501768548352.0
+  },
+  {
+   "variant": "hybrid",
+   "prompt": 8192,
+   "lm_head": "last",
+   "dense": 124245864611840.0,
+   "attention": 4398583382016.0,
+   "transform": 225485783040.0,
+   "spectral": 9664856064.0,
+   "other": 16106127360.0,
+   "total": 128895704760320.0
+  },
+  {
+   "variant": "hyena_circ",
+   "prompt": 512,
+   "lm_head": "all",
+   "dense": 537944653824.0,
+   "attention": 0.0,
+   "transform": 39594229760.0,
+   "spectral": 47879553024.0,
+   "other": 16221470720.0,
+   "total": 641639907328.0
+  },
+  {
+   "variant": "hyena_circ",
+   "prompt": 512,
+   "lm_head": "last",
+   "dense": 1050673152.0,
+   "attention": 0.0,
+   "transform": 39594229760.0,
+   "spectral": 47879553024.0,
+   "other": 16221470720.0,
+   "total": 104745926656.0
+  },
+  {
+   "variant": "hyena_circ",
+   "prompt": 2048,
+   "lm_head": "all",
+   "dense": 2151778615296.0,
+   "attention": 0.0,
+   "transform": 169114337280.0,
+   "spectral": 191513493504.0,
+   "other": 64885882880.0,
+   "total": 2577292328960.0
+  },
+  {
+   "variant": "hyena_circ",
+   "prompt": 2048,
+   "lm_head": "last",
+   "dense": 1050673152.0,
+   "attention": 0.0,
+   "transform": 169114337280.0,
+   "spectral": 191513493504.0,
+   "other": 64885882880.0,
+   "total": 426564386816.0
+  },
+  {
+   "variant": "hyena_circ",
+   "prompt": 8192,
+   "lm_head": "all",
+   "dense": 8607114461184.0,
+   "attention": 0.0,
+   "transform": 719407022080.0,
+   "spectral": 766049255424.0,
+   "other": 259543531520.0,
+   "total": 10352114270208.0
+  },
+  {
+   "variant": "hyena_circ",
+   "prompt": 8192,
+   "lm_head": "last",
+   "dense": 1050673152.0,
+   "attention": 0.0,
+   "transform": 719407022080.0,
+   "spectral": 766049255424.0,
+   "other": 259543531520.0,
+   "total": 1746050482176.0
+  }
+ ],
+ "decode": [
+  {
+   "variant": "hyena_direct",
+   "ctx": 2048,
+   "total": 17694195712.0
+  },
+  {
+   "variant": "hyena_direct",
+   "ctx": 32768,
+   "total": 33800323072.0
+  },
+  {
+   "variant": "hyena_distilled",
+   "ctx": 2048,
+   "total": 16653484032.0
+  },
+  {
+   "variant": "hyena_distilled",
+   "ctx": 32768,
+   "total": 16653484032.0
+  }
+ ]
+}

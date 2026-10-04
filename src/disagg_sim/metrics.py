@@ -88,8 +88,10 @@ def summarise(res: SimResult) -> dict:
 
     energy = energy_report(res, out_tokens, len(met))
 
-    return {
-        "mode": cfg.mode,
+    out = {"mode": cfg.mode}
+    if cfg.heterogeneous:
+        out["pools"] = pools(cfg)
+    out.update({
         "requests": {"completed": len(done), "rejected": len(res.rejected),
                      "measured": len(steady)},
         "latency_s": {"ttft": _dist(ttft), "tpot": _dist(tpot), "itl": _dist(itl),
@@ -119,7 +121,30 @@ def summarise(res: SimResult) -> dict:
         "littles_law": {"L_measured": little_L, "lambda_W": lam * w},
         "energy": energy,
         "sim_time_s": res.horizon,
-    }
+    })
+    if any(i.cost.device.transform is not None for i in res.instances):
+        out["optical"] = {i.name: {
+            "optical_bound_frac": i.optical_bound_time / i.busy if i.busy else 0.0,
+            "optical_flops": i.optical_flops, "conversion_J": i.optical_j,
+            "static_J": i.cost.optical_static_w * res.horizon} for i in res.instances}
+    tr = cfg.kv_transit
+    if tr is not None:
+        lk = res.link
+        out["kv_link"]["transit"] = {
+            "preset": tr.compression.name, "where": tr.where, "ratio": tr.compression.ratio,
+            "handoff_GB": lk.handoff_bytes / 1e9,
+            "transit_bound_frac": lk.transit_bound / lk.transfers if lk.transfers else 0.0,
+            "transit_J": lk.transit_j}
+    return out
+
+
+def pools(cfg) -> dict:
+    """Which device, and how many per instance, each pool runs on."""
+    out = {}
+    for role in ("prefill", "decode"):
+        dev, n = cfg.pool(role)
+        out[role] = f"{n}x {dev.name}"
+    return out
 
 
 def energy_report(res: SimResult, out_tokens: int, slo_met: int) -> dict:
@@ -131,23 +156,42 @@ def energy_report(res: SimResult, out_tokens: int, slo_met: int) -> dict:
     H = res.horizon
     per = {}
     static = compute = memory = 0.0
+    o_static = o_conv = 0.0                  # transform engine: lasers + tuning, conversions
+    optical = any(i.cost.device.transform is not None for i in res.instances)
     for i in res.instances:
         cm = i.cost
         s_j = cm.idle_w * H
         c_j, m_j = i.compute_j, i.memory_j
         static, compute, memory = static + s_j, compute + c_j, memory + m_j
-        per[i.name] = {"avg_w": (s_j + c_j + m_j) / H, "peak_step_w": i.peak_power,
+        if optical:
+            os_j = cm.optical_static_w * H
+            o_static, o_conv = o_static + os_j, o_conv + i.optical_j
+            avg = (s_j + c_j + m_j + os_j + i.optical_j) / H
+        else:
+            avg = (s_j + c_j + m_j) / H
+        per[i.name] = {"avg_w": avg, "peak_step_w": i.peak_power,
                        "power_bound_frac": i.power_bound_time / i.busy if i.busy else 0.0}
     link = res.link.energy
     total = static + compute + memory + link
+    transit = res.cfg.kv_transit is not None
+    if optical:
+        total = total + o_static + o_conv
+    if transit:
+        total = total + res.link.transit_j
+    breakdown = {"static": static / total, "compute": compute / total,
+                 "memory": memory / total, "link": link / total}
+    if optical:
+        breakdown["optical_static"] = o_static / total
+        breakdown["optical_conversions"] = o_conv / total
+    if transit:
+        breakdown["transit"] = res.link.transit_j / total
     return {
         "total_J": total,
         "avg_power_W": total / H,
         "J_per_output_token": total / out_tokens if out_tokens else math.nan,
         "output_tokens_per_J": out_tokens / total if total else math.nan,
         "J_per_slo_met_request": total / slo_met if slo_met else math.inf,
-        "breakdown": {"static": static / total, "compute": compute / total,
-                      "memory": memory / total, "link": link / total},
+        "breakdown": breakdown,
         "per_instance": per,
     }
 
@@ -156,6 +200,8 @@ def format_report(m: dict) -> str:
     ms = lambda x: f"{1e3 * x:8.1f}"
     lines = [f"── {m['mode']} ── {m['requests']['completed']} done, "
              f"{m['requests']['rejected']} rejected, sim {m['sim_time_s']:.1f}s"]
+    if "pools" in m:
+        lines.append(f"pools        prefill {m['pools']['prefill']}   decode {m['pools']['decode']}")
     lines.append("latency (ms)       mean      p50      p90      p99")
     for k in ("ttft", "tpot", "itl", "e2e"):
         d = m["latency_s"][k]
@@ -173,6 +219,15 @@ def format_report(m: dict) -> str:
     lines.append(f"power        avg {e['avg_power_W']:,.0f} W   {e['J_per_output_token']:.2f} J/token   "
                  f"{e['output_tokens_per_J']:.2f} tok/J   energy: " + "  ".join(
                      f"{k} {100 * v:.0f}%" for k, v in e["breakdown"].items()))
+    if "optical" in m:
+        lines.append("optical      " + "  ".join(
+            f"{k} optical-bound {100 * v['optical_bound_frac']:.0f}% of busy time, conversions {v['conversion_J']:,.0f} J, "
+            f"lasers+tuning {v['static_J']:,.0f} J" for k, v in m["optical"].items() if v["static_J"]))
+    if "transit" in m["kv_link"]:
+        t = m["kv_link"]["transit"]
+        lines.append(f"kv hand-off  {t['preset']} at {t['where']} (ratio {t['ratio']:.2f}): "
+                     f"{t['handoff_GB']:.1f} GB -> {m['kv_link']['bytes_GB']:.1f} GB on the link, "
+                     f"transit-bound {100 * t['transit_bound_frac']:.0f}% of transfers, stage {t['transit_J']:,.1f} J")
     capped = {k: v["power_bound_frac"] for k, v in e["per_instance"].items() if v["power_bound_frac"] > 0}
     if capped:
         lines.append("power-capped " + "  ".join(f"{k} {100 * v:.0f}% of busy time" for k, v in capped.items()))
