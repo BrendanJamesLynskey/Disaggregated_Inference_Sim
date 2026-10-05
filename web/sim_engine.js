@@ -4,6 +4,9 @@
 // 2026-10-04: heterogeneous pools, FFT-mixing models (Hyena, hybrid, block-circulant,
 // distilled decode), the optical transform engine, KV hand-off compression (in transit or
 // at the GPU) and the PPA functions, all bit-exact with the Python package (tested).
+// 2026-10-05: the Causal Encoder-Decoder (CED) option of DeepSeek-V4.1-Flash (arXiv:2609.19969):
+// cedE encoder layers, a cedW-token replay through the decoder on prefill or (SGLang RFC #39963)
+// as the decode instance's first step. Off unless a model or cfg turns it on (tested bit-exact).
 (function (root) {
     // mixer: 'attention' | 'hyena' | 'hybrid'; see hardware.ModelSpec for the fields
     const MODELS = {
@@ -17,6 +20,9 @@
                               mixer: 'hybrid' },
         'llama3-8b-hyena-circ': { name: 'Llama-3-8B-shape Hyena-2 + block-circulant 256', L: 32, d: 4096, h: 32, kvh: 8,
                                   ff: 14336, V: 128256, mixer: 'hyena', circ: 256 },
+        // CED proxies: half encoder, half decoder (DeepSeek-V4.1-Flash splits 40 layers 20/20); illustrative
+        'llama3-8b-ced':  { name: 'Llama-3-8B-shape CED 16+16',  L: 32, d: 4096, h: 32, kvh: 8, ff: 14336, V: 128256, cedE: 16 },
+        'llama3-70b-ced': { name: 'Llama-3-70B-shape CED 40+40', L: 80, d: 8192, h: 64, kvh: 8, ff: 28672, V: 128256, cedE: 40 },
     };
     const ENOB_REQUIRED = { bf16: 11, int8: 8, fp8: 7 };
     // Fourier-optical transform engine (illustrative; hardware.TransformEngine)
@@ -68,7 +74,13 @@
 
     function derive(m0) {
         const m = { mixer: 'attention', attnEvery: 4, order: 2, short: 3, circ: 0, decodeStyle: 'direct', ds: 16,
-                    actFormat: 'bf16', lmHead: 'all', ...m0 };
+                    actFormat: 'bf16', lmHead: 'all', cedE: 0, cedW: 128, cedOn: 'prefill', ...m0 };
+        if (m.cedE) {
+            if (m.mixer !== 'attention') throw new Error("ced_encoder_layers is modelled for mixer='attention' only");
+            if (!(m.cedE > 0 && m.cedE < m.L)) throw new Error('ced_encoder_layers must leave at least one decoder layer');
+            if (m.cedW < 1) throw new Error('ced_replay must be at least 1 token');
+            if (m.cedOn !== 'prefill' && m.cedOn !== 'decode') throw new Error(`unknown ced_replay_on ${m.cedOn}`);
+        }
         const hd = m.d / m.h, kv = m.kvh * hd;
         const ppl = 2 * m.d * m.d + 2 * m.d * kv + 3 * m.d * m.ff;
         const isAttn = i => m.mixer === 'attention' || (m.mixer === 'hybrid' && i % m.attnEvery === 0);
@@ -84,10 +96,15 @@
         if (m.mixer !== 'attention') { let per = N * d; if (k) for (const [r, c] of mats) per += Math.max(r, c); pairs = nHy * per; }
         // weightBytes: resident (both vocab tables); weightStream: read by every step (layers +
         // LM head); embRow: one embedding row, read per token looked up (corrected 2026-10-03)
-        const mm = { ...m, isAttn, nAttn, nHy, mats, layers, params: layers + 2 * m.V * m.d, matmul: layers + m.V * m.d,
+        const mm = { ...m, isAttn, nAttn, nHy, mats, layers, ppl, params: layers + 2 * m.V * m.d, matmul: layers + m.V * m.d,
                      weightBytes: 2 * (layers + 2 * m.V * m.d), weightStream: 2 * (layers + m.V * m.d),
                      embRow: 2 * m.d, kvTok, state, cacheUnit: kvTok ? kvTok : state, pairs,
                      transformer: m.mixer === 'attention' };
+        // CED: parameters a prompt token touches (encoder + the decoder's K/V projections), and what a
+        // prefill-only instance holds when the replay runs on decode (+ the input embedding)
+        mm.cedPrompt = m.cedE * ppl + (m.L - m.cedE) * 2 * m.d * kv;
+        mm.cedResident = mm.cedPrompt + m.V * m.d;
+        mm.cedAttn = (layers_, s, w) => 2 * layers_ * m.d * w * (2 * s - w + 1);
         mm.units = (p, o) => kvTok ? p + o : 1;
         mm.handoff = p => state ? state : p * kvTok;
         const dense = (r, c, tokens) => {
@@ -173,7 +190,9 @@
     const pjPair = eng => eng.fomDac * 2 ** eng.enob * 1e-3 + eng.fomAdc * 2 ** eng.enob * 1e-3;
 
     const cbrt = x => Math.sign(x) * Math.pow(Math.abs(x), 1 / 3);
-    function costModel(model, dev, n, overhead, powerCap, dvfs, sMin) {
+    function costModel(model, dev, n, overhead, powerCap, dvfs, sMin, prefillOnly) {
+        // CED with the replay on decode: a prefill-pool instance holds and runs the encoder only
+        const encoderOnly = !!prefillOnly && model.cedE > 0 && model.cedOn === 'decode';
         const Fr = dev.F * dev.fe * n, Br = dev.B * dev.be * n;
         const jF = dev.pjF * 1e-12, jB = dev.pjB * 1e-12, idleW = dev.idle * n;
         const eng = dev.transform || null;
@@ -209,7 +228,7 @@
             const r = raw(flops, bytes);
             return { flops, bytes, time: r.time + overhead, bound: r.bound, ec: r.ec, em: r.em, oj: 0, oflops: 0 };
         };
-        const free = dev.M * n * 0.9 - model.weightBytes;
+        const free = dev.M * n * 0.9 - (encoderOnly ? model.cedResident * 2 : model.weightBytes);
         const kvCap = free > 0 ? Math.floor(free / model.cacheUnit) : null;
         // the transform engine's integer counts: (passes, conversions, rewrites, optical seconds)
         const opticalTerms = (lens, tokens) => {
@@ -218,11 +237,42 @@
             const rewrites = q * eng.maskValues < vals ? q + 1 : q;
             return [k, conversions, rewrites, conversions / eng.sps + rewrites / eng.maskRate];
         };
+        // CED prefill: CostModel._prefill_ced (same integer FLOPs, same float order for bytes)
+        const cedPrefill = lens => {
+            const enc = model.cedE, dec = model.L - model.cedE;
+            let tok = 0; for (const s of lens) tok += s;
+            let flops = 2 * model.cedPrompt * tok;
+            let att = 0; for (const s of lens) att += 2 * enc * model.d * s * (s + 1);
+            flops += att;
+            if (encoderOnly) {
+                const nbytes = model.cedPrompt * 2 + tok * model.embRow;
+                return t(flops, nbytes + tok * model.kvTok);
+            }
+            let rt = 0, ra = 0;
+            for (const s of lens) { const w = Math.min(s, model.cedW); rt += w; ra += model.cedAttn(dec, s, w); }
+            flops += 2 * dec * model.ppl * rt;
+            flops += ra;
+            flops += 2 * model.V * model.d * (model.lmHead === 'all' ? rt : lens.length);
+            return t(flops, model.weightStream + tok * model.embRow + tok * model.kvTok);
+        };
         return {
-            idleW, optStaticW, kvCap, opticalTerms,
+            idleW, optStaticW, kvCap, opticalTerms, encoderOnly,
             fits: free > 0,
+            // CED, replay on decode: running rows decode while new rows replay w prompt tokens (CostModel.ced_step)
+            cedStep(ctx, b, replay) {
+                let rt = 0, ra = 0, rs = 0;
+                for (const [s, w] of replay) { rt += w; ra += model.cedAttn(model.L, s, w); rs += s; }
+                let flops = 2 * model.matmul * b + 4 * model.L * model.d * (ctx + b);
+                flops += 2 * model.layers * rt;
+                flops += 2 * model.V * model.d * (model.lmHead === 'all' ? rt : replay.length);
+                flops += ra;
+                let nbytes = model.weightStream + (b + rt) * model.embRow + (ctx + b) * model.kvTok;
+                nbytes += rs * model.kvTok;
+                return t(flops, nbytes);
+            },
             prefill(lens) {
                 let tok = 0, fl = 0;
+                if (model.cedE) return cedPrefill(lens);
                 if (!model.transformer) {
                     for (const s of lens) tok += s;
                     const o = model.prefillOps(lens);
@@ -293,7 +343,12 @@
 
     // ── engine ─────────────────────────────────────────────────────────
     function simulate(cfg, rows) {
-        const model = derive({ ...MODELS[cfg.model], ...(cfg.lmHead ? { lmHead: cfg.lmHead } : {}) });
+        const model = derive({ ...MODELS[cfg.model], ...(cfg.lmHead ? { lmHead: cfg.lmHead } : {}),
+                               ...(cfg.cedEncoderLayers != null ? { cedE: cfg.cedEncoderLayers } : {}),
+                               ...(cfg.cedReplay != null ? { cedW: cfg.cedReplay } : {}),
+                               ...(cfg.cedReplayOn ? { cedOn: cfg.cedReplayOn } : {}) });
+        const cedOnDecode = model.cedE > 0 && model.cedOn === 'decode';
+        if (cedOnDecode && cfg.mode !== 'disagg') throw new Error("ced_replay_on='decode' splits prefill across the two pools: mode='disagg' only");
         const link = { ...LINKS[cfg.link], ch: cfg.linkChannels || 1 };
         const capFor = role => (role === 'prefill' ? cfg.prefillPowerCap : role === 'decode' ? cfg.decodePowerCap : null) ?? cfg.powerCap ?? null;
         // heterogeneous pools: prefillDevice / decodeDevice (keys) default to cfg.device
@@ -301,7 +356,7 @@
             dev: deviceFor((role === 'prefill' ? cfg.prefillDevice : role === 'decode' ? cfg.decodeDevice : null) ?? cfg.device, cfg),
             n: (role === 'prefill' ? cfg.prefillDevicesPerInstance : role === 'decode' ? cfg.decodeDevicesPerInstance : null) ?? cfg.devicesPerInstance });
         const cmFor = role => { const p = poolOf(role);
-            const c = costModel(model, p.dev, p.n, cfg.stepOverhead ?? 0.5e-3, capFor(role), !!cfg.dvfs);
+            const c = costModel(model, p.dev, p.n, cfg.stepOverhead ?? 0.5e-3, capFor(role), !!cfg.dvfs, undefined, role === 'prefill');
             if (!c.fits) throw new Error(`${role} pool: ${model.name} does not fit on ${p.n}x ${p.dev.name}`);
             return { ...c, dev: p.dev, n: p.n }; };
         // KV hand-off compression: { preset, where, opsPerByte, pjBit, lat, nativeFft }
@@ -340,7 +395,7 @@
         };
 
         const reqs = rows.map(([a, p, o], i) => ({ rid: i, arrival: a, prompt: p, output: o,
-            prefillStart: null, firstToken: null, kvStart: null, kvReady: null, decodeStart: null,
+            prefillStart: null, firstToken: null, prefillDone: null, kvStart: null, kvReady: null, decodeStart: null,
             finish: null, tokensOut: 0, lastToken: null, itls: [] }));
         const samples = [];
 
@@ -398,6 +453,24 @@
             const ctx = inst.running.map(r => r.prompt + r.tokensOut);
             step(inst, inst.cm.decode(ctx), ctx.length, () => decodeDone(inst));
         }
+        // CED, replay on decode: new rows run their last w prompt tokens through the whole model in the
+        // same step as the running rows' decode, and emit their first token (sim.CedDecodeInstance)
+        function cedOnce(inst) {
+            let ctx = 0, b = 0; const replay = [];
+            for (const r of inst.running) {
+                if (r.tokensOut) { ctx += r.prompt + r.tokensOut; b++; }
+                else replay.push([r.prompt, Math.min(r.prompt, model.cedW)]);
+            }
+            step(inst, inst.cm.cedStep(ctx, b, replay), inst.running.length, () => {
+                const still = [];
+                for (const r of inst.running) {
+                    if (r.tokensOut) { r.itls.push(now - r.lastToken); r.tokensOut++; r.lastToken = now; }
+                    else firstToken(r);
+                    if (r.tokensOut >= r.output) { inst.kvUsed -= kvNeed(r); finish(r); } else still.push(r);
+                }
+                inst.running = still;
+            });
+        }
         function loop(inst) {
             if (inst.active) return;
             if (inst.role === 'prefill') {
@@ -409,18 +482,20 @@
                 let cost = inst.cm.prefill(batch.map(r => r.prompt));
                 if (tr && tr.where === 'endpoint' && !(tr.preset.ratio === 1.0 && !tr.preset.ops)) {
                     let o = 0.0, nb = 0.0;
-                    for (const r of batch) { if (r.output <= 1) continue;
+                    for (const r of batch) { if (r.output <= 1 && !inst.cm.encoderOnly) continue;
                         const hb = model.handoff(r.prompt);
                         o += transitOps(tr, hb, r.prompt, 2.0, true); nb += hb + hb / tr.preset.ratio; }
                     if (nb) cost = inst.cm.compress(cost, o, nb);
                 }
                 step(inst, cost, batch.length, () => {
+                    // CED, replay on decode: the decode instance emits the first token; every request is handed off
+                    if (inst.cm.encoderOnly) { for (const r of batch) { r.prefillDone = now; kvRequest(r); } return; }
                     for (const r of batch) { firstToken(r); if (r.output <= 1) finish(r); else kvRequest(r); }
                 });
             } else if (inst.role === 'decode') {
                 while (inst.queue.length && inst.running.length < maxB && inst.kvUsed + kvNeed(inst.queue[0]) <= inst.cm.kvCap) {
                     const r = inst.queue.shift(); inst.kvUsed += kvNeed(r); r.decodeStart = now; inst.running.push(r); }
-                if (inst.running.length) decodeOnce(inst);
+                if (inst.running.length) { if (cedOnDecode) cedOnce(inst); else decodeOnce(inst); }
             } else {
                 const batch = []; let tok = 0;
                 while (inst.queue.length && inst.running.length + batch.length < maxB
@@ -450,7 +525,7 @@
                     nbytes * 8 * tr.pjBit * 1e-12, tOps > tWire];
         }
         function kvStart(r) {
-            ls.inUse++; r.kvStart = now; ls.wait += now - r.firstToken;
+            ls.inUse++; r.kvStart = now; ls.wait += now - (r.prefillDone ?? r.firstToken);
             const [t, nbytes, joules, transitJ, tb] = transfer(r);
             push(now + t, () => {
                 ls.inUse--; ls.busy += t; ls.bytes += nbytes; ls.transfers++; r.kvReady = now;
@@ -492,9 +567,10 @@
                          return { mean: mean(xs), p50: pctSorted(s, 50), p90: pctSorted(s, 90), p99: pctSorted(s, 99) }; };
     function stages(r) {
         const hand = r.kvReady !== null ? r.kvReady : r.firstToken;
-        const s = { prefill_queue: r.prefillStart - r.arrival, prefill: r.firstToken - r.prefillStart,
+        const pd = r.prefillDone ?? r.firstToken;       // CED, replay on decode: prefill ends before the first token
+        const s = { prefill_queue: r.prefillStart - r.arrival, prefill: pd - r.prefillStart,
                     kv_wait: 0, kv_transfer: 0, decode_queue: 0, decode: 0 };
-        if (r.kvStart !== null) { s.kv_wait = r.kvStart - r.firstToken; s.kv_transfer = r.kvReady - r.kvStart; }
+        if (r.kvStart !== null) { s.kv_wait = r.kvStart - pd; s.kv_transfer = r.kvReady - r.kvStart; }
         if (r.decodeStart !== null) { s.decode_queue = r.decodeStart - hand; s.decode = r.finish - r.decodeStart; }
         return s;
     }

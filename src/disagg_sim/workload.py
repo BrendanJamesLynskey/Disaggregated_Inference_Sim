@@ -24,6 +24,7 @@ class Request:
 
     prefill_start: float | None = None
     first_token: float | None = None
+    prefill_done: float | None = None  # CED with the replay on decode: prefill ends before the first token
     kv_start: float | None = None      # link granted
     kv_ready: float | None = None      # KV landed on the decode instance
     decode_start: float | None = None  # admitted into a decode batch
@@ -50,19 +51,24 @@ class Request:
     def e2e(self) -> float:
         return self.finish - self.arrival
 
+    @property
+    def handoff_start(self) -> float:
+        """When prefill finished: the first token, except under CED with the replay on decode."""
+        return self.prefill_done if self.prefill_done is not None else self.first_token
+
     def stages(self) -> dict[str, float]:
         """Where this request's time went, stage by stage. Sums to e2e."""
         handoff = self.kv_ready if self.kv_ready is not None else self.first_token
         s = {
             "prefill_queue": self.prefill_start - self.arrival,
-            "prefill": self.first_token - self.prefill_start,
+            "prefill": self.handoff_start - self.prefill_start,
             "kv_wait": 0.0,
             "kv_transfer": 0.0,
             "decode_queue": 0.0,
             "decode": 0.0,
         }
         if self.kv_start is not None:
-            s["kv_wait"] = self.kv_start - self.first_token
+            s["kv_wait"] = self.kv_start - self.handoff_start
             s["kv_transfer"] = self.kv_ready - self.kv_start
         if self.decode_start is not None:
             s["decode_queue"] = self.decode_start - handoff

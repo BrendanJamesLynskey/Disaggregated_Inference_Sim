@@ -31,18 +31,29 @@ queueing theory.
   `optical-fft`, a Fourier-optical transform engine co-packaged with a digital part;
   fp8 / fp4 / frequency-domain compression of the KV hand-off, in the link or on the GPU;
   PPA (area, silicon cost, perf/W, perf/mm², perf/$) with FHE_Accelerator_Sim's method.
+* **Causal Encoder-Decoder (CED)** (added 2026-10-05, for
+  [Modern Architectures 06](https://brendanjameslynskey.github.io/Arch_06_Asymmetric_Causal_Encoder_Decoder/)):
+  the encoder-only prefill of DeepSeek-V4.1-Flash ([arXiv:2609.19969](https://arxiv.org/abs/2609.19969), section 2.2).
+  `--model llama3-70b-ced` (or `--ced-encoder-layers E` on any attention model): a prompt token runs only the causal
+  encoder and the decoder's K/V projections; the last `--ced-replay` (default 128) prompt tokens are replayed through
+  the decoder on the prefill instance (`--ced-replay-on prefill`, the paper) or as the decode instance's first step
+  (`--ced-replay-on decode`, the asymmetric P/D deployment of
+  [SGLang RFC #39963](https://github.com/sgl-project/sglang/issues/39963), where a prefill instance holds only the
+  encoder's weights and the first token comes from the decode pool). Off by default: every other run is unchanged.
 * A JavaScript port (`web/sim_engine.js`) that runs live in
   [deck 05](https://brendanjameslynskey.github.io/InfSim_05_Disaggregated_Inference/) and
   [FOptInf deck 03](https://brendanjameslynskey.github.io/FOptInf_03_Optical_Prefill_Pools/),
   and is tested to match the Python exactly, every new feature included.
-* 130 tests: unit, invariant, analytic (M/D/1, Little's law), behavioural,
+* 154 tests: unit, invariant, analytic (M/D/1, Little's law), behavioural,
   property-based (Hypothesis), power and energy, differential (fast path vs
   baseline, JS vs Python), the cost model pinned against an operator trace
   of the real Llama-3-8B, and (94, added 2026-10-04) the new features: identical pools
   reproduce the homogeneous run bit-exactly, the FFT-mixing op ledger equals the FOptInf
   analysis to the FLOP, a transformer on the transform device equals its digital part,
   the averaging-pass rule, monotone energy in static power, and JS parity on 21 new
-  configurations.
+  configurations; and (24, added 2026-10-05, `tests/test_ced.py`) the CED option: closed-form prefill FLOPs, the
+  encoder-only residency, replay settings inert when CED is off (bit-identical runs), every request's stages and
+  timestamps in both replay placements, the fast path exact, and JS parity on 10 configurations.
 * Every number below comes from [`examples/results.md`](examples/results.md),
   written by `examples/results.py`.
 
@@ -65,7 +76,7 @@ queueing theory.
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .[dev]
-pytest                                   # 130 tests, about a minute
+pytest                                   # 154 tests, about a minute
 
 disagg-sim                               # one disaggregated run (70B, 4xH100 per instance)
 disagg-sim --compare                     # colocated vs disaggregated, same request stream
@@ -81,6 +92,10 @@ disagg-sim --model llama3-8b --devices-per-instance 1 --prefill-device h100 --de
 disagg-sim --model llama3-8b-hyena-circ --prefill-lm-head last --devices-per-instance 1 \
            --prefill-device optical-fft --ft-enob 11 --ft-mask-rate 20000 --ft-overlap --fft-efficiency 0.0625
 disagg-sim --model llama3-8b --devices-per-instance 1 --link eth-25g --rate 14 --kv-compress fp8 --kv-compress-at transit
+
+# Causal Encoder-Decoder: prefill runs the encoder only; replay on prefill (the paper) or on decode (SGLang RFC)
+disagg-sim --model llama3-70b-ced --prompt 8192 --output 128 --rate 3
+disagg-sim --model llama3-70b-ced --ced-replay-on decode --prefill-devices-per-instance 2 --prompt 8192 --output 128 --rate 3
 
 python examples/benchmark_acceleration.py   # measure every acceleration technique
 python examples/results.py               # regenerate examples/results.md (every quoted number)
@@ -160,13 +175,33 @@ mask rewriting at 47,942 Hz). Compressing the KV hand-off helps only where the l
 there the GPU does the same compression nearly free. Explained in
 [FOptInf 03](https://brendanjameslynskey.github.io/FOptInf_03_Optical_Prefill_Pools/).
 
+### Causal Encoder-Decoder (results.md sections 16–18)
+
+Llama-3-70B shape split 40 + 40 (`llama3-70b-ced`), **illustrative** (DeepSeek-V4.1-Flash is a 552B MoE). A prompt
+token touches 34.90B matmul parameters against 69.50B for a generated token (0.502; the paper:
+8B vs 16B). One 8,192-token prefill: 564.3 ms decoder-only, 288.3 ms CED, 283.5 ms encoder only. Highest request rate with
+90% of requests inside both SLOs, best split of 6 instances of 4×H100 (TTFT SLO = 5× the decoder-only unloaded
+prefill; TPOT 25 ms; the prompt:output ratios are illustrative stand-ins for agent loops):
+
+| Prompt : output | Decoder-only req/s | CED, replay on prefill | gain | CED, replay on decode | gain |
+|---|---|---|---|---|---|
+| 2,048 : 512 | 25.72 (4P2D) | 39.20 (3P3D) | 1.52× | 41.07 (3P3D) | 1.60× |
+| 4,096 : 256 | 13.10 (4P2D) | 27.01 (4P2D) | 2.06× | 27.90 (4P2D) | 2.13× |
+| 8,192 : 128 | 7.89 (5P1D) | 13.23 (4P2D) | 1.68× | 13.23 (4P2D) | 1.68× |
+| 16,384 : 64 | 3.81 (5P1D) | 6.89 (5P1D) | 1.81× | 8.17 (5P1D) | 2.14× |
+
+With the replay on decode a prefill instance holds 71.9 GB of weights instead of 141.1 GB: on two H100s that leaves
+KV room for 220,048 tokens instead of 8,835. Gains above 2× are queueing (a fixed TTFT SLO), not FLOPs.
+
 **Ports.** JavaScript: everything, bit-exact. Rust
 ([Rust_DES_Kernel](https://github.com/BrendanJamesLynskey/Rust_DES_Kernel)): heterogeneous pools only,
-bit-exact; the FFT-mixing models, the optical transform engine and KV hand-off compression are
-**Python and JS only, not in the Rust port**, and the Rust side rejects them by name.
+bit-exact; the FFT-mixing models, the optical transform engine, KV hand-off compression and the CED option
+are **Python and JS only, not in the Rust port**; the Rust side rejects the first three by name and the
+`*-ced` models as unknown models.
 
-`examples/results.py --keep-timings` regenerates sections 1–8 and 10–15 and keeps section 9 (wall
-clock) from the previous run; `--optical-from-json` re-renders 10–15 from `examples/results_optical.json`.
+`examples/results.py --keep-timings` regenerates sections 1–8 and 10–18 and keeps section 9 (wall
+clock) from the previous run; `--optical-from-json` re-renders 10–15 from `examples/results_optical.json`
+and `--ced-from-json` re-renders 16–18 from `examples/results_ced.json`.
 
 ---
 
@@ -179,7 +214,12 @@ clock) from the previous run; `--optical-from-json` re-renders 10–15 from `exa
   swapping, prefix caching or chunked prefill.
 * Efficiency factors (MFU/MBU derating) are constants, not shape-dependent.
 * Disaggregated TPOT includes the KV transfer and decode queueing (DistServe's definition); TTFT
-  does not (the first token leaves the prefill pool).
+  does not (the first token leaves the prefill pool), except under CED with the replay on decode, where
+  the first token comes from the decode pool and TTFT includes the hand-off.
+* The CED models are dense Llama-3 shapes split half and half (DeepSeek-V4.1-Flash is a MoE with
+  compressed sparse attention). A replayed token is charged a whole decoder layer (its local K/V
+  included, standing in for the paper's sliding-window branch), and CED does not change the KV size:
+  the paper's KV savings come from cross-layer sharing and FP4, which are not modelled.
 * The optical transform engine is first-order: noise as ENOB with ideal gain control, passes
   `4^(required − ENOB)`, integer mask rewrites, static lasers and tuning; no crosstalk or drift.
   Relaxed-tiling decode (FFTs at decode) and the accuracy of compressed KV are not modelled.

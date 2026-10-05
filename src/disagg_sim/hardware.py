@@ -22,6 +22,16 @@ Added 2026-10-04 (Fourier-optics follow-up, all illustrative or speculative wher
   ``HYPOTHETICAL_OPTICAL``, an optical **MAC** that speeds up every matmul.
 * ``KVCompression`` / ``KVTransit``: compressing the KV hand-off either in the link
   ("compute in transit") or on the prefill GPU, for comparison.
+
+Added 2026-10-05 (brief 11): the Causal Encoder-Decoder (CED) option of DeepSeek-V4.1-Flash
+(arXiv:2609.19969, section 2.2). ``ModelSpec.ced_encoder_layers = E > 0`` makes the bottom E
+layers a causal encoder; every decoder layer projects its KV from the last encoder hidden state
+with its own weights, so a prompt token needs only the encoder plus the decoder's K/V
+projections. The last ``ced_replay`` prompt tokens (the paper's n_win = 128) still go through
+the decoder: on the prefill instance (``ced_replay_on="prefill"``, the paper's Decoder SWA
+Bounded Replay) or as the decode instance's first step (``"decode"``, the asymmetric P/D
+deployment of SGLang RFC #39963, where a prefill instance holds only the encoder's weights).
+Off by default: every other model is unchanged. Decode always runs the whole model.
 """
 
 from __future__ import annotations
@@ -120,6 +130,10 @@ class ModelSpec:
     distill_state: int = 16     # state size per channel for "distilled" (illustrative)
     act_format: str = "bf16"    # format a transform engine's output must match: bf16 | int8 | fp8
     prefill_lm_head: str = "all"  # "all": every prompt token (as now) | "last": last token only
+    # Causal Encoder-Decoder (DeepSeek-V4.1-Flash, arXiv:2609.19969 section 2.2). 0 = off.
+    ced_encoder_layers: int = 0   # E: the bottom E layers are the causal encoder (the paper: 20 of 40)
+    ced_replay: int = 128         # W: last prompt tokens replayed through the decoder (paper: n_win = 128)
+    ced_replay_on: str = "prefill"  # "prefill" (paper section 3.2.2) | "decode" (SGLang RFC #39963)
 
     def __post_init__(self):
         if self.mixer not in MIXERS:
@@ -134,10 +148,49 @@ class ModelSpec:
             raise ValueError(f"unknown prefill_lm_head {self.prefill_lm_head!r}")
         if self.act_format not in ENOB_REQUIRED:
             raise ValueError(f"unknown act_format {self.act_format!r}")
+        if self.ced_encoder_layers:
+            if self.mixer != "attention":
+                raise ValueError("ced_encoder_layers is modelled for mixer='attention' only")
+            if not 0 < self.ced_encoder_layers < self.n_layers:
+                raise ValueError("ced_encoder_layers must leave at least one decoder layer")
+            if self.ced_replay < 1:
+                raise ValueError("ced_replay must be at least 1 token")
+            if self.ced_replay_on not in ("prefill", "decode"):
+                raise ValueError(f"unknown ced_replay_on {self.ced_replay_on!r}")
 
     @property
     def head_dim(self) -> int:
         return self.d_model // self.n_heads
+
+    # ── Causal Encoder-Decoder (CED) ──
+    @property
+    def is_ced(self) -> bool:
+        return self.ced_encoder_layers > 0
+
+    @cached_property
+    def ced_kv_proj_params(self) -> int:
+        """The decoder layers' K and V projections (Wk, Wv), applied to the last encoder state."""
+        return (self.n_layers - self.ced_encoder_layers) * 2 * self.d_model * self.n_kv_heads * self.head_dim
+
+    @cached_property
+    def ced_prompt_params(self) -> int:
+        """Matmul parameters one prompt token touches under CED: encoder + decoder K/V
+        projections (no LM head). The paper's "activated parameters during prefill"."""
+        return self.ced_encoder_layers * self.params_per_layer + self.ced_kv_proj_params
+
+    @cached_property
+    def ced_prefill_resident_params(self) -> int:
+        """What a prefill-only instance must hold when the replay runs on decode: the input
+        embedding, the encoder and the decoder K/V projections (SGLang RFC #39963)."""
+        return self.ced_prompt_params + self.vocab * self.d_model
+
+    def ced_replay_lens(self, prompt_lens: list[int]) -> list[int]:
+        return [min(s, self.ced_replay) for s in prompt_lens]
+
+    def ced_replay_attention(self, layers: int, s: int, w: int) -> int:
+        """QK^T and AV FLOPs of the last w positions of an s-token prompt, over ``layers`` causal
+        layers: sum of 4 d c for c = s - w + 1 .. s (integers, so every language agrees)."""
+        return 2 * layers * self.d_model * w * (2 * s - w + 1)
 
     # ── layer structure (all-attention models: every layer is attention) ──
     def layer_is_attention(self, i: int) -> bool:
@@ -382,9 +435,16 @@ LLAMA3_8B_HYBRID = replace(LLAMA3_8B, name="Llama-3-8B-shape hybrid 1:3", mixer=
 LLAMA3_8B_HYENA_CIRC = replace(LLAMA3_8B_HYENA, name="Llama-3-8B-shape Hyena-2 + block-circulant 256",
                                circulant_block=256)
 
+# CED proxies (brief 11): the same dense shapes split half encoder, half decoder, as
+# DeepSeek-V4.1-Flash splits its 40 layers 20/20 (arXiv:2609.19969, section 4.2.1). Illustrative:
+# that model is a 552B MoE with compressed sparse attention, not a dense Llama.
+LLAMA3_8B_CED = replace(LLAMA3_8B, name="Llama-3-8B-shape CED 16+16", ced_encoder_layers=16)
+LLAMA3_70B_CED = replace(LLAMA3_70B, name="Llama-3-70B-shape CED 40+40", ced_encoder_layers=40)
+
 MODELS = {"llama3-8b": LLAMA3_8B, "llama3-70b": LLAMA3_70B, "llama3-8b-hyena": LLAMA3_8B_HYENA,
           "llama3-8b-hyena-dist": LLAMA3_8B_HYENA_DIST, "llama3-8b-hybrid": LLAMA3_8B_HYBRID,
-          "llama3-8b-hyena-circ": LLAMA3_8B_HYENA_CIRC}
+          "llama3-8b-hyena-circ": LLAMA3_8B_HYENA_CIRC,
+          "llama3-8b-ced": LLAMA3_8B_CED, "llama3-70b-ced": LLAMA3_70B_CED}
 
 
 # ──────────────────────────────────────────────────────────── hardware ──
@@ -614,6 +674,21 @@ class CostModel:
     enforce_tdp: bool = True        # a real part throttles at its board power limit
     dvfs: bool = False              # lower the compute clock on memory-bound steps
     s_min: float = 0.4              # lowest compute clock, as a fraction of nominal
+    # A prefill-pool instance. Changes nothing except for a CED model whose replay runs on
+    # decode: then it holds only the encoder's weights and its prefill stops at the encoder.
+    prefill_only: bool = False
+
+    @cached_property
+    def encoder_only(self) -> bool:
+        m = self.model
+        return self.prefill_only and m.is_ced and m.ced_replay_on == "decode"
+
+    @cached_property
+    def resident_weight_bytes(self) -> float:
+        m = self.model
+        if self.encoder_only:
+            return m.ced_prefill_resident_params * m.weight_bytes
+        return m.weight_bytes_total
 
     @cached_property
     def flops_rate(self) -> float:
@@ -626,7 +701,7 @@ class CostModel:
     @property
     def kv_capacity_tokens(self) -> int:
         """Admission units that fit beside the weights: KV tokens (or distilled states)."""
-        free = self.device.mem_capacity * self.n_devices * self.mem_util - self.model.weight_bytes_total
+        free = self.device.mem_capacity * self.n_devices * self.mem_util - self.resident_weight_bytes
         if free <= 0:
             raise ValueError(f"{self.model.name} does not fit on {self.n_devices}x {self.device.name}")
         return int(free // self.model.cache_unit_bytes)
@@ -716,6 +791,8 @@ class CostModel:
         """One prefill step over whole prompts (no chunking)."""
         m = self.model
         tokens = sum(prompt_lens)
+        if m.is_ced:
+            return self._prefill_ced(prompt_lens, tokens)
         if not m.is_transformer:
             return self._prefill_ops(prompt_lens, tokens)
         # The LM head is charged for every prompt token, as a plain forward pass computes
@@ -728,6 +805,45 @@ class CostModel:
         # causal attention: QK^T and AV, each 2*d*c FLOPs at position c (diagonal included)
         flops += sum(2 * m.n_layers * m.d_model * s * (s + 1) for s in prompt_lens)
         nbytes = m.weight_bytes_read(tokens) + tokens * m.kv_bytes_per_token
+        return self._time(flops, nbytes)
+
+    def _prefill_ced(self, prompt_lens: list[int], tokens: int) -> StepCost:
+        """CED prefill (arXiv:2609.19969 section 2.2). Every prompt token runs the E encoder
+        layers and the decoder layers' K/V projections from the last encoder state; nothing
+        else of the decoder. With the replay on prefill, the last W tokens of each prompt
+        then run the decoder layers too (attending to the whole prompt), and only they reach
+        the LM head. With the replay on decode, a prefill-only instance stops at the encoder
+        and reads only the encoder's weights; the decode instance does the rest
+        (``ced_step``). All FLOP counts are integers below 2^53: exact in every language."""
+        m = self.model
+        enc, dec = m.ced_encoder_layers, m.n_layers - m.ced_encoder_layers
+        flops = 2 * m.ced_prompt_params * tokens
+        flops += sum(2 * enc * m.d_model * s * (s + 1) for s in prompt_lens)
+        if self.encoder_only:
+            nbytes = m.ced_prompt_params * m.weight_bytes + tokens * m.embedding_row_bytes
+            return self._time(flops, nbytes + tokens * m.kv_bytes_per_token)
+        reps = m.ced_replay_lens(prompt_lens)
+        rt = sum(reps)
+        flops += 2 * dec * m.params_per_layer * rt
+        flops += sum(m.ced_replay_attention(dec, s, w) for s, w in zip(prompt_lens, reps))
+        flops += 2 * m.vocab * m.d_model * (rt if m.prefill_lm_head == "all" else len(prompt_lens))
+        nbytes = m.weight_bytes_read(tokens) + tokens * m.kv_bytes_per_token
+        return self._time(flops, nbytes)
+
+    def ced_step(self, ctx: int, batch: int, replay: list[tuple[int, int]]) -> StepCost:
+        """A decode-pool step under CED with the replay on decode (SGLang RFC #39963): ``batch``
+        running sequences decode one token each over ``ctx`` cached positions (exactly as
+        ``decode_sum``), while each newly admitted request runs its last w prompt tokens
+        through the whole model (a bounded prefill) and emits its first token. ``replay`` is
+        a list of (prompt length s, w)."""
+        m = self.model
+        rt = sum(w for _, w in replay)
+        flops = 2 * m.matmul_params * batch + 4 * m.n_layers * m.d_model * (ctx + batch)
+        flops += 2 * m.layer_params * rt
+        flops += 2 * m.vocab * m.d_model * (rt if m.prefill_lm_head == "all" else len(replay))
+        flops += sum(m.ced_replay_attention(m.n_layers, s, w) for s, w in replay)
+        nbytes = m.weight_bytes_read(batch + rt) + (ctx + batch) * m.kv_bytes_per_token
+        nbytes += sum(s for s, _ in replay) * m.kv_bytes_per_token
         return self._time(flops, nbytes)
 
     def _digital_flops(self, ops: Ops) -> float:

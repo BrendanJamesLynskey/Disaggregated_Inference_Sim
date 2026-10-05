@@ -226,6 +226,13 @@ class PrefillInstance(Instance):
                 cost = self.sim.endpoint_compress(self.cost, cost, batch)
             yield from self.step("prefill", cost, f"prefill n={len(batch)} tok={tokens}",
                                  len(batch))
+            if self.cost.encoder_only:
+                # CED, replay on decode: the decode instance emits the first token, so every
+                # request is handed off, single-token ones included
+                for r in batch:
+                    r.prefill_done = self.env.now
+                    self.env.process(self.sim.kv_transfer(r))
+                continue
             for r in batch:
                 self.emit_first_token(r)
                 if r.output_len <= 1:
@@ -244,6 +251,49 @@ class DecodeInstance(Instance):
                 yield from self.idle()
                 continue
             yield from self.decode_once()
+
+
+class CedDecodeInstance(DecodeInstance):
+    """A decode instance for a CED model with the replay on decode (SGLang RFC #39963).
+
+    A newly admitted request first runs its last ``ced_replay`` prompt tokens through the
+    whole model (a bounded prefill) in the same step as the running batch's decode, and
+    emits its first token at the end of that step; from then on it decodes as usual.
+    """
+
+    def run(self):
+        while True:
+            self.admit_decode()
+            if not self.running:
+                yield from self.idle()
+                continue
+            yield from self.ced_once()
+
+    def ced_once(self):
+        w = self.sim.cfg.model.ced_replay
+        ctx, b, replay = 0, 0, []
+        for r in self.running:
+            if r.tokens_out:
+                ctx += r.prompt_len + r.tokens_out
+                b += 1
+            else:
+                replay.append((r.prompt_len, min(r.prompt_len, w)))
+        cost = self.cost.ced_step(ctx, b, replay)
+        yield from self.step("decode", cost, f"decode b={b} replay={len(replay)}", len(self.running))
+        now, still = self.env.now, []
+        for r in self.running:
+            if r.tokens_out:
+                r.itls.append(now - r.last_token)
+                r.tokens_out += 1
+                r.last_token = now
+            else:
+                self.emit_first_token(r)
+            if r.tokens_out >= r.output_len:
+                self.kv_used -= self.kv_need(r)
+                self.sim.finish(r)
+            else:
+                still.append(r)
+        self.running = still
 
 
 class FastDecodeInstance(DecodeInstance):
@@ -453,9 +503,16 @@ class Simulation:
 
         if cfg.kv_transit is not None and cfg.mode != "disagg":
             raise ValueError("kv_transit compresses the prefill-to-decode hand-off: mode='disagg' only")
+        ced_on_decode = cfg.model.is_ced and cfg.model.ced_replay_on == "decode"
+        if ced_on_decode and cfg.mode != "disagg":
+            raise ValueError("ced_replay_on='decode' splits prefill across the two pools: mode='disagg' only")
+        if ced_on_decode and cfg.fast_forward:
+            raise ValueError("fast_forward does not model the CED replay step on decode")
         if cfg.mode == "disagg":
             self.prefill = [PrefillInstance(self, i) for i in range(cfg.n_prefill)]
             dec = FastDecodeInstance if cfg.fast_forward else DecodeInstance
+            if ced_on_decode:
+                dec = CedDecodeInstance
             self.decode = [dec(self, i) for i in range(cfg.n_decode)]
             self.instances: list[Instance] = self.prefill + self.decode
         elif cfg.mode == "colocated":
@@ -475,7 +532,8 @@ class Simulation:
         cap = {"prefill": cfg.prefill_power_cap_w, "decode": cfg.decode_power_cap_w}.get(role)
         dev, n = cfg.pool(role)
         return CostModel(cfg.model, dev, n, cfg.step_overhead,
-                         power_cap_w=cap if cap is not None else cfg.power_cap_w, dvfs=cfg.dvfs)
+                         power_cap_w=cap if cap is not None else cfg.power_cap_w, dvfs=cfg.dvfs,
+                         prefill_only=role == "prefill")
 
     def endpoint_compress(self, cm: CostModel, cost, batch: list[Request]):
         """Compress each request's hand-off on the prefill GPU after the step."""
@@ -484,7 +542,7 @@ class Simulation:
             return cost                       # "none": nothing to do
         ops = nbytes = 0.0
         for r in batch:
-            if r.output_len <= 1:
+            if r.output_len <= 1 and not cm.encoder_only:
                 continue                      # finished at prefill: nothing to hand off
             hb = m.handoff_bytes(r.prompt_len)
             ops += tr.ops(hb, r.prompt_len, m.kv_bytes, True)
@@ -550,7 +608,7 @@ class Simulation:
         with self.link.request() as grant:
             yield grant
             r.kv_start = self.env.now
-            stats.wait += r.kv_start - r.first_token
+            stats.wait += r.kv_start - r.handoff_start
             t, nbytes, joules, transit_j, transit_bound = self.transfer(r)
             yield self.env.timeout(t)
         stats.busy += t

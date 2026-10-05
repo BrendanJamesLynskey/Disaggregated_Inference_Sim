@@ -7,6 +7,7 @@
     disagg-sim --model llama3-8b --devices-per-instance 1 --prefill-device h100 --decode-device a100
     disagg-sim --model llama3-8b-hyena-circ --devices-per-instance 1 --prefill-device optical-fft --decode-device h100
     disagg-sim --model llama3-8b --devices-per-instance 1 --link eth-25g --kv-compress fp8 --kv-compress-at transit
+    disagg-sim --model llama3-70b-ced --ced-replay-on decode --prefill-devices-per-instance 2
 """
 
 from __future__ import annotations
@@ -78,6 +79,12 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--kv-keep", type=float, help="freq-keep-k: fraction of frequency bins kept (default 0.5)")
     g.add_argument("--transit-ops-per-byte", type=float, help="in-transit compute budget per line byte")
     g.add_argument("--transit-pj-per-bit", type=float, help="in-transit stage energy per input bit")
+    g = p.add_argument_group("Causal Encoder-Decoder (DeepSeek-V4.1-Flash, arXiv:2609.19969; *-ced models)")
+    g.add_argument("--ced-encoder-layers", type=int, metavar="E",
+                   help="make the bottom E layers a causal encoder (0: off; the *-ced models use half)")
+    g.add_argument("--ced-replay", type=int, metavar="W", help="prompt tokens replayed through the decoder (default 128)")
+    g.add_argument("--ced-replay-on", choices=["prefill", "decode"],
+                   help="replay on the prefill instance (the paper) or as decode's first step (SGLang RFC #39963)")
     p.add_argument("--ppa", action="store_true", help="also report area, silicon cost and perf/W, /mm², /$")
     return p
 
@@ -132,6 +139,10 @@ def config_from_args(a) -> SimConfig:
     model = MODELS[a.model]
     if a.prefill_lm_head is not None:
         model = replace(model, prefill_lm_head=a.prefill_lm_head)
+    ced = {k: v for k, v in (("ced_encoder_layers", a.ced_encoder_layers), ("ced_replay", a.ced_replay),
+                             ("ced_replay_on", a.ced_replay_on)) if v is not None}
+    if ced:
+        model = replace(model, **ced)
     fe = a.fft_efficiency
     return SimConfig(model=model, device=pick_device(a.device, over, fe),
                      prefill_device=pick_device(a.prefill_device, over, fe),

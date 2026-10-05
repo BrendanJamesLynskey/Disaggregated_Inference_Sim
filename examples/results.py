@@ -15,6 +15,11 @@ Timings are wall-clock on whatever machine runs this; the header records which o
 Sections 10-15 (added 2026-10-04, FOptInf deck 03) run only on the current code: heterogeneous
 pools, FFT-mixing models on an optical transform engine, the KV hand-off links, and compressing
 the hand-off in transit or at the GPU. Their coefficients are illustrative (see each section).
+
+Sections 16-18 (added 2026-10-05, brief 11) measure the Causal Encoder-Decoder option (DeepSeek-V4.1-Flash,
+arXiv:2609.19969) on a dense Llama-3-70B-shape proxy: prefill cost, pool split and capacity across prompt:output
+ratios. ``--ced-from-json`` re-renders them from examples/results_ced.json; with ``--keep-timings
+--optical-from-json --ced-from-json`` nothing is rerun except sections 1-8.
 """
 
 from __future__ import annotations
@@ -744,6 +749,185 @@ def render_optical(o: dict) -> str:
     return "\n".join(L) + "\n"
 
 
+# ───────────────────── sections 16-18: the Causal Encoder-Decoder (brief 11) ──
+# DeepSeek-V4.1-Flash (arXiv:2609.19969): prefill runs the causal encoder only (section 2.2). The
+# proxies are dense Llama-3-70B shapes split 40+40, so every number here is the simulator's, not
+# the paper's. The prompt:output ratios stand in for agent loops (illustrative, not measured).
+CED_WORKLOADS = [(2048, 512), (4096, 256), (8192, 128), (16384, 64)]   # mean prompt, mean output
+CED_CLUSTER = 6                       # instances of 4xH100 (24 GPUs), split between the pools
+CED_N, CED_SEED, CED_TARGET, CED_TOL = 1000, 1, 0.9, 0.02
+CED_TTFT_X = 5.0                      # TTFT SLO = 5x the decoder-only model's unloaded prefill of the mean prompt
+CED_GPU_BUDGET = 24
+CED_SMALL_PREFILL = [(2, 5), (4, 4), (6, 3), (8, 2)]   # (prefill, decode) instances: 2P x 2 GPUs + D x 4 GPUs = 24
+
+
+def collect_ced() -> dict:
+    from dataclasses import replace
+    from disagg_sim.hardware import H100_SXM, LLAMA3_70B, LLAMA3_70B_CED, CostModel
+    from disagg_sim.search import Workload, max_sustainable_rate
+    from disagg_sim.sim import SimConfig
+    from disagg_sim.workload import LengthDist
+
+    base, ced = LLAMA3_70B, LLAMA3_70B_CED
+    enc = replace(ced, ced_replay_on="decode")
+    variants = {"decoder-only": base, "CED, replay on prefill": ced, "CED, replay on decode": enc}
+    out: dict = {}
+
+    # 16a. activated parameters per token
+    out["params"] = {"decoder_only_token": base.matmul_params, "ced_prompt_token": ced.ced_prompt_params,
+                     "ced_decode_token": ced.matmul_params, "ced_kv_proj": ced.ced_kv_proj_params,
+                     "layer_params": base.layer_params, "lm_head": base.vocab * base.d_model,
+                     "replay": ced.ced_replay}
+    # 16b. one prefill step, one prompt, 4xH100
+    steps = {}
+    for s in (2048, 8192, 32768):
+        b = CostModel(base, H100_SXM, 4).prefill([s])
+        c = CostModel(ced, H100_SXM, 4).prefill([s])
+        e = CostModel(enc, H100_SXM, 4, prefill_only=True).prefill([s])
+        steps[s] = {k: {"flops": x.flops, "time": x.time, "bound": x.bound} for k, x in
+                    (("base", b), ("ced", c), ("enc", e))}
+    out["steps"] = steps
+    # 16c. what a prefill instance holds, and the KV room left
+    room = {}
+    for n in (1, 2, 4):
+        row = {}
+        for k, m, po in (("base", base, False), ("enc", enc, True)):
+            cm = CostModel(m, H100_SXM, n, prefill_only=po)
+            try:
+                kv = cm.kv_capacity_tokens
+            except ValueError:
+                kv = None
+            row[k] = {"weights": cm.resident_weight_bytes, "kv_tokens": kv}
+        room[n] = row
+    out["room"] = room
+
+    def wl_of(p, o):
+        return Workload(LengthDist(p, 0.5), LengthDist(o, 0.5), n=CED_N, seed=CED_SEED)
+
+    def best_rate(cfg, w):
+        return max_sustainable_rate(cfg, w, target=CED_TARGET, rel_tol=CED_TOL)["rate"]
+
+    # 17. pool split at a fixed 6-instance cluster, per prompt:output ratio
+    split = {}
+    for p, o in CED_WORKLOADS:
+        slo = CED_TTFT_X * CostModel(base, H100_SXM, 4).prefill([p]).time
+        w = wl_of(p, o)
+        rows = {}
+        for name, m in variants.items():
+            rates = {}
+            for np_ in range(1, CED_CLUSTER):
+                cfg = SimConfig(model=m, n_prefill=np_, n_decode=CED_CLUSTER - np_, ttft_slo=slo,
+                                fast_forward=not (m.is_ced and m.ced_replay_on == "decode"))
+                rates[np_] = best_rate(cfg, w)
+            rows[name] = rates
+        split[f"{p}:{o}"] = {"ttft_slo": slo, "rates": rows}
+    out["split"] = split
+
+    # 18. two-GPU prefill instances under a 24-GPU budget (the 8192:128 workload)
+    p, o = 8192, 128
+    slo = CED_TTFT_X * CostModel(base, H100_SXM, 4).prefill([p]).time
+    small = {}
+    for name, m in variants.items():
+        rates = {}
+        for np_, nd in CED_SMALL_PREFILL:
+            cfg = SimConfig(model=m, n_prefill=np_, n_decode=nd, prefill_devices_per_instance=2, ttft_slo=slo,
+                            fast_forward=not (m.is_ced and m.ced_replay_on == "decode"))
+            rates[f"{np_}x2+{nd}x4"] = best_rate(cfg, wl_of(p, o))
+        small[name] = rates
+    out["small_prefill"] = {"workload": f"{p}:{o}", "ttft_slo": slo, "rates": small}
+    return out
+
+
+def render_ced(c: dict) -> str:
+    L: list[str] = []
+    p = L.append
+    pa = c["params"]
+    b = lambda x: f"{x / 1e9:.2f}B"
+    p("## 16. Causal Encoder-Decoder (CED): the cost model (Llama-3-70B shape, 4xH100)")
+    p("")
+    p("DeepSeek-V4.1-Flash (arXiv:2609.19969, section 2.2) splits its 40 layers into a 20-layer causal encoder and a"
+      " 20-layer decoder whose global KV is projected from the last encoder hidden state, so a prompt token runs only"
+      " the encoder (and the decoder's K/V projections). The proxy here is the dense Llama-3-70B shape split 40 + 40"
+      f" (`llama3-70b-ced`); the last {pa['replay']} prompt tokens are replayed through the decoder (the paper's"
+      " n_win = 128), on the prefill instance (`--ced-replay-on prefill`, the paper) or as the decode instance's first"
+      " step (`--ced-replay-on decode`, SGLang RFC #39963, where a prefill instance holds only the encoder). Decode"
+      " always runs the whole model. Illustrative: the paper's model is a 552B MoE with compressed sparse attention.")
+    p("")
+    table(L, ["Matmul parameters a token touches", "Parameters", "vs a decode token"], [
+        ["Decoder-only, any token (layers + LM head)", b(pa["decoder_only_token"]), "1.000"],
+        ["CED, prompt token (encoder + decoder K/V projections)", b(pa["ced_prompt_token"]),
+         f"{pa['ced_prompt_token'] / pa['ced_decode_token']:.3f}"],
+        ["CED, decode token (whole model)", b(pa["ced_decode_token"]), "1.000"],
+        ["... of which the decoder's K/V projections", b(pa["ced_kv_proj"]),
+         f"{pa['ced_kv_proj'] / pa['ced_decode_token']:.3f}"],
+    ])
+    p("The paper's own figures are 8B activated per token at prefill and 16B at decode (abstract; section 4.2.1).")
+    p("")
+    rows = []
+    for s, r in c["steps"].items():
+        rows.append([f"{int(s):,}", f"{r['base']['flops'] / 1e15:.3f}", ms(r["base"]["time"]),
+                     f"{r['ced']['flops'] / 1e15:.3f}", ms(r["ced"]["time"]),
+                     f"{r['ced']['time'] / r['base']['time']:.3f}",
+                     f"{r['enc']['flops'] / 1e15:.3f}", ms(r["enc"]["time"]),
+                     f"{r['enc']['time'] / r['base']['time']:.3f}"])
+    table(L, ["Prompt", "Decoder-only PFLOP", "time", "CED replay on prefill PFLOP", "time", "vs decoder-only",
+              "CED encoder only PFLOP", "time", "vs decoder-only"], rows)
+    p("One prompt per step; every step here is compute-bound. The paper: CED \"effectively halv[es] the overall"
+      " computation\" of prefill for N >> n_win (section 2.2).")
+    p("")
+    rows = []
+    for n, r in c["room"].items():
+        kv = lambda x: "does not fit" if x is None else f"{x:,}"
+        rows.append([f"{n}x H100", f"{r['base']['weights'] / 1e9:.1f} GB", kv(r["base"]["kv_tokens"]),
+                     f"{r['enc']['weights'] / 1e9:.1f} GB", kv(r["enc"]["kv_tokens"])])
+    table(L, ["Prefill instance", "Decoder-only (or CED replay on prefill): weights", "KV room, tokens",
+              "CED replay on decode: weights", "KV room, tokens"], rows)
+    p("KV room = 90% of HBM minus the resident weights, in tokens of BF16 KV for all 80 layers (327,680 bytes each).")
+    p("")
+
+    p("## 17. CED: pool split and capacity across prompt:output ratios (6 instances of 4xH100)")
+    p("")
+    p(f"Highest Poisson rate with at least {CED_TARGET:.0%} of requests inside both SLOs (bisection on full runs to"
+      f" {CED_TOL:.0%}, as `search.max_sustainable_rate`), for every split of {CED_CLUSTER} instances into prefill and"
+      f" decode pools. {CED_N} requests, seed {CED_SEED}, prompt and output cv 0.5, InfiniBand NDR, TPOT SLO 25 ms;"
+      f" TTFT SLO = {CED_TTFT_X:g}x the decoder-only model's unloaded prefill of the mean prompt (shown). The"
+      " prompt:output ratios stand in for agent loops (illustrative). Gains above 2x are queueing, not FLOPs: with"
+      " a fixed TTFT SLO, halving the prefill service time cuts the queueing delay by more than half.")
+    p("")
+    rows = []
+    for wk, d in c["split"].items():
+        base_best = max(d["rates"]["decoder-only"].values())
+        for name, rates in d["rates"].items():
+            rs = {int(k): v for k, v in rates.items()}
+            bp = max(rs, key=rs.get)
+            rows.append([wk.replace(":", " : "), ms(d["ttft_slo"]) if name == "decoder-only" else "", name]
+                        + [f"{rs[k]:.2f}" for k in sorted(rs)]
+                        + [f"{bp}P{CED_CLUSTER - bp}D", f"{rs[bp]:.2f}", f"{rs[bp] / CED_GPU_BUDGET:.3f}",
+                           f"{rs[bp] / base_best:.2f}x"])
+    table(L, ["Prompt : output", "TTFT SLO", "Model"] + [f"{k}P{CED_CLUSTER - k}D req/s" for k in range(1, CED_CLUSTER)]
+          + ["Best split", "Best req/s", "req/s per GPU", "vs decoder-only best"], rows)
+
+    p("## 18. CED: two-GPU prefill instances (8,192 : 128, 24 GPUs)")
+    p("")
+    sp = c["small_prefill"]
+    p("Prefill instances on 2 H100s (decode instances keep 4), every split that uses all 24 GPUs; otherwise as"
+      f" section 17 (TTFT SLO {ms(sp['ttft_slo'])}). A whole Llama-3-70B shape only just fits on two H100s (section 16:"
+      " KV room for one 8,192-token batch); the CED encoder fits with 25x the room. The roofline charges no extra"
+      " cost for a tight fit, so this compares capacity, not feasibility. The decoder-only row is limited by the"
+      " prefill router, not by compute: the router (unchanged) sends each request to the instance with the fewest"
+      " queued prompt tokens and ignores the batch in flight, so with 1.1-second steps it piles work onto busy"
+      " instances while others idle. The same router applies in section 17, where it slightly favours the model with"
+      " the shorter prefill steps.")
+    p("")
+    rows = []
+    for name, rates in sp["rates"].items():
+        bk = max(rates, key=rates.get)
+        rows.append([name] + [f"{rates[k]:.2f}" for k in rates] + [bk, f"{rates[bk]:.2f}"])
+    keys = list(next(iter(sp["rates"].values())))
+    table(L, ["Model"] + [f"{k} req/s" for k in keys] + ["Best", "Best req/s"], rows)
+    return "\n".join(L) + "\n"
+
+
 def cpu_name() -> str:
     try:
         for line in Path("/proc/cpuinfo").read_text().splitlines():
@@ -765,6 +949,8 @@ def main():
     ap.add_argument("--keep-timings", action="store_true", help="reuse section 9 from the current results.md")
     ap.add_argument("--optical-from-json", action="store_true",
                     help="render sections 10-15 from examples/results_optical.json instead of rerunning them")
+    ap.add_argument("--ced-from-json", action="store_true",
+                    help="render sections 16-18 from examples/results_ced.json instead of rerunning them")
     a = ap.parse_args()
     sys.path.insert(0, str(ROOT / "src"))
     new = json.loads(json.dumps(collect()))          # same key types as the legacy side
@@ -782,7 +968,13 @@ def main():
     else:
         optical = json.loads(json.dumps(collect_optical()))
         oj.write_text(json.dumps(optical, indent=1))
-    OUT.write_text(render(new, old, timings) + render_optical(optical))
+    cj = ROOT / "examples" / "results_ced.json"
+    if a.ced_from_json:
+        ced = json.loads(cj.read_text())
+    else:
+        ced = json.loads(json.dumps(collect_ced()))
+        cj.write_text(json.dumps(ced, indent=1))
+    OUT.write_text(render(new, old, timings) + render_optical(optical) + "\n" + render_ced(ced))
     print(f"wrote {OUT}")
 
 
