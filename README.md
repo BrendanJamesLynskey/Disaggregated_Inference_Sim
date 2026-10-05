@@ -205,3 +205,7 @@ The tools and methods this repository measures with are explained, with their ov
 
 The [LLM Inference Simulators](https://github.com/BrendanJamesLynskey/LLM_Hub_Inference_Simulators)
 series on the [LLMs hub](https://github.com/BrendanJamesLynskey/LLMs).
+
+## Licence
+
+MIT — see [`LICENSE`](LICENSE).
