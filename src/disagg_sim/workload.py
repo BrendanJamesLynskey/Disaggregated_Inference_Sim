@@ -53,6 +53,8 @@ class Request:
     nodes: list = field(default_factory=list, repr=False)
     covered: int = field(default=0, repr=False)
     swapped_units: int = field(default=0, repr=False)
+    # Speculative decoding (brief 20A2): this request's acceptance-draw generator state (None until first used)
+    rng: int | None = field(default=None, repr=False)
 
     # ── derived latencies ────────────────────────────────────────────────
     @property
@@ -192,3 +194,67 @@ def load_workload(path: str | Path) -> list[Request]:
             r.emit_key, r.after, r.think = x["emit"], x["after"], float(x["think"])
         out.append(r)
     return out
+
+
+# ───────────────────────────────────────────── named workloads (brief 20A2) ──
+@dataclass(frozen=True)
+class WorkloadPreset:
+    """A named workload: length distributions, session shape and the SLOs it is judged by. Every number is a
+    parameter with its rationale; the SLOs are this simulator's choices unless a source is named."""
+
+    key: str
+    label: str
+    prompt: LengthDist            # each turn's new input
+    output: LengthDist
+    ttft_slo: float               # seconds
+    tpot_slo: float               # seconds per output token
+    turns: int = 1
+    think: float = 0.0            # mean seconds between a reply and the next turn
+    system_prompts: int = 0
+    system_len: int = 0
+    share: float = 1.0
+    rationale: str = ""
+
+    def generate(self, rate: float, n: int, seed: int = 0) -> list[Request]:
+        """``n`` requests; ``rate`` is the arrival rate of sessions (of requests when ``turns`` is 1)."""
+        if self.turns == 1 and not self.system_prompts:
+            return poisson_workload(rate, n, self.prompt, self.output, seed=seed)
+        return chat_sessions(rate, n, self.prompt, self.output, seed=seed, turns=self.turns, think=self.think,
+                             system_prompts=self.system_prompts, system_len=self.system_len, share=self.share)
+
+
+WORKLOADS = {w.key: w for w in (
+    WorkloadPreset(
+        "chat", "Chat", LengthDist(161.31, 1.0, hi=1024), LengthDist(337.99, 1.0, hi=1024), ttft_slo=1.0, tpot_slo=0.05,
+        turns=3, think=10.0, system_prompts=8, system_len=512,
+        rationale="ShareGPT turn lengths (means 161 in, 338 out, as vLLM's evaluation, arXiv:2309.06180 section 6.1); "
+                  "three turns 10 s apart behind one of eight 512-token system prompts (our choice). SLOs: 1 s to the "
+                  "first token, 50 ms a token (20 tokens/s, faster than reading); DistServe's chatbot SLOs on A100s "
+                  "were 0.25-4 s and 0.1-0.2 s (arXiv:2401.09670, Table 1)."),
+    WorkloadPreset(
+        "coding-agent", "Coding agent", LengthDist(512, 0.8, hi=4096), LengthDist(160, 0.6, hi=1024), ttft_slo=1.5,
+        tpot_slo=0.04, turns=8, think=2.0, system_prompts=2, system_len=6144,
+        rationale="An agent loop: a 6,144-token prefix (tools, instructions, repository context) shared by every "
+                  "session, eight turns of tool output (mean 512) and short actions (mean 160), 2 s of tool time "
+                  "between turns: long prompts, short outputs, heavy prefix reuse (our choice of numbers)."),
+    WorkloadPreset(
+        "offline-batch", "Offline batch", LengthDist(2048, 0.5, hi=8192), LengthDist(256, 0.5, hi=2048), ttft_slo=60.0,
+        tpot_slo=0.5,
+        rationale="Bulk summarisation or labelling: nobody is waiting, so the SLOs are loose (60 s, 0.5 s a token) "
+                  "and throughput and cost per token decide (our choice)."),
+    WorkloadPreset(
+        "long-rag", "Long-context RAG", LengthDist(7904, 0.50, hi=15360), LengthDist(230, 0.48, hi=1024),
+        ttft_slo=5.0, tpot_slo=0.05, system_prompts=4, system_len=1024,
+        rationale="Retrieved documents make the prompt long: lengths fitted to arxiv_summarization's median and 90th "
+                  "percentile (7,059 / 12,985 in, 208 / 371 out; Sarathi-Serve, arXiv:2403.02310, Table 2; lognormal "
+                  "means 7,904 and 230, cv 0.50 and 0.48), behind one "
+                  "of four 1,024-token instruction prefixes. SLOs: 5 s, 50 ms (DistServe's summarisation: 15 s, "
+                  "0.15 s on A100s)."),
+    WorkloadPreset(
+        "voice", "Real-time voice", LengthDist(64, 0.5, hi=512), LengthDist(48, 0.5, hi=256), ttft_slo=0.3,
+        tpot_slo=0.025, turns=6, think=3.0, system_prompts=4, system_len=1024,
+        rationale="A spoken conversation: short utterances and replies, six turns 3 s apart, a 1,024-token persona "
+                  "prompt. People minimise the silence between turns (Stivers et al., PNAS 2009, "
+                  "doi:10.1073/pnas.0903616106), so the first token gets 300 ms and the stream 25 ms a token to keep "
+                  "speech synthesis fed (our choice)."),
+)}

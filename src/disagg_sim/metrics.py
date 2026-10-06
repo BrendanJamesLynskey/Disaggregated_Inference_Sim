@@ -129,6 +129,11 @@ def summarise(res: SimResult) -> dict:
             "static_J": i.cost.optical_static_w * res.horizon} for i in res.instances}
     if cfg.scheduled:
         out["scheduler"] = scheduler_report(res)
+    if any(cfg.parallel_for(r) is not None for r in ("prefill", "decode", "colocated")):
+        out["parallel"] = parallel_report(res)
+    if cfg.quantised:
+        out["formats"] = {"weights": cfg.weight_format, "kv": cfg.kv_format, "compute": cfg.compute_format,
+                          "weight_bytes": cfg.model.weight_bytes, "kv_bytes": cfg.model.kv_bytes}
     tr = cfg.kv_transit
     if tr is not None:
         lk = res.link
@@ -141,16 +146,20 @@ def summarise(res: SimResult) -> dict:
 
 
 def scheduler_report(res: SimResult) -> dict:
-    """The brief-20A1 levers: what the schedulers did (only when ``SimConfig.scheduled``)."""
+    """The brief-20A1 levers: what the schedulers did (only when ``SimConfig.scheduled``). In disaggregated mode
+    (brief 20A2) the running-batch and KV figures are the decode pool's, the prefix cache the prefill pool's."""
     cfg, insts = res.cfg, res.instances
+    dec = [i for i in insts if i.role != "prefill"]
     busy = run = tok = alloc = 0.0          # plain loops, not sum(): Python 3.12's sum() of floats is compensated
-    for i in insts:
+    for i in dec:
         busy, run, tok, alloc = busy + i.busy, run + i.run_area, tok + i.tok_area, alloc + i.alloc_area
     out = {"batch_policy": cfg.batch_policy, "token_budget": insts[0].budget, "kv_policy": cfg.kv_policy,
-           "kv_capacity_units": insts[0].kv_cap, "kv_unit_tokens": insts[0].blk,
+           "kv_capacity_units": dec[0].kv_cap, "kv_unit_tokens": dec[0].blk,
            "mean_running": run / busy if busy else 0.0,
            "kv_token_frac": tok / alloc if alloc else math.nan,
            "computed_prefill_tokens": sum(i.computed_tokens for i in insts)}
+    if cfg.mode == "disagg":
+        out["prefill_kv_capacity_units"] = insts[0].kv_cap
     if cfg.kv_policy == "paged":
         out["preemption"] = cfg.preemption
         out["preemptions"] = sum(i.preemptions for i in insts)
@@ -161,12 +170,41 @@ def scheduler_report(res: SimResult) -> dict:
                 so, si, ss, sj = so + i.swap_out_bytes, si + i.swap_in_bytes, ss + i.swap_time, sj + i.swap_j
             out["swap"] = {"out_GB": so / 1e9, "in_GB": si / 1e9, "seconds": ss, "J": sj}
     if cfg.prefix_caching:
-        prompt = sum(i.prompt_tokens for i in insts)
-        hit = sum(i.hit_tokens for i in insts)
+        cached = [i for i in insts if i.cache is not None]
+        prompt = sum(i.prompt_tokens for i in cached)
+        hit = sum(i.hit_tokens for i in cached)
         out["prefix_cache"] = {"hit_rate": hit / prompt if prompt else 0.0, "hit_tokens": hit,
                                "prompt_tokens": prompt,
-                               "evicted_tokens": sum(i.cache.evicted_tokens for i in insts),
-                               "cached_tokens_end": sum(i.cache.cached_tokens for i in insts)}
+                               "evicted_tokens": sum(i.cache.evicted_tokens for i in cached),
+                               "cached_tokens_end": sum(i.cache.cached_tokens for i in cached)}
+    sp = cfg.speculative
+    if sp is not None:
+        from .speculative import expected_tokens
+        rows = sum(i.spec_rows for i in insts)
+        toks = sum(i.spec_tokens for i in insts)
+        dt = 0.0
+        for i in insts:
+            dt = dt + i.draft_time
+        out["speculative"] = {"draft": sp.draft, "gamma": sp.gamma, "alpha": sp.alpha, "verify_rows": rows,
+                              "tokens_per_verify": toks / rows if rows else math.nan,
+                              "closed_form": expected_tokens(sp.alpha, sp.gamma),
+                              "draft_time_frac": dt / busy if busy else 0.0}
+    return out
+
+
+def parallel_report(res: SimResult) -> dict:
+    """Brief 20A2: each pool's parallel layout and the share of its busy time on the scale-up link."""
+    cfg, out = res.cfg, {}
+    for i in res.instances:
+        p = cfg.parallel_for(i.role)
+        if p is None:
+            continue
+        r = out.setdefault(i.role, {"tp": p.tp, "pp": p.pp, "ep": p.ep, "microbatches": p.microbatches or p.pp,
+                                    "expert_imbalance": p.expert_imbalance, "link": i.cost.scale_up_link.name,
+                                    "busy_s": 0.0, "comm_s": 0.0, "comm_J": 0.0})
+        r["busy_s"], r["comm_s"], r["comm_J"] = r["busy_s"] + i.busy, r["comm_s"] + i.comm_time, r["comm_J"] + i.comm_j
+    for r in out.values():
+        r["comm_frac"] = r["comm_s"] / r["busy_s"] if r["busy_s"] else 0.0
     return out
 
 
@@ -207,6 +245,7 @@ def energy_report(res: SimResult, out_tokens: int, slo_met: int) -> dict:
     total = static + compute + memory + link
     transit = res.cfg.kv_transit is not None
     swap = res.cfg.scheduled and res.cfg.kv_policy == "paged" and res.cfg.preemption == "swap"
+    par = any(res.cfg.parallel_for(r) is not None for r in ("prefill", "decode", "colocated"))
     if optical:
         total = total + o_static + o_conv
     if transit:
@@ -216,6 +255,11 @@ def energy_report(res: SimResult, out_tokens: int, slo_met: int) -> dict:
         for i in res.instances:
             swap_j += i.swap_j
         total = total + swap_j
+    if par:                                  # brief 20A2: scale-up link energy (tensor/pipeline/expert parallel)
+        comm_j = 0.0
+        for i in res.instances:
+            comm_j += i.comm_j
+        total = total + comm_j
     breakdown = {"static": static / total, "compute": compute / total,
                  "memory": memory / total, "link": link / total}
     if optical:
@@ -225,6 +269,8 @@ def energy_report(res: SimResult, out_tokens: int, slo_met: int) -> dict:
         breakdown["transit"] = res.link.transit_j / total
     if swap:
         breakdown["swap"] = swap_j / total
+    if par:
+        breakdown["scale_up"] = comm_j / total
     return {
         "total_J": total,
         "avg_power_W": total / H,
@@ -278,10 +324,23 @@ def format_report(m: dict) -> str:
         if "swap" in s:
             line += f" ({s['swap']['out_GB']:.1f} GB swapped out, {s['swap']['seconds']:.2f} s)"
         lines.append(line)
+        if "speculative" in s:
+            c = s["speculative"]
+            lines.append(f"speculative  {c['draft']} draft, gamma {c['gamma']}, alpha {c['alpha']}: "
+                         f"{c['tokens_per_verify']:.2f} tokens per verify (closed form {c['closed_form']:.2f}), "
+                         f"draft {100 * c['draft_time_frac']:.0f}% of busy time")
         if "prefix_cache" in s:
             c = s["prefix_cache"]
             lines.append(f"prefix cache hit rate {100 * c['hit_rate']:.1f}% of {c['prompt_tokens']:,} prompt tokens, "
                          f"{c['evicted_tokens']:,} tokens evicted")
+    if "parallel" in m:
+        lines.append("parallel     " + "  ".join(
+            f"{k} tp {v['tp']} pp {v['pp']} ep {v['ep']} on {v['link']}: {100 * v['comm_frac']:.0f}% of busy time "
+            f"on the link" for k, v in m["parallel"].items()))
+    if "formats" in m:
+        f = m["formats"]
+        lines.append(f"formats      weights {f['weights']}, KV {f['kv']}, compute {f['compute']} "
+                     f"(accuracy not simulated)")
     capped = {k: v["power_bound_frac"] for k, v in e["per_instance"].items() if v["power_bound_frac"] > 0}
     if capped:
         lines.append("power-capped " + "  ".join(f"{k} {100 * v:.0f}% of busy time" for k, v in capped.items()))

@@ -9,3 +9,5 @@ __pycache__/
 !examples/results_optical.json
 !examples/results_ced.json
 !examples/results_levers.json
+!examples/results_levers2.json
+!examples/tradeoffs.json

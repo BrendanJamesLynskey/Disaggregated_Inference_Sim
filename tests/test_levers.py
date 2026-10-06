@@ -300,7 +300,7 @@ def test_reuse_distance_lowers_the_hit_rate_under_lru():
 
 # ── validation, CLI, I/O ────────────────────────────────────────────────
 @pytest.mark.parametrize("kw, msg", [
-    (dict(mode="disagg", batch_policy="chunked"), "colocated"),
+    (dict(mode="disagg", batch_policy="chunked", fast_forward=True), "fast_forward"),   # disagg: brief 20A2
     (dict(model=LLAMA3_8B_HYENA, kv_policy="paged"), "attention models"),
     (dict(model=LLAMA3_8B_CED, prefix_caching=True), "attention models"),
     (dict(prefix_caching=True, kv_policy="paged", preemption="swap"), "swap"),

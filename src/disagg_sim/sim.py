@@ -20,6 +20,12 @@ budget), KV memory policies (whole-sequence reservation as before, or the over-r
 compares against, or paged blocks with preemption by recompute or swap to host memory) and prefix
 caching (an LRU cache of shared prompt segments). They run in ``ScheduledInstance``; with every lever
 off, ``ColocatedInstance`` runs exactly as before.
+
+Added 2026-10-06 (brief 20A2), all off by default: the same levers in disaggregated pools (a prefill pool with
+prefix caching and chunking, ``ScheduledPrefillInstance``; a decode pool with paged KV and preemption,
+``ScheduledDecodeInstance``, which pulls each hand-off only once it has the blocks for it); speculative decoding in
+every scheduled instance; and the cost-model levers of ``hardware.py`` (tensor / pipeline / expert parallelism,
+weight and KV formats), which every instance type prices.
 """
 
 from __future__ import annotations
@@ -32,8 +38,9 @@ from dataclasses import dataclass, field
 
 import simpy
 
-from .hardware import (H100_SXM, LINKS, LLAMA3_70B, Accelerator, CostModel, KVTransit, Link,
-                       ModelSpec, StepCost)
+from .hardware import (H100_SXM, LINKS, LLAMA3_70B, MODELS, QUANT_FORMATS, Accelerator, CostModel, KVTransit,
+                       LeverStepCost, Link, ModelSpec, Parallel, StepCost)
+from .speculative import Speculative, draw_accepted, seed_state
 from .trace import Tracer
 from .workload import Request
 
@@ -78,12 +85,51 @@ class SimConfig:
     preemption: str = "recompute"      # paged, out of blocks: "recompute" | "swap" (to host memory)
     host_link: Link = LINKS["pcie5"]   # swap path between device and host memory
     prefix_caching: bool = False       # LRU cache of shared prompt segments (Request.prefix)
+    # Brief 20A2 levers (every default reproduces the behaviour above exactly). Parallelism inside an instance
+    # (hardware.Parallel; the pool's devices per instance must equal tp x pp), per pool if wanted; storage formats of
+    # the weights and the KV cache (hardware.QUANT_FORMATS) and the matmul input format ("bf16": weight-only, or the
+    # weight format itself on a device with units for it: W8A8, W4A4); speculative decoding (speculative.Speculative).
+    parallel: Parallel | None = None
+    prefill_parallel: Parallel | None = None
+    decode_parallel: Parallel | None = None
+    weight_format: str = "bf16"
+    kv_format: str = "bf16"
+    compute_format: str = "bf16"
+    speculative: Speculative | None = None
 
     @property
     def scheduled(self) -> bool:
-        """True when any brief-20A1 lever is on (inert settings such as the block size alone are not)."""
+        """True when any lever that needs the scheduled instances is on: brief 20A1's, or speculative decoding
+        (inert settings such as the block size alone are not)."""
         return (self.batch_policy != "prefill-priority" or self.max_num_batched_tokens is not None
-                or self.kv_policy != "oracle" or self.prefix_caching)
+                or self.kv_policy != "oracle" or self.prefix_caching or self.speculative is not None)
+
+    def parallel_for(self, role: str) -> Parallel | None:
+        own = {"prefill": self.prefill_parallel, "decode": self.decode_parallel}.get(role)
+        return own if own is not None else self.parallel
+
+    @property
+    def quantised(self) -> bool:
+        return (self.weight_format, self.kv_format, self.compute_format) != ("bf16", "bf16", "bf16")
+
+    @property
+    def lever_summary(self) -> str | None:
+        """Every brief-20A1/20A2 lever that is on, as text (None if none is): the Rust port rejects them."""
+        parts = []
+        if self.batch_policy != "prefill-priority" or self.max_num_batched_tokens is not None:
+            parts.append(f"batch_policy={self.batch_policy}, max_num_batched_tokens={self.max_num_batched_tokens}")
+        if self.kv_policy != "oracle":
+            parts.append(f"kv_policy={self.kv_policy}")
+        if self.prefix_caching:
+            parts.append("prefix_caching")
+        for k in ("parallel", "prefill_parallel", "decode_parallel", "speculative"):
+            if getattr(self, k) is not None:
+                parts.append(f"{k}={getattr(self, k)}")
+        if self.quantised:
+            parts.append(f"formats w={self.weight_format} kv={self.kv_format} compute={self.compute_format}")
+        if self.model.is_moe:
+            parts.append(f"mixture-of-experts model {self.model.name}")
+        return ", ".join(parts) or None
 
     @property
     def heterogeneous(self) -> bool:
@@ -132,6 +178,9 @@ class Instance:
         self.optical_j = 0.0        # transform engine: conversion energy
         self.optical_flops = 0.0    # transform engine: FLOPs it took
         self.optical_bound_time = 0.0
+        self.comm_time = 0.0        # brief 20A2: scale-up link seconds (parallelism) ...
+        self.comm_j = 0.0           # ... and joules
+        self.draft_time = 0.0       # speculative decoding: seconds of draft passes
         self._wake: simpy.Event | None = None
         self.proc = self.env.process(self.run())
 
@@ -160,6 +209,10 @@ class Instance:
             self.account_optical(cost)
         else:
             self.account_power(cost.time, cost.compute_j, cost.memory_j, cost.bound)
+        if cost.lever:
+            self.comm_time += cost.comm_time
+            self.comm_j += cost.comm_j
+            self.draft_time += cost.draft_time
         if cost.bound == "compute":
             self.compute_bound_time += cost.time
         self.sim.tracer.span(self.name, kind, label, start, cost.time)
@@ -595,6 +648,12 @@ class ScheduledInstance(Instance):
     - 1 tokens are skipped: the last token is always computed), its prefill starts after the hit, and the
     segments it computes are inserted when its prefill ends; its own segment (rest of prompt + output)
     when it finishes. Not with swap preemption (ValueError).
+
+    Speculative decoding (brief 20A2, ``SimConfig.speculative``): every decode step drafts gamma tokens per row
+    (gamma draft passes) and verifies them in one target pass (``CostModel.step_spec``); a row keeps its accepted
+    run plus one token, drawn per request (``speculative.draw_accepted``). Prefill steps also run the draft's
+    prefill. Paged rows grow by up to gamma + 1 tokens a step; in chunked mode a row counts gamma + 1 tokens of the
+    budget. The tokens of one verify pass arrive together: the first ITL is the step, the rest 0.
     """
 
     role = "colocated"
@@ -602,6 +661,16 @@ class ScheduledInstance(Instance):
     def __init__(self, sim: "Simulation", idx: int):
         super().__init__(sim, idx)
         cfg = sim.cfg
+        self.batch_cap = cfg.max_decode_batch
+        dm = sim.draft_model
+        self.kv_tok_bytes = cfg.model.kv_bytes_per_token if dm is None else (
+            cfg.model.kv_bytes_per_token + dm.kv_bytes_per_token)
+        self.spec = cfg.speculative
+        if self.spec is not None:
+            self.gamma, self.alpha = self.spec.gamma, self.spec.alpha
+            self.draft_cost = sim.cost_for(self.role, draft=True)
+        self.spec_rows = 0                      # verify passes, counted per row
+        self.spec_tokens = 0                    # tokens they yielded
         self.policy = cfg.batch_policy
         self.budget = cfg.max_num_batched_tokens if cfg.max_num_batched_tokens is not None else cfg.max_prefill_tokens
         self.paged = cfg.kv_policy == "paged"
@@ -726,7 +795,11 @@ class ScheduledInstance(Instance):
             if r.done_prompt < r.target:          # still prefilling: its prompt blocks are allocated
                 i += 1
                 continue
-            need = self.units(r.prompt_len + r.tokens_out - r.covered)
+            if self.spec is None:
+                need = self.units(r.prompt_len + r.tokens_out - r.covered)
+            else:                                 # room for the gamma + 1 positions the verify pass writes
+                need = self.units(min(r.prompt_len + r.tokens_out + self.gamma, r.prompt_len + r.output_len)
+                                  - r.covered)
             if need <= r.alloc:
                 i += 1
                 continue
@@ -744,7 +817,7 @@ class ScheduledInstance(Instance):
         self.preemptions += 1
         if self.swap and r.done_prompt >= r.target:
             host = self.sim.cfg.host_link
-            nbytes = r.alloc * self.blk * self.sim.cfg.model.kv_bytes_per_token
+            nbytes = r.alloc * self.blk * self.kv_tok_bytes
             t = r.alloc * host.latency + nbytes / host.bandwidth
             self.swap_t += t
             self.swap_time += t
@@ -763,12 +836,12 @@ class ScheduledInstance(Instance):
 
     def swap_in(self) -> None:
         host = self.sim.cfg.host_link
-        while self.swapped and len(self.running) < self.sim.cfg.max_decode_batch:
+        while self.swapped and len(self.running) < self.batch_cap:
             r = self.swapped[0]
             if not self.room(r.swapped_units):
                 break
             self.swapped.pop(0)
-            nbytes = r.swapped_units * self.blk * self.sim.cfg.model.kv_bytes_per_token
+            nbytes = r.swapped_units * self.blk * self.kv_tok_bytes
             t = r.swapped_units * host.latency + nbytes / host.bandwidth
             self.swap_t += t
             self.swap_time += t
@@ -860,7 +933,7 @@ class ScheduledInstance(Instance):
     def admit_prompts(self) -> list[Request]:
         """Prefill- or decode-priority: whole prompts up to the token budget."""
         batch, tokens = [], 0
-        cap = self.sim.cfg.max_decode_batch
+        cap = self.batch_cap
         while self.queue and len(self.running) < cap and not self.swapped:
             r = self.queue[0]
             t = (r.target or r.prompt_len) - self.lookup_hit(r)
@@ -882,7 +955,8 @@ class ScheduledInstance(Instance):
         tokens = sum(c for _, c, _ in chunks)
         self.computed_tokens += tokens
         self.recompute_tokens += sum(c for r, (_, c, _) in zip(batch, chunks) if r.tokens_out)
-        cost = self.cost.step_mixed(0, 0, chunks)
+        cost = self.cost.step_mixed(0, 0, chunks) if self.spec is None else self.spec_cost(0, 0, chunks)
+        cost = self.finish_cost(cost, batch)
         yield from self.sched_step(cost, f"prefill n={len(batch)} tok={tokens}", len(batch))
         for r in batch:
             r.done_prompt = r.target
@@ -894,10 +968,36 @@ class ScheduledInstance(Instance):
             return
         rows = list(self.running)
         ctx = sum(r.prompt_len + r.tokens_out for r in rows)
-        yield from self.sched_step(self.cost.decode_sum(ctx, len(rows)), f"decode b={len(rows)}", len(rows))
+        cost = self.cost.decode_sum(ctx, len(rows)) if self.spec is None else self.spec_cost(ctx, len(rows), [])
+        yield from self.sched_step(cost, f"decode b={len(rows)}", len(rows))
         self.after_decode(rows)
 
+    def finish_cost(self, cost, finishing: list[Request]):
+        """Work added to a step for the requests whose prefill it finishes (the prefill pool's endpoint
+        compression of the hand-off); nothing elsewhere."""
+        return cost
+
+    def spec_cost(self, ctx: int, b: int, chunks):
+        """A speculative step: the target's verify pass over ``b`` rows (plus any prefill chunks), the draft's
+        prefill of those chunks and its gamma decode passes over the rows, one after another."""
+        g, d = self.gamma, self.draft_cost
+        t = self.cost.step_spec(ctx, b, g + 1, chunks) if b else self.cost.step_mixed(0, 0, chunks)
+        parts = []
+        if chunks:
+            parts.append(d.step_mixed(0, 0, chunks))
+        if b:
+            for j in range(g):
+                parts.append(d.decode_sum(ctx + j * b, b))
+        time, flops, nbytes, ec, em, dt = t.time, t.flops, t.bytes, t.compute_j, t.memory_j, 0.0
+        for x in parts:
+            time, flops, nbytes = time + x.time, flops + x.flops, nbytes + x.bytes
+            ec, em, dt = ec + x.compute_j, em + x.memory_j, dt + x.time
+        return LeverStepCost(flops, nbytes, time, t.bound, ec + em, ec, em, t.comm_time, t.comm_j, dt)
+
     def after_decode(self, rows: list[Request]) -> None:
+        if self.spec is not None:
+            self.after_spec(rows)
+            return
         now = self.env.now
         for r in rows:
             r.itls.append(now - r.last_token)
@@ -907,11 +1007,32 @@ class ScheduledInstance(Instance):
                 _remove(self.running, r)
                 self.finish_row(r)
 
+    def after_spec(self, rows: list[Request]) -> None:
+        """Each row keeps its accepted drafts plus one token (at most what is left of its output)."""
+        now, seed, a, g = self.env.now, self.spec.seed, self.alpha, self.gamma
+        for r in rows:
+            if r.rng is None:
+                r.rng = seed_state(seed, r.rid)
+            r.rng, k = draw_accepted(r.rng, a, g)
+            n = min(k + 1, r.output_len - r.tokens_out)
+            self.spec_rows += 1
+            self.spec_tokens += n
+            r.itls.append(now - r.last_token)
+            for _ in range(n - 1):
+                r.itls.append(0.0)
+            r.tokens_out += n
+            r.last_token = now
+            if r.tokens_out >= r.output_len:
+                _remove(self.running, r)
+                self.finish_row(r)
+
     def chunked_step(self):
         self.grow()
-        tau, cap = self.budget, self.sim.cfg.max_decode_batch
+        tau, cap = self.budget, self.batch_cap
         dec = [r for r in self.running if r.done_prompt >= r.target]
         nt, ctx = len(dec), sum(r.prompt_len + r.tokens_out for r in dec)
+        if self.spec is not None:
+            nt = len(dec) * (self.gamma + 1)
         part = []
         for r in self.running:
             if r.done_prompt < r.target and nt < tau:
@@ -931,7 +1052,11 @@ class ScheduledInstance(Instance):
         pre = sum(c for _, c in part)
         self.computed_tokens += pre
         self.recompute_tokens += sum(c for r, c in part if r.tokens_out)
-        cost = self.cost.step_mixed(ctx, len(dec), chunks)
+        if self.spec is None:
+            cost = self.cost.step_mixed(ctx, len(dec), chunks)
+        else:
+            cost = self.spec_cost(ctx, len(dec), chunks)
+        cost = self.finish_cost(cost, [r for r, c in part if r.done_prompt + c == r.target])
         yield from self.sched_step(cost, f"step b={len(dec)} chunks={len(part)} tok={nt}", len(dec) + len(part))
         self.after_decode(dec)
         for r, c in part:
@@ -940,8 +1065,12 @@ class ScheduledInstance(Instance):
                 self.prefill_done(r)
         return True
 
+    def boundary(self) -> None:
+        """Called at every step boundary before scheduling (the decode pool takes in its hand-offs here)."""
+
     def run(self):
         while True:
+            self.boundary()
             if self.swapped:
                 self.swap_in()
             if self.policy == "chunked":
@@ -959,6 +1088,122 @@ class ScheduledInstance(Instance):
                 yield from self.decode_all()
             else:
                 yield from self.idle()
+
+
+class ScheduledPrefillInstance(ScheduledInstance):
+    """A prefill-pool instance with the levers (brief 20A2; disaggregated mode with ``SimConfig.scheduled``).
+
+    It holds prompt KV only, in the same units as the colocated scheduler (blocks when paged), with no watermark:
+    a request's prompt KV from admission until its hand-off has been transferred, plus the prefix cache. Batching:
+    whole prompts up to the token budget (prefill-priority; decode-priority is the same here, there being no decode
+    rows) or Sarathi-style chunks of the budget. Prefix caching skips the cached part of a prompt; the segments it
+    computes are cached, but not the request's output (generated on the decode pool), so a session's next turn
+    recomputes the previous reply. Endpoint KV compression runs after the step that finishes a prompt.
+    """
+
+    role = "prefill"
+
+    def __init__(self, sim: "Simulation", idx: int):
+        super().__init__(sim, idx)
+        self.batch_cap = 1 << 62               # no decode batch here
+        self.watermark = 0
+        if self.policy == "decode-priority":
+            self.policy = "prefill-priority"
+        self.held: dict[int, tuple] = {}       # rid -> (units, pinned segments) until the hand-off lands
+
+    def load(self) -> float:
+        return sum(r.prompt_len for r in self.queue)     # as PrefillInstance
+
+    def full_need(self, r: Request) -> int:
+        return self.units(r.prompt_len)
+
+    def admit_need(self, r: Request, hit: int) -> int:
+        return self.units(r.target - hit)
+
+    def finish_cost(self, cost, finishing: list[Request]):
+        tr = self.sim.cfg.kv_transit
+        if tr is not None and tr.where == "endpoint" and finishing:
+            return self.sim.endpoint_compress(self.cost, cost, finishing)
+        return cost
+
+    def prefill_done(self, r: Request) -> None:
+        self.insert_chain(r)
+        self.emit_first_token(r)
+        _remove(self.running, r)
+        if r.output_len <= 1:
+            self.release(r)
+            self.sim.finish(r)
+            return
+        self.held[r.rid] = (r.alloc, r.nodes)
+        r.alloc, r.nodes, r.covered = 0, [], 0
+        self.sim.handoff(r, self)
+
+    def free_held(self, r: Request) -> None:
+        """The hand-off has landed on the decode pool: free its prompt KV and unpin its segments."""
+        units, nodes = self.held.pop(r.rid)
+        self.kv_used -= units
+        now = self.env.now
+        for n in nodes:
+            self.cache.unref(n, now)
+        if self._wake is not None and not self._wake.triggered:
+            self._wake.succeed()
+
+
+class ScheduledDecodeInstance(ScheduledInstance):
+    """A decode-pool instance with the levers (brief 20A2; disaggregated mode with ``SimConfig.scheduled``).
+
+    A prefilled request waits in ``inbox`` (its KV still on the prefill instance) until this instance can allocate
+    its KV (the policy's reservation, or the prompt's blocks plus the watermark when paged; nothing new while
+    anything is swapped out); then its transfer starts, so the hand-off never lands without room. Landed requests
+    join the running batch at the next step boundary. From there it is the colocated scheduler: paged rows grow,
+    the latest arrival is preempted when blocks run out, by swap to host memory or by recompute here (the queue
+    holds only recomputes, prefilled again under the batching policy). No prefix cache on decode.
+    """
+
+    role = "decode"
+
+    def __init__(self, sim: "Simulation", idx: int):
+        super().__init__(sim, idx)
+        self.cache = None                      # prefix caching is the prefill pool's
+        self.inbox: deque = deque()            # (request, prefill instance) waiting for room here
+        self.landed: list[Request] = []        # transferred, waiting for a step boundary and a batch slot
+        self.inflight = 0
+
+    def load(self) -> float:
+        return len(self.inbox) + self.inflight + len(self.landed) + super().load()
+
+    def offer(self, r: Request, src: "ScheduledPrefillInstance") -> None:
+        self.inbox.append((r, src))
+        self.pull()
+
+    def pull(self) -> None:
+        while self.inbox and not self.swapped:
+            r, src = self.inbox[0]
+            need = self.admit_need(r, 0)
+            if not self.room(need + self.watermark):
+                break
+            self.inbox.popleft()
+            r.alloc = 0
+            self.set_alloc(r, need)
+            self.inflight += 1
+            self.env.process(self.sim.kv_transfer(r, src, self))
+
+    def land(self, r: Request) -> None:
+        self.inflight -= 1
+        self.landed.append(r)
+        if self._wake is not None and not self._wake.triggered:
+            self._wake.succeed()
+
+    def boundary(self) -> None:
+        self.pull()
+        now = self.env.now
+        while self.landed and len(self.running) < self.batch_cap:
+            r = self.landed.pop(0)
+            r.decode_start = now
+            r.done_prompt = r.prompt_len
+            r.base_out = r.tokens_out
+            self.running.append(r)
+            self.running.sort(key=_by_arrival)
 
 
 def _remove(rows: list, r: Request) -> None:
@@ -1001,9 +1246,16 @@ class SimResult:
 
 class Simulation:
     def __init__(self, cfg: SimConfig, workload: list[Request]):
+        if cfg.quantised or cfg.speculative is not None or cfg.model.is_moe or any(
+                cfg.parallel_for(r) is not None for r in ("prefill", "decode", "colocated")):
+            self.check_levers_2(cfg)
+        if cfg.quantised:          # the weights and KV cache in their storage formats, everywhere
+            cfg = replace(cfg, model=replace(cfg.model, weight_bytes=QUANT_FORMATS[cfg.weight_format],
+                                             kv_bytes=QUANT_FORMATS[cfg.kv_format]))
         self.cfg = cfg
+        self.draft_model, self.draft_resident = self.make_draft(cfg)
         self.env = simpy.Environment()
-        self.cost = self.cost_for("colocated")
+        self.cost = self.cost_for("colocated") if cfg.lever_summary is None else None
         self.tracer = Tracer(enabled=cfg.trace)
         self.requests = workload
         self.rejected: list[Request] = []
@@ -1028,7 +1280,11 @@ class Simulation:
         self.scheduled = cfg.scheduled
         if self.scheduled:
             self.check_levers(cfg)
-        if cfg.mode == "disagg":
+        if cfg.mode == "disagg" and self.scheduled:
+            self.prefill = [ScheduledPrefillInstance(self, i) for i in range(cfg.n_prefill)]
+            self.decode = [ScheduledDecodeInstance(self, i) for i in range(cfg.n_decode)]
+            self.instances = self.prefill + self.decode
+        elif cfg.mode == "disagg":
             self.prefill = [PrefillInstance(self, i) for i in range(cfg.n_prefill)]
             dec = FastDecodeInstance if cfg.fast_forward else DecodeInstance
             if ced_on_decode:
@@ -1048,32 +1304,101 @@ class Simulation:
 
     @staticmethod
     def check_levers(cfg: SimConfig) -> None:
-        """The brief-20A1 levers: colocated attention models only, valid names, no cache with swap."""
+        """The scheduled levers: attention models only (no CED), valid names, no cache with swap; in disaggregated
+        mode not on the fast path, and no speculative draft KV through hand-off compression."""
         if cfg.batch_policy not in BATCH_POLICIES:
             raise ValueError(f"unknown batch_policy {cfg.batch_policy!r}")
         if cfg.kv_policy not in KV_POLICIES:
             raise ValueError(f"unknown kv_policy {cfg.kv_policy!r}")
         if cfg.preemption not in ("recompute", "swap"):
             raise ValueError(f"unknown preemption {cfg.preemption!r}")
-        if cfg.mode != "colocated":
-            raise ValueError("batch_policy, max_num_batched_tokens, kv_policy and prefix_caching are modelled for "
-                             "mode='colocated' only (disaggregated pools keep whole prompts and reserved KV)")
         if not cfg.model.is_transformer or cfg.model.is_ced:
-            raise ValueError("the brief-20A1 levers are modelled for attention models without CED only")
+            raise ValueError("the scheduling levers (batch_policy, max_num_batched_tokens, kv_policy, prefix_caching, "
+                             "speculative) are modelled for attention models without CED only")
+        if cfg.fast_forward and cfg.mode == "disagg":
+            raise ValueError("fast_forward is the plain decode instance's fast path: not with the scheduling levers")
+        if cfg.mode == "disagg" and cfg.speculative is not None and cfg.kv_transit is not None:
+            raise ValueError("speculative decoding with KV hand-off compression is not modelled (the draft's KV "
+                             "would cross uncompressed)")
         if cfg.kv_block_size < 1 or (cfg.max_num_batched_tokens is not None and cfg.max_num_batched_tokens < 1):
             raise ValueError("kv_block_size and max_num_batched_tokens must be at least 1")
         if cfg.prefix_caching and cfg.kv_policy == "paged" and cfg.preemption == "swap":
             raise ValueError("prefix caching with swap preemption is not modelled: use preemption='recompute'")
 
-    def cost_for(self, role: str) -> CostModel:
+    @staticmethod
+    def check_levers_2(cfg: SimConfig) -> None:
+        """Brief 20A2's cost-model levers and speculative decoding: what is not modelled raises here."""
+        m = cfg.model
+        for k in ("weight_format", "kv_format", "compute_format"):
+            if getattr(cfg, k) not in QUANT_FORMATS:
+                raise ValueError(f"unknown {k} {getattr(cfg, k)!r} (one of {', '.join(QUANT_FORMATS)})")
+        if cfg.compute_format not in ("bf16", cfg.weight_format):
+            raise ValueError("compute_format is 'bf16' (weight-only: dequantised before the multiply) or the weight "
+                             "format itself (W8A8, W4A4)")
+        if cfg.quantised and (not m.is_transformer or m.is_ced):
+            raise ValueError("weight and KV formats are modelled for attention models without CED only")
+        if cfg.kv_format != "bf16" and cfg.kv_transit is not None:
+            raise ValueError("KV hand-off compression assumes a BF16 KV cache: not with kv_format != 'bf16'")
+        if cfg.fast_forward and cfg.mode == "disagg":
+            raise ValueError("fast_forward is the plain decode instance's fast path: not with parallelism, "
+                             "quantisation, speculative decoding or mixture-of-experts models")
+        sp = cfg.speculative
+        if sp is not None:
+            if sp.gamma < 1 or not 0.0 <= sp.alpha <= 1.0:
+                raise ValueError("speculative decoding needs gamma >= 1 and 0 <= alpha <= 1")
+            if sp.draft != "mtp" and sp.draft not in MODELS:
+                raise ValueError(f"unknown draft model {sp.draft!r} (a MODELS key or 'mtp')")
+            if sp.draft != "mtp" and MODELS[sp.draft].vocab != m.vocab:
+                raise ValueError(f"draft {sp.draft} has a {MODELS[sp.draft].vocab}-token vocabulary, the target "
+                                 f"{m.vocab}: speculative decoding needs the same one")
+            if any(p is not None and p.pp > 1 for p in (cfg.parallel, cfg.prefill_parallel, cfg.decode_parallel)):
+                raise ValueError("speculative decoding with pipeline parallelism is not modelled")
+
+    @staticmethod
+    def make_draft(cfg: SimConfig) -> tuple[ModelSpec | None, float]:
+        """The speculative draft (in the target's storage formats) and the bytes of weights it adds."""
+        sp = cfg.speculative
+        if sp is None:
+            return None, 0.0
+        m = cfg.model
+        if sp.draft == "mtp":            # one more layer of the target; embedding and LM head shared
+            d = replace(m, name=f"{m.name} MTP head", n_layers=1)
+            per = (d.moe_fixed_params_per_layer + d.n_experts * d.expert_params) if d.is_moe else d.params_per_layer
+            return d, per * d.weight_bytes
+        d = replace(MODELS[sp.draft], weight_bytes=m.weight_bytes, kv_bytes=m.kv_bytes)
+        return d, d.weight_bytes_total
+
+    def cost_for(self, role: str, draft: bool = False) -> CostModel:
         """Each pool gets its own cost model, so pools can have different power caps and,
-        with ``prefill_device`` / ``decode_device``, different hardware."""
+        with ``prefill_device`` / ``decode_device``, different hardware. Brief 20A2: the pool's parallelism,
+        compute format and speculative draft; ``draft=True`` prices the draft model itself (no step overhead,
+        no parallelism: it runs as one device of the instance's size)."""
         cfg = self.cfg
         cap = {"prefill": cfg.prefill_power_cap_w, "decode": cfg.decode_power_cap_w}.get(role)
         dev, n = cfg.pool(role)
+        if cfg.lever_summary is None:
+            return CostModel(cfg.model, dev, n, cfg.step_overhead,
+                             power_cap_w=cap if cap is not None else cfg.power_cap_w, dvfs=cfg.dvfs,
+                             prefill_only=role == "prefill")
+        kw = {}
+        if cfg.compute_format != "bf16":
+            sp = dev.format_speedup(cfg.compute_format)
+            if sp is None:
+                raise ValueError(f"{role} pool: {dev.name} has no {cfg.compute_format} units (use compute_format='bf16' "
+                                 f"for weight-only {cfg.weight_format})")
+            kw["compute_speedup"] = sp
+        if draft:
+            return CostModel(self.draft_model, dev, n, 0.0, power_cap_w=cap if cap is not None else cfg.power_cap_w,
+                             dvfs=cfg.dvfs, **kw)
+        par = cfg.parallel_for(role)
+        if par is not None:
+            par.check(cfg.model, n, f"{role} pool")
+            kw["parallel"] = par
+        if self.draft_model is not None:
+            kw["draft"], kw["draft_resident_bytes"] = self.draft_model, self.draft_resident
         return CostModel(cfg.model, dev, n, cfg.step_overhead,
                          power_cap_w=cap if cap is not None else cfg.power_cap_w, dvfs=cfg.dvfs,
-                         prefill_only=role == "prefill")
+                         prefill_only=role == "prefill", **kw)
 
     def endpoint_compress(self, cm: CostModel, cost, batch: list[Request]):
         """Compress each request's hand-off on the prefill GPU after the step."""
@@ -1117,6 +1442,13 @@ class Simulation:
     def arrive(self, r: Request) -> None:
         self._population(+1)
         if self.scheduled:
+            if self.cfg.mode == "disagg":
+                pf, dc = self.prefill[0], self.decode[0]
+                if dc.full_need(r) > dc.kv_cap or pf.full_need(r) > pf.kv_cap:
+                    self._reject(r)
+                    return
+                min(self.prefill, key=lambda i: i.load()).submit(r)
+                return
             inst = self.colocated[0]
             if inst.full_need(r) > inst.kv_cap:
                 self._reject(r)
@@ -1154,6 +1486,8 @@ class Simulation:
         """(seconds, bytes on the link, link joules, in-transit joules, transit-bound)."""
         link, tr, m = self.cfg.link, self.cfg.kv_transit, self.cfg.model
         nbytes = m.handoff_bytes(r.prompt_len)
+        if self.draft_model is not None:      # speculative decoding: the draft's KV crosses too
+            nbytes = nbytes + r.prompt_len * self.draft_model.kv_bytes_per_token
         if tr is None:
             return link.transfer_time(nbytes), nbytes, nbytes * 8 * link.pj_per_bit * 1e-12, 0.0, False
         wire = nbytes / tr.compression.ratio
@@ -1167,7 +1501,12 @@ class Simulation:
         return (t, wire, wire * 8 * link.pj_per_bit * 1e-12, nbytes * 8 * tr.pj_per_bit * 1e-12,
                 t_ops > t_wire)
 
-    def kv_transfer(self, r: Request):
+    def handoff(self, r: Request, src: "ScheduledPrefillInstance") -> None:
+        """Brief 20A2: a prefilled request goes to the least-loaded decode instance, which pulls its KV when it
+        has room for it."""
+        min(self.decode, key=lambda i: i.load()).offer(r, src)
+
+    def kv_transfer(self, r: Request, src=None, dst=None):
         stats = self.link_stats
         with self.link.request() as grant:
             yield grant
@@ -1185,6 +1524,10 @@ class Simulation:
             stats.transit_bound += transit_bound
         r.kv_ready = self.env.now
         self.tracer.span("kv-link", "kv", f"kv r{r.rid} {nbytes / 1e6:.0f} MB", r.kv_start, t)
+        if dst is not None:                   # scheduled pools: the decode instance reserved room before the pull
+            src.free_held(r)
+            dst.land(r)
+            return
         min(self.decode, key=lambda i: i.load()).submit(r)
 
     def sampler(self):

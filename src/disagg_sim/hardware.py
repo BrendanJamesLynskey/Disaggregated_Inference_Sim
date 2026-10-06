@@ -39,6 +39,23 @@ prefill (Sarathi-Serve, arXiv:2403.02310), prefill after a prefix-cache hit (SGL
 and the recompute of a preempted request (vLLM, arXiv:2309.06180); the schedulers are in ``sim.py``.
 Validation presets for those papers: Mistral-7B, Yi-34B and OPT-13B shapes (from their Hugging Face
 configs), an A100 40 GB and a PCIe Gen4 x16 host link. Nothing existing changes.
+
+Added 2026-10-06 (brief 20A2), all off by default:
+
+* Mixture-of-experts shapes (``ModelSpec.n_experts`` / ``top_k``; Mixtral-8x7B): a step's FLOPs use the active
+  experts, its weight traffic the experts its tokens are expected to touch, E (1 - (1 - k/E)^tokens) per layer
+  under uniform routing, so small decode batches read few experts and prefill reads them all.
+* ``Parallel``: tensor, pipeline and expert parallelism inside an instance. Ring all-reduces after attention and
+  the MLP (Megatron-LM, arXiv:1909.08053), GPipe micro-batches and bubbles (arXiv:1811.06965), all-to-all dispatch
+  and combine with an expert load imbalance (GShard, arXiv:2006.16668), on the device's scale-up link; memory is
+  checked per GPU, stage by stage.
+* Quantisation as a performance lever: ``QUANT_FORMATS`` (bytes per value, block scales included) for weights and
+  the KV cache, and the dense tensor-core rate of a native compute format (``Accelerator.native_formats``, from
+  NVIDIA's datasheets). Accuracy is not simulated.
+* ``CostModel.step_spec``: the target model verifying gamma drafted tokens per row (speculative decoding); the
+  draft's weights and KV cache share the instance's memory (``draft``). The schedule is in ``sim.py``.
+* Presets: H200 and B200 (datasheet figures; B200's power coefficients illustrative), NVLink 3 and 5 links,
+  Mixtral-8x7B, and Llama-3.2-1B as a draft for the Llama-3 family (same 128,256-token vocabulary).
 """
 
 from __future__ import annotations
@@ -64,6 +81,25 @@ def rfft_flops(n: int) -> float:
 
 def pow2_at_least(n: int) -> int:
     return 1 << (n - 1).bit_length()
+
+
+def ipow(x: float, n: int) -> float:
+    """x ** n for an integer n >= 0 by binary exponentiation: the same multiplications in every language
+    (a library ``pow`` is not guaranteed to round identically in Python and JavaScript)."""
+    r = 1.0
+    while n:
+        if n & 1:
+            r *= x
+        x *= x
+        n >>= 1
+    return r
+
+
+# Bytes per value of each storage format, block scales included (brief 20A2). INT4 as AWQ/GPTQ store it: groups of
+# 128 weights share an FP16 scale (arXiv:2306.00978), 4 + 16/128 bits. FP4 as the OCP microscaling MXFP4 format:
+# blocks of 32 E2M1 values share an 8-bit exponent (arXiv:2310.10537), 4 + 8/32 bits. FP8 and INT8 per-tensor or
+# per-channel scales are negligible. Accuracy is not simulated: see the Numerics site.
+QUANT_FORMATS = {"bf16": 2.0, "fp8": 1.0, "int8": 1.0, "int4": 0.5 + 2 / 128, "fp4": 0.5 + 1 / 32}
 
 
 @dataclass
@@ -141,6 +177,11 @@ class ModelSpec:
     ced_encoder_layers: int = 0   # E: the bottom E layers are the causal encoder (the paper: 20 of 40)
     ced_replay: int = 128         # W: last prompt tokens replayed through the decoder (paper: n_win = 128)
     ced_replay_on: str = "prefill"  # "prefill" (paper section 3.2.2) | "decode" (SGLang RFC #39963)
+    # Mixture of experts (brief 20A2). 0 = dense. Every layer's MLP is n_experts SwiGLU experts of width d_ff, of
+    # which top_k (plus n_shared_experts always-on ones) run per token; a router of d_model x n_experts picks them.
+    n_experts: int = 0
+    top_k: int = 0
+    n_shared_experts: int = 0
 
     def __post_init__(self):
         if self.mixer not in MIXERS:
@@ -164,6 +205,11 @@ class ModelSpec:
                 raise ValueError("ced_replay must be at least 1 token")
             if self.ced_replay_on not in ("prefill", "decode"):
                 raise ValueError(f"unknown ced_replay_on {self.ced_replay_on!r}")
+        if self.n_experts:
+            if self.mixer != "attention" or self.ced_encoder_layers:
+                raise ValueError("mixture-of-experts layers are modelled for mixer='attention' without CED only")
+            if not 1 <= self.top_k <= self.n_experts:
+                raise ValueError("top_k must be between 1 and n_experts")
 
     @property
     def head_dim(self) -> int:
@@ -228,10 +274,38 @@ class ModelSpec:
 
     @cached_property
     def params_per_layer(self) -> int:
+        """Parameters one token uses in one layer (an MoE layer: the router and its active experts)."""
         d, kv = self.d_model, self.n_kv_heads * self.head_dim
         attn = 2 * d * d + 2 * d * kv          # Wq, Wo  +  Wk, Wv (GQA-narrow)
         mlp = 3 * d * self.d_ff                # SwiGLU: gate, up, down
+        if self.n_experts:
+            return attn + d * self.n_experts + (self.top_k + self.n_shared_experts) * mlp
         return attn + mlp
+
+    # ── mixture of experts (brief 20A2) ──
+    @property
+    def is_moe(self) -> bool:
+        return self.n_experts > 0
+
+    @cached_property
+    def expert_params(self) -> int:
+        return 3 * self.d_model * self.d_ff
+
+    @cached_property
+    def moe_fixed_params_per_layer(self) -> int:
+        """What every MoE step reads in each layer whatever the routing: attention, router, shared experts."""
+        d, kv = self.d_model, self.n_kv_heads * self.head_dim
+        return 2 * d * d + 2 * d * kv + d * self.n_experts + self.n_shared_experts * self.expert_params
+
+    def experts_touched(self, tokens: int) -> float:
+        """Expected routed experts that ``tokens`` tokens use in one layer, each picking top_k of n_experts uniformly:
+        E (1 - (1 - k/E)^tokens)."""
+        e = self.n_experts
+        return e * (1.0 - ipow(1.0 - self.top_k / e, tokens))
+
+    def expert_flops(self, tokens: int) -> float:
+        """Routed-expert FLOPs of ``tokens`` tokens over all layers (what expert parallelism spreads)."""
+        return 2.0 * self.n_layers * self.top_k * self.expert_params * tokens
 
     @cached_property
     def layer_params(self) -> int:
@@ -241,7 +315,10 @@ class ModelSpec:
 
     @cached_property
     def params(self) -> int:
-        """Total parameters (untied input embedding and LM head)."""
+        """Total parameters (untied input embedding and LM head; every expert of an MoE model)."""
+        if self.n_experts:
+            return (self.n_layers * (self.moe_fixed_params_per_layer + self.n_experts * self.expert_params)
+                    + 2 * self.vocab * self.d_model)
         return self.layer_params + 2 * self.vocab * self.d_model
 
     @cached_property
@@ -271,7 +348,14 @@ class ModelSpec:
         2026-10-03 every step was charged the whole table, ``weight_bytes_total``:
         1.05 GB too much per step for Llama-3-8B. An operator trace of the real
         model, in Torch_Sim_Frontend, found it.)
+
+        An MoE model reads, in each layer, its fixed part and the routed experts the tokens are expected
+        to touch (``experts_touched``), plus the LM head.
         """
+        if self.n_experts:
+            per_layer = self.moe_fixed_params_per_layer + self.experts_touched(tokens) * self.expert_params
+            return ((self.n_layers * per_layer + self.vocab * self.d_model) * self.weight_bytes
+                    + tokens * self.embedding_row_bytes)
         return self.weight_bytes_streamed + tokens * self.embedding_row_bytes
 
     @cached_property
@@ -457,11 +541,19 @@ MISTRAL_7B = ModelSpec("Mistral-7B", n_layers=32, d_model=4096, n_heads=32, n_kv
 YI_34B = ModelSpec("Yi-34B", n_layers=60, d_model=7168, n_heads=56, n_kv_heads=8, d_ff=20480, vocab=64000)
 OPT_13B = ModelSpec("OPT-13B", n_layers=40, d_model=5120, n_heads=40, n_kv_heads=40, d_ff=13653, vocab=50272)
 
+# Brief 20A2 (Hugging Face config.json): Mixtral-8x7B, 8 experts of width 14,336, top-2 (46.7B parameters, 12.9B
+# active; arXiv:2401.04088); Llama-3.2-1B, a draft for the Llama-3 models (same 128,256-token vocabulary; its tied
+# embedding is counted twice like every model here, 0.5B parameters too many).
+MIXTRAL_8X7B = ModelSpec("Mixtral-8x7B", n_layers=32, d_model=4096, n_heads=32, n_kv_heads=8, d_ff=14336, vocab=32000,
+                         n_experts=8, top_k=2)
+LLAMA32_1B = ModelSpec("Llama-3.2-1B", n_layers=16, d_model=2048, n_heads=32, n_kv_heads=8, d_ff=8192, vocab=128256)
+
 MODELS = {"llama3-8b": LLAMA3_8B, "llama3-70b": LLAMA3_70B, "llama3-8b-hyena": LLAMA3_8B_HYENA,
           "llama3-8b-hyena-dist": LLAMA3_8B_HYENA_DIST, "llama3-8b-hybrid": LLAMA3_8B_HYBRID,
           "llama3-8b-hyena-circ": LLAMA3_8B_HYENA_CIRC,
           "llama3-8b-ced": LLAMA3_8B_CED, "llama3-70b-ced": LLAMA3_70B_CED,
-          "mistral-7b": MISTRAL_7B, "yi-34b": YI_34B, "opt-13b": OPT_13B}
+          "mistral-7b": MISTRAL_7B, "yi-34b": YI_34B, "opt-13b": OPT_13B,
+          "mixtral-8x7b": MIXTRAL_8X7B, "llama3.2-1b": LLAMA32_1B}
 
 
 # ──────────────────────────────────────────────────────────── hardware ──
@@ -525,6 +617,17 @@ class Accelerator:
     # models only). 1.0 (the default) is optimistic for GPUs: FlashFFTConv (arXiv:2311.05908)
     # exists because FFTs use matmul units poorly. Time and dynamic energy both scale by 1/x.
     fft_efficiency: float = 1.0
+    # Brief 20A2. Dense tensor-core rate of each native low-precision compute format as a multiple of BF16 (from the
+    # datasheet; a format not listed runs weight-only: dequantised to BF16 before the multiply). The scale-up link
+    # (a LINKS key) carries tensor-, pipeline- and expert-parallel traffic inside an instance.
+    native_formats: tuple = ()
+    scale_up: str = "nvlink4"
+
+    def format_speedup(self, fmt: str) -> float | None:
+        """The compute-rate multiple of a compute format: 1.0 for BF16, None if the device has no such units."""
+        if fmt == "bf16":
+            return 1.0
+        return dict(self.native_formats).get(fmt)
 
     @property
     def ridge_point(self) -> float:
@@ -532,9 +635,13 @@ class Accelerator:
         return (self.peak_flops * self.flops_eff) / (self.mem_bw * self.bw_eff)
 
 
-H100_SXM = Accelerator("H100-SXM", peak_flops=989 * TB, mem_bw=3.35 * TB, mem_capacity=80 * GB)
+# native_formats from NVIDIA's datasheets (dense; the sheets quote sparse figures at twice these): H100/H200 FP8 and
+# INT8 1,979 TFLOPS/TOPS against BF16 989; A100 INT8 624 TOPS against BF16 312 (no FP8 units).
+H100_SXM = Accelerator("H100-SXM", peak_flops=989 * TB, mem_bw=3.35 * TB, mem_capacity=80 * GB,
+                       native_formats=(("fp8", 2.0), ("int8", 2.0)))
 A100_SXM = Accelerator("A100-SXM", peak_flops=312 * TB, mem_bw=2.039 * TB, mem_capacity=80 * GB,
-                       tdp_w=400.0, idle_w=60.0, pj_per_flop=1.6, pj_per_byte=70.0)
+                       tdp_w=400.0, idle_w=60.0, pj_per_flop=1.6, pj_per_byte=70.0,
+                       native_formats=(("int8", 2.0),), scale_up="nvlink3")
 # A deliberately hypothetical part: abundant matmul throughput, ordinary memory.
 # Use it to ask "what if compute were nearly free?" -- the answer is that decode
 # barely moves, because decode is bandwidth-bound.
@@ -553,8 +660,16 @@ OPTICAL_FFT_SMALL = replace(A100_SXM, name="Optical-FFT + A100-class", transform
 # The 40 GB A100 (HBM2, 1,555 GB/s; NVIDIA A100 datasheet): vLLM's OPT-13B server (arXiv:2309.06180, Table 1).
 A100_40G = replace(A100_SXM, name="A100-SXM-40GB", mem_bw=1.555 * TB, mem_capacity=40 * GB)
 
+# Brief 20A2 hardware presets. H200 SXM (NVIDIA H200 page): the H100's compute, 141 GB of HBM3e at 4.8 TB/s, 700 W.
+# B200 (NVIDIA DGX B200 page, per GPU of eight): 180 GB, 8 TB/s, FP4 9 PFLOPS and FP8 4.5 PFLOPS dense; BF16 taken as
+# half of FP8 (2.25 PFLOPS), NVLink 5 at 900 GB/s each way (14.4 TB/s over 8 GPUs, both directions). Its 1,000 W board
+# limit and power coefficients are illustrative (the page quotes about 14.3 kW for the whole system).
+H200_SXM = replace(H100_SXM, name="H200-SXM", mem_bw=4.8 * TB, mem_capacity=141 * GB)
+B200 = Accelerator("B200", peak_flops=2250 * TB, mem_bw=8 * TB, mem_capacity=180 * GB, tdp_w=1000.0, idle_w=140.0,
+                   pj_per_flop=0.6, pj_per_byte=45.0, native_formats=(("fp8", 2.0), ("fp4", 4.0)), scale_up="nvlink5")
+
 ACCELERATORS = {"h100": H100_SXM, "a100": A100_SXM, "a100-40g": A100_40G, "optical": HYPOTHETICAL_OPTICAL,
-                "optical-fft": OPTICAL_FFT, "optical-fft-small": OPTICAL_FFT_SMALL}
+                "optical-fft": OPTICAL_FFT, "optical-fft-small": OPTICAL_FFT_SMALL, "h200": H200_SXM, "b200": B200}
 
 
 @dataclass(frozen=True)
@@ -583,6 +698,9 @@ LINKS = {
     # Round numbers, not a product: multi-Tb/s optical I/O chiplets exist (Wade et al., TeraPHY,
     # IEEE Micro 2020); 1.6 Tb/s and 3 pJ/bit are this simulator's assumptions.
     "cpo-optical": Link("Co-packaged optics (illustrative)", bandwidth=200 * GB, latency=5e-6, pj_per_bit=3.0),
+    # Scale-up links inside an instance (brief 20A2): an A100's NVLink 3 (600 GB/s both ways) and a B200's NVLink 5.
+    "nvlink3": Link("NVLink 3 (one direction)", bandwidth=300 * GB, latency=5e-6, pj_per_bit=5.0),
+    "nvlink5": Link("NVLink 5 (one direction)", bandwidth=900 * GB, latency=5e-6, pj_per_bit=5.0),
 }
 
 
@@ -651,6 +769,58 @@ class KVTransit:
         return per * values
 
 
+# ───────────────────────────────────────────── parallelism (brief 20A2) ──
+@dataclass(frozen=True)
+class Parallel:
+    """How an instance's tp x pp GPUs share the model (brief 20A2; first-order, illustrative).
+
+    * ``tp``: tensor parallelism inside each pipeline stage. Two ring all-reduces of the activations per layer, one
+      after attention and one after the MLP (Megatron-LM, arXiv:1909.08053), each 2(n-1)/n S / B + 2(n-1) latency
+      (the ring algorithm's bandwidth factor; NCCL's performance notes), not overlapped with compute.
+    * ``pp``: pipeline stages, ``n_layers / pp`` layers each. A step's tokens are split into ``microbatches``
+      (default pp, at most the tokens), and the stages run GPipe's schedule (arXiv:1811.06965): m + pp - 1 slots, so
+      the bubble is (pp - 1) / (m + pp - 1); every micro-batch re-reads its stage's weights; one activation hop per
+      boundary. Successive steps are not overlapped across stages (no cross-step pipelining).
+    * ``ep``: expert parallelism for an MoE model, 1 (each expert split by TP, an all-reduce after it) or ``tp``
+      (whole experts per GPU): the MLP all-reduce becomes an all-to-all dispatch and combine moving
+      2 tokens k d (n-1)/n activations per layer (GShard, arXiv:2006.16668), and the busiest GPU's expert work is
+      ``expert_imbalance`` times the mean.
+    * ``link``: the scale-up link (a LINKS key); None means the device's own (``Accelerator.scale_up``).
+    """
+
+    tp: int = 1
+    pp: int = 1
+    ep: int = 1
+    microbatches: int | None = None
+    expert_imbalance: float = 1.0
+    link: str | None = None
+
+    @property
+    def gpus(self) -> int:
+        return self.tp * self.pp
+
+    def check(self, model: ModelSpec, n_devices: int, where: str = "") -> None:
+        """Clear errors for the combinations this model does not cover."""
+        at = f"{where}: " if where else ""
+        if self.tp < 1 or self.pp < 1 or (self.microbatches is not None and self.microbatches < 1):
+            raise ValueError(f"{at}tp, pp and microbatches must be at least 1")
+        if self.tp * self.pp != n_devices:
+            raise ValueError(f"{at}parallel tp={self.tp} x pp={self.pp} needs {self.tp * self.pp} devices per instance "
+                             f"(got {n_devices})")
+        if self.ep not in (1, self.tp):
+            raise ValueError(f"{at}ep must be 1 (experts split by TP) or equal to tp (whole experts per GPU)")
+        if self.ep > 1 and not model.is_moe:
+            raise ValueError(f"{at}expert parallelism needs a mixture-of-experts model")
+        if self.expert_imbalance < 1.0:
+            raise ValueError(f"{at}expert_imbalance is the busiest GPU's load over the mean: at least 1")
+        if model.n_layers % self.pp:
+            raise ValueError(f"{at}{model.name} has {model.n_layers} layers: not divisible into {self.pp} stages")
+        if not model.is_transformer or model.is_ced:
+            raise ValueError(f"{at}parallelism is modelled for attention models without CED only")
+        if self.link is not None and self.link not in LINKS:
+            raise ValueError(f"{at}unknown scale-up link {self.link!r}")
+
+
 # ────────────────────────────────────────────────────────── cost model ──
 def _cbrt(x: float) -> float:
     return math.copysign(abs(x) ** (1 / 3), x)
@@ -668,6 +838,10 @@ class StepCost:
     # Not fields: ordinary steps construct as fast as before 2026-10-04 (the simulator's hot path).
     optical_j = 0.0            # transform engine: conversion energy (DAC + ADC)
     optical_flops = 0.0        # transform engine: FFT and Fourier-plane FLOPs it took
+    lever = False              # brief 20A2: a LeverStepCost (scale-up traffic, draft passes)
+    comm_time = 0.0
+    comm_j = 0.0
+    draft_time = 0.0
 
 
 @dataclass(frozen=True)
@@ -676,6 +850,17 @@ class OpticalStepCost(StepCost):
 
     optical_j: float = 0.0
     optical_flops: float = 0.0
+
+
+@dataclass(frozen=True)
+class LeverStepCost(StepCost):
+    """A step with brief-20A2 terms: scale-up link time and energy (parallelism) and draft-model time
+    (speculative decoding). ``time`` already includes them; these say how much of it they were."""
+
+    comm_time: float = 0.0
+    comm_j: float = 0.0
+    draft_time: float = 0.0
+    lever = True
 
 
 @dataclass(frozen=True)
@@ -699,6 +884,12 @@ class CostModel:
     # A prefill-pool instance. Changes nothing except for a CED model whose replay runs on
     # decode: then it holds only the encoder's weights and its prefill stops at the encoder.
     prefill_only: bool = False
+    # Brief 20A2 (defaults change nothing): the compute format's rate multiple (W8A8 on FP8 units: 2.0), tensor /
+    # pipeline / expert parallelism inside the instance, and a speculative-decoding draft that shares its memory.
+    compute_speedup: float = 1.0
+    parallel: Parallel | None = None
+    draft: ModelSpec | None = None
+    draft_resident_bytes: float = 0.0
 
     @cached_property
     def encoder_only(self) -> bool:
@@ -714,7 +905,7 @@ class CostModel:
 
     @cached_property
     def flops_rate(self) -> float:
-        return self.device.peak_flops * self.device.flops_eff * self.n_devices
+        return self.device.peak_flops * self.device.flops_eff * self.n_devices * self.compute_speedup
 
     @cached_property
     def byte_rate(self) -> float:
@@ -723,14 +914,39 @@ class CostModel:
     @property
     def kv_capacity_tokens(self) -> int:
         """Admission units that fit beside the weights: KV tokens (or distilled states)."""
+        if self.parallel is not None or self.draft is not None:
+            return self._kv_capacity_levers()
         free = self.device.mem_capacity * self.n_devices * self.mem_util - self.resident_weight_bytes
         if free <= 0:
             raise ValueError(f"{self.model.name} does not fit on {self.n_devices}x {self.device.name}")
         return int(free // self.model.cache_unit_bytes)
 
+    def _kv_capacity_levers(self) -> int:
+        """Brief 20A2: memory checked per GPU. Each pipeline stage holds its layers' weights (the first also the
+        embedding, the last the LM head) split over its tp GPUs, and its layers' share of every token's KV; the
+        stage with the least room sets the instance's token capacity. A draft model's weights and KV are added."""
+        m, p = self.model, self.parallel
+        tp, pp = (p.tp, p.pp) if p is not None else (self.n_devices, 1)
+        room = self.device.mem_capacity * self.mem_util          # bytes the engine may use on one GPU
+        unit = m.kv_bytes_per_token / pp
+        if self.draft is not None:
+            unit = unit + self.draft.kv_bytes_per_token
+        per_layer = (m.moe_fixed_params_per_layer + m.n_experts * m.expert_params) if m.is_moe else m.params_per_layer
+        layers = m.n_layers // pp
+        cap = None
+        for s in range(pp):
+            params = layers * per_layer + (m.vocab * m.d_model if s == 0 else 0) + (m.vocab * m.d_model if s == pp - 1 else 0)
+            w = params * m.weight_bytes + self.draft_resident_bytes
+            if w / tp > room:
+                raise ValueError(f"{m.name} does not fit: {w / tp / 1e9:.1f} GB of weights per GPU in stage {s} of "
+                                 f"{tp} x {pp} {self.device.name} ({room / 1e9:.1f} GB usable)")
+            c = int((room * tp - w) // unit)
+            cap = c if cap is None or c < cap else cap
+        return cap
+
     @cached_property
     def joules_per_flop(self) -> float:
-        return self.device.pj_per_flop * 1e-12
+        return self.device.pj_per_flop * 1e-12 / self.compute_speedup
 
     @cached_property
     def joules_per_byte(self) -> float:
@@ -826,6 +1042,8 @@ class CostModel:
             flops = 2 * m.layer_params * tokens + 2 * m.vocab * m.d_model * len(prompt_lens)
         # causal attention: QK^T and AV, each 2*d*c FLOPs at position c (diagonal included)
         flops += sum(2 * m.n_layers * m.d_model * s * (s + 1) for s in prompt_lens)
+        if self.parallel is not None:
+            return self._parallel(flops, m.weight_bytes_read(tokens), tokens * m.kv_bytes_per_token, tokens)
         nbytes = m.weight_bytes_read(tokens) + tokens * m.kv_bytes_per_token
         return self._time(flops, nbytes)
 
@@ -924,6 +1142,8 @@ class CostModel:
                 nbytes += batch * m.state_bytes_per_seq
             return self._time(self._digital_flops(m.decode_ops(ctx, batch)), nbytes)
         flops = 2 * m.matmul_params * batch + 4 * m.n_layers * m.d_model * (ctx + batch)
+        if self.parallel is not None:
+            return self._parallel(flops, m.weight_bytes_read(batch), (ctx + batch) * m.kv_bytes_per_token, batch)
         nbytes = m.weight_bytes_read(batch) + (ctx + batch) * m.kv_bytes_per_token
         return self._time(flops, nbytes)
 
@@ -949,7 +1169,76 @@ class CostModel:
             flops += 2 * m.n_layers * m.d_model * c * (2 * p0 + c + 1)
             tokens += c
             kv += p0 + c
+        if self.parallel is not None:
+            return self._parallel(flops, m.weight_bytes_read(tokens), kv * m.kv_bytes_per_token, tokens)
         return self._time(flops, m.weight_bytes_read(tokens) + kv * m.kv_bytes_per_token)
+
+    def step_spec(self, ctx: int, batch: int, c: int, chunks=()) -> StepCost:
+        """The target's verify pass of speculative decoding (brief 20A2): ``batch`` rows each run ``c`` = gamma + 1
+        positions (their last token and gamma drafted ones) after their cached context (``ctx`` in total, the
+        ``decode_sum`` convention), plus any prefill ``chunks`` in the same pass (as ``step_mixed``). Row i's
+        attention is the causal tail 4 L d j for j = ctx_i + 1 .. ctx_i + c, which sums over the rows to
+        2 L d c (2 ctx + batch (c + 1)); every position reaches the LM head (each needs its logits)."""
+        m = self.model
+        flops = 2 * m.matmul_params * batch * c + 2 * m.n_layers * m.d_model * c * (2 * ctx + batch * (c + 1))
+        tokens, kv = batch * c, ctx + batch * c
+        for p0, cc, last in chunks:
+            if m.prefill_lm_head == "all":
+                flops += 2 * m.matmul_params * cc
+            else:
+                flops += 2 * m.layer_params * cc + (2 * m.vocab * m.d_model if last else 0)
+            flops += 2 * m.n_layers * m.d_model * cc * (2 * p0 + cc + 1)
+            tokens += cc
+            kv += p0 + cc
+        if self.parallel is not None:
+            return self._parallel(flops, m.weight_bytes_read(tokens), kv * m.kv_bytes_per_token, tokens)
+        return self._time(flops, m.weight_bytes_read(tokens) + kv * m.kv_bytes_per_token)
+
+    @cached_property
+    def stage(self) -> "CostModel":
+        """One pipeline stage: its tp GPUs, no per-step overhead (``_parallel`` adds it once per step)."""
+        return replace(self, n_devices=self.parallel.tp, parallel=None, step_overhead=0.0)
+
+    @cached_property
+    def scale_up_link(self) -> Link:
+        return LINKS[self.parallel.link or self.device.scale_up]
+
+    def _parallel(self, flops: float, wbytes: float, obytes: float, tokens: int) -> StepCost:
+        """One forward pass on tp x pp GPUs (see ``Parallel``). ``wbytes`` are the weights the pass reads, ``obytes``
+        everything else (KV, embedding rows already in ``wbytes``). Each of the m + pp - 1 pipeline slots is one
+        micro-batch on one stage: its share of the FLOPs and bytes on tp GPUs (the roofline, DVFS and power cap of
+        those GPUs), then its scale-up traffic. Energy counts the FLOPs and bytes actually done."""
+        p, m = self.parallel, self.model
+        tp, pp = p.tp, p.pp
+        mb = min(p.microbatches or pp, max(1, tokens))
+        f_eff = flops
+        if m.is_moe and p.ep > 1 and p.expert_imbalance != 1.0:
+            f_eff = flops + m.expert_flops(tokens) * (p.expert_imbalance - 1.0)
+        t, ec, em, bound = self.stage.step_time_raw(f_eff / (mb * pp), wbytes / pp + obytes / (mb * pp))
+        if f_eff != flops:
+            ec = ec * (flops / f_eff)                 # the busiest GPU sets the time; energy is the work done
+        link = self.scale_up_link
+        act = tokens / mb * m.d_model * 2.0          # one micro-batch's activations, BF16
+        layers = m.n_layers // pp
+        ct, cbytes = 0.0, 0.0                         # per slot: seconds, bytes over all GPUs of the stage
+        if tp > 1:
+            n_ar = layers if (m.is_moe and p.ep > 1) else 2 * layers
+            ct += n_ar * (2 * (tp - 1) / tp * act / link.bandwidth + 2 * (tp - 1) * link.latency)
+            cbytes += n_ar * 2 * (tp - 1) * act
+        if m.is_moe and p.ep > 1:
+            a2a = 2 * (tokens / mb) * m.top_k * m.d_model * 2.0 * (p.ep - 1) / p.ep
+            ct += layers * (a2a / link.bandwidth + 2 * (p.ep - 1) * link.latency)
+            cbytes += layers * a2a
+        hop = 0.0
+        if pp > 1:
+            hop = act / link.bandwidth + link.latency
+        slots = mb + pp - 1
+        comm_time = slots * (ct + hop)
+        comm_bytes = mb * pp * cbytes + mb * (pp - 1) * act
+        time = slots * t + comm_time + self.step_overhead
+        n = mb * pp
+        return LeverStepCost(flops, mb * wbytes + obytes, time, bound, n * (ec + em), n * ec, n * em,
+                             comm_time, comm_bytes * 8 * link.pj_per_bit * 1e-12, 0.0)
 
     def compress_pass(self, cost: StepCost, ops: float, nbytes: float) -> StepCost:
         """Add a KV-compression kernel after a prefill step (endpoint compression): an

@@ -24,6 +24,11 @@ ratios. ``--ced-from-json`` re-renders them from examples/results_ced.json; with
 Sections 19-21 (added 2026-10-06, brief 20A1) validate the simulator levers against their papers: batching policy
 and chunked prefill (Sarathi-Serve, arXiv:2403.02310), paged KV and preemption (vLLM, arXiv:2309.06180) and prefix
 caching (SGLang, arXiv:2312.07104). ``--levers-from-json`` re-renders them from examples/results_levers.json.
+
+Sections 23-25 (added 2026-10-06, brief 20A2): the levers in disaggregated pools, parallelism / MoE / storage formats,
+and speculative decoding against Leviathan et al. (arXiv:2211.17192); ``--levers2-from-json`` re-renders them from
+examples/results_levers2.json. Section 26 is rendered from examples/tradeoffs.json (written by examples/tradeoffs.py,
+the trade-off sweep), never rerun here.
 """
 
 from __future__ import annotations
@@ -1328,6 +1333,481 @@ def render_validation(v: dict) -> list[str]:
     return L
 
 
+# ──────────────────────────────────────────── brief 20A2: levers, part II ──
+L2_N = 600           # requests per run in sections 23-25
+L2_SEED = 1
+
+
+def collect_levers2() -> dict:
+    """Sections 23-25: the levers in disaggregated pools, parallelism / MoE / formats, speculative decoding."""
+    from dataclasses import replace
+    from disagg_sim.hardware import (A100_40G, A100_SXM, ACCELERATORS, H100_SXM, KV_PRESETS, LINKS, MODELS,
+                                     CostModel, KVTransit, Parallel, QUANT_FORMATS)
+    from disagg_sim.metrics import summarise
+    from disagg_sim.sim import SimConfig, Simulation, simulate
+    from disagg_sim.speculative import (Speculative, expected_operations, expected_speedup, expected_tokens)
+    from disagg_sim.workload import LengthDist, chat_sessions, poisson_workload
+
+    out: dict = {}
+
+    def row(cfg, reqs):
+        res = simulate(cfg, reqs)
+        m = summarise(res)
+        lat, s = m["latency_s"], m.get("scheduler", {})
+        r = {"ttft_p50": lat["ttft"]["p50"], "ttft_p99": lat["ttft"]["p99"], "tpot_p50": lat["tpot"]["p50"],
+             "tpot_p99": lat["tpot"]["p99"], "itl_p99": lat["itl"]["p99"], "tok_s": m["throughput"]["output_tok_per_s"],
+             "req_s": m["throughput"]["req_per_s"], "j_tok": m["energy"]["J_per_output_token"],
+             "kv_wait": m["stage_breakdown_s"].get("kv_wait", 0.0), "completed": m["requests"]["completed"],
+             "link_GB": m["kv_link"]["bytes_GB"]}
+        for k in ("mean_running", "preemptions", "computed_prefill_tokens"):
+            if k in s:
+                r[k] = s[k]
+        if "prefix_cache" in s:
+            r["hit_rate"] = s["prefix_cache"]["hit_rate"]
+        if "speculative" in s:
+            r["tokens_per_verify"] = s["speculative"]["tokens_per_verify"]
+            r["draft_time_frac"] = s["speculative"]["draft_time_frac"]
+        flops = 0.0
+        for i in res.instances:
+            flops += i.flops
+        r["flops"] = flops
+        r["out_tokens"] = sum(q.output_len for q in res.requests if q.finish is not None)
+        return r
+
+    # 23a. paged KV in the decode pool against colocated (vLLM's setting: OPT-13B on A100-40GB, ShareGPT lengths)
+    opt = SimConfig(model=MODELS["opt-13b"], device=A100_40G, devices_per_instance=1, n_prefill=1, n_decode=1,
+                    n_colocated=2, host_link=LINKS["pcie4"], max_num_batched_tokens=8192)
+    p_d, o_d = LengthDist(161.31, 1.0, hi=1024), LengthDist(337.99, 1.0, hi=1024)
+    mem = {}
+    for rate in (2.0, 4.0):
+        for label, kw in (("colocated x2, reserved", dict(mode="colocated")),
+                          ("colocated x2, paged", dict(mode="colocated", kv_policy="paged")),
+                          ("1P1D, reserved", dict(mode="disagg")),
+                          ("1P1D, paged, recompute", dict(mode="disagg", kv_policy="paged")),
+                          ("1P1D, paged, swap", dict(mode="disagg", kv_policy="paged", preemption="swap")),
+                          ("1P1D, paged, chunked 512", dict(mode="disagg", kv_policy="paged", batch_policy="chunked",
+                                                             max_num_batched_tokens=512))):
+            mem[f"{rate:g}|{label}"] = row(replace(opt, **kw), poisson_workload(rate, L2_N, p_d, o_d, seed=L2_SEED))
+    out["disagg_memory"] = mem
+
+    # 23b. prefix caching: prefill pool against colocated (Llama-3-8B on 2 H100s; multi-turn sessions)
+    pc = SimConfig(model=MODELS["llama3-8b"], devices_per_instance=1, n_prefill=1, n_decode=1, n_colocated=2,
+                   max_num_batched_tokens=8192)
+    pref = {}
+    for outs, od in (("short (4-8)", LengthDist(6, 0.19, lo=4, hi=8)), ("medium (64)", LengthDist(64, 0.3, lo=32, hi=96))):
+        for label, kw in (("colocated x2, off", dict(mode="colocated")), ("colocated x2, on", dict(mode="colocated", prefix_caching=True)),
+                          ("1P1D, off", dict(mode="disagg")), ("1P1D, on", dict(mode="disagg", prefix_caching=True))):
+            reqs = chat_sessions(2.0, L2_N, LengthDist(384, 0.19, lo=256, hi=512), od, seed=L2_SEED, turns=4, think=1.0,
+                                 system_prompts=4, system_len=1024)
+            pref[f"{outs}|{label}"] = row(replace(pc, **kw), reqs)
+    out["disagg_prefix"] = pref
+
+    # 23c. interactions with the other options
+    inter = {}
+    base8 = SimConfig(model=MODELS["llama3-8b"], devices_per_instance=1, n_prefill=1, n_decode=1)
+    wl8 = lambda rate=4.0: poisson_workload(rate, L2_N, LengthDist(2048, 0.6), LengthDist(256, 0.6), seed=L2_SEED)
+    for label, kw in (("H100 prefill, H100 decode, reserved", dict(max_num_batched_tokens=8192)),
+                      ("H100 prefill, A100 decode, reserved", dict(decode_device=A100_SXM, max_num_batched_tokens=8192)),
+                      ("H100 prefill, A100 decode, paged", dict(decode_device=A100_SXM, kv_policy="paged")),
+                      ("25 GbE link, reserved", dict(link=LINKS["eth-25g"], max_num_batched_tokens=8192)),
+                      ("25 GbE link, fp8 in transit, paged", dict(link=LINKS["eth-25g"], kv_policy="paged",
+                                                                  kv_transit=KVTransit(KV_PRESETS["fp8"]))),
+                      ("25 GbE link, fp8 at the GPU, paged", dict(link=LINKS["eth-25g"], kv_policy="paged",
+                                                                  kv_transit=KVTransit(KV_PRESETS["fp8"], where="endpoint")))):
+        inter[label] = row(replace(base8, **kw), wl8(2.0 if "25 GbE" in label else 4.0))
+    rejected = {}
+    for label, kw in (("CED model (llama3-70b-ced)", dict(model=MODELS["llama3-70b-ced"], devices_per_instance=4)),
+                      ("Optical prefill pool (Hyena model on optical-fft)", dict(model=MODELS["llama3-8b-hyena"],
+                                                                                prefill_device=ACCELERATORS["optical-fft"])),
+                      ("Prefix caching + swap preemption", dict(prefix_caching=True, preemption="swap")),
+                      ("fast_forward decode", dict(fast_forward=True))):
+        try:
+            Simulation(replace(base8, kv_policy="paged", **kw), wl8()[:5])
+            rejected[label] = "runs"
+        except ValueError as e:
+            rejected[label] = str(e)
+    try:
+        Simulation(replace(base8, speculative=Speculative(), kv_transit=KVTransit(KV_PRESETS["fp8"])), wl8()[:5])
+        rejected["Speculative decoding + hand-off compression"] = "runs"
+    except ValueError as e:
+        rejected["Speculative decoding + hand-off compression"] = str(e)
+    out["interactions"], out["rejected"] = inter, rejected
+
+    # 24a. tensor parallelism: Llama-3-70B, one instance of tp H100s
+    m70 = MODELS["llama3-70b"]
+    tp = {}
+    for n in (2, 4, 8):
+        cm = CostModel(m70, H100_SXM, n, parallel=Parallel(tp=n))
+        plain = CostModel(m70, H100_SXM, n)
+        d1, d64, pf = cm.decode_sum(2048, 1), cm.decode_sum(64 * 2048, 64), cm.prefill([8192])
+        tp[n] = {"decode1": d1.time, "decode1_comm": d1.comm_time, "decode64": d64.time, "decode64_comm": d64.comm_time,
+                 "prefill8k": pf.time, "prefill8k_comm": pf.comm_time, "decode64_plain": plain.decode_sum(64 * 2048, 64).time,
+                 "kv_tokens": cm.kv_capacity_tokens, "tok_s_gpu_64": 64 / d64.time / n}
+    out["tp"] = tp
+    # 24b. pipeline against tensor parallelism on 4 GPUs
+    pp = {}
+    for label, par in (("TP4", Parallel(tp=4)), ("TP2 x PP2, 1 micro-batch", Parallel(tp=2, pp=2, microbatches=1)),
+                       ("TP2 x PP2, 2 micro-batches", Parallel(tp=2, pp=2)),
+                       ("TP2 x PP2, 4 micro-batches", Parallel(tp=2, pp=2, microbatches=4)),
+                       ("PP4, 4 micro-batches", Parallel(tp=1, pp=4))):
+        cm = CostModel(m70, H100_SXM, 4, parallel=par)
+        pf, d64 = cm.prefill([4096] * 4), cm.decode_sum(64 * 2048, 64)
+        mb, stages = min(par.microbatches or par.pp, 64), par.pp
+        pp[label] = {"prefill": pf.time, "decode64": d64.time, "comm_prefill": pf.comm_time,
+                     "bubble": (stages - 1) / (mb + stages - 1), "kv_tokens": cm.kv_capacity_tokens}
+    out["pp"] = pp
+    # 24c. mixture of experts: Mixtral-8x7B on 2 H100s
+    mx = MODELS["mixtral-8x7b"]
+    moe = {"touched": {b: mx.experts_touched(b) for b in (1, 2, 4, 8, 16, 64)},
+           "decode_bytes": {b: CostModel(mx, H100_SXM, 2).decode_sum(b * 2048, b).bytes for b in (1, 4, 16, 64)},
+           "params": mx.params, "active": mx.matmul_params + mx.vocab * mx.d_model, "layouts": {}}
+    for label, par in (("TP2", Parallel(tp=2)), ("EP2", Parallel(tp=2, ep=2)),
+                       ("EP2, imbalance 1.25", Parallel(tp=2, ep=2, expert_imbalance=1.25)),
+                       ("EP2, imbalance 1.5", Parallel(tp=2, ep=2, expert_imbalance=1.5))):
+        cm = CostModel(mx, H100_SXM, 2, parallel=par)
+        pf, d32 = cm.prefill([2048] * 4), cm.decode_sum(32 * 2048, 32)
+        moe["layouts"][label] = {"prefill": pf.time, "prefill_comm": pf.comm_time, "decode32": d32.time,
+                                 "decode32_comm": d32.comm_time, "prefill_J": pf.compute_j + pf.memory_j}
+    out["moe"] = moe
+    # 24d. formats: Llama-3-70B on 4 GPUs (no parallel comm, to isolate the format)
+    fm = {}
+    for dev, label, w, kvf, c in (("h100", "BF16", "bf16", "bf16", "bf16"), ("h100", "FP8 weights only (W8A16)", "fp8", "bf16", "bf16"),
+                                  ("h100", "FP8 W8A8", "fp8", "bf16", "fp8"), ("h100", "INT8 W8A8", "int8", "bf16", "int8"),
+                                  ("h100", "INT4 weights only (W4A16)", "int4", "bf16", "bf16"),
+                                  ("h100", "FP4 weights only (W4A16)", "fp4", "bf16", "bf16"),
+                                  ("h100", "FP8 KV cache", "bf16", "fp8", "bf16"), ("h100", "INT4 KV cache", "bf16", "int4", "bf16"),
+                                  ("h100", "FP8 W8A8 + FP8 KV", "fp8", "fp8", "fp8"),
+                                  ("b200", "BF16", "bf16", "bf16", "bf16"), ("b200", "FP8 W8A8", "fp8", "bf16", "fp8"),
+                                  ("b200", "FP4 W4A4", "fp4", "bf16", "fp4"), ("b200", "FP4 W4A4 + FP8 KV", "fp4", "fp8", "fp4")):
+        cfg = SimConfig(model=m70, device=ACCELERATORS[dev], mode="colocated", n_colocated=1, weight_format=w, kv_format=kvf,
+                        compute_format=c)
+        cm = Simulation(cfg, []).colocated[0].cost
+        d1, d64, pf = cm.decode_sum(2048, 1), cm.decode_sum(64 * 2048, 64), cm.prefill([8192])
+        fm[f"{dev}|{label}"] = {"weights_GB": cm.model.weight_bytes_total / 1e9, "kv_tokens": cm.kv_capacity_tokens,
+                                "decode1": d1.time, "decode64": d64.time, "prefill8k": pf.time,
+                                "j_tok64": (d64.compute_j + d64.memory_j + cm.idle_w * d64.time) / 64,
+                                "bound64": d64.bound, "boundpf": pf.bound}
+    out["formats"] = fm
+
+    # 25a/b. speculative decoding: closed forms and the simulator's draws
+    out["lev_table1"] = [{"alpha": a, "gamma": g, "ops": expected_operations(a, g, 0.0), "speed": expected_speedup(a, g, 0.0)}
+                         for a, g in ((0.6, 2), (0.7, 3), (0.8, 2), (0.8, 5), (0.9, 2), (0.9, 10))]
+    m8 = MODELS["llama3-8b"]
+    one = SimConfig(model=m8, devices_per_instance=1, mode="colocated", n_colocated=1)
+    lo = lambda: poisson_workload(0.2, 150, LengthDist(512, 0.5), LengthDist(512, 0.5), seed=L2_SEED)
+    # tiny prompts: decode is nearly all the work, so FLOPs per output token compare the decode schemes alone
+    tiny = lambda: poisson_workload(0.2, 150, LengthDist(16), LengthDist(512, 0.5), seed=L2_SEED)
+    draws = {}
+    for a in (0.6, 0.8):
+        for g in (2, 4, 6):
+            r = row(replace(one, speculative=Speculative("mtp", g, a)), lo())
+            draws[f"{a}|{g}"] = {"sim": r["tokens_per_verify"], "closed": expected_tokens(a, g)}
+    out["spec_draws"] = draws
+    # 25c. Theorem 3.8 (wall time) and 3.11 (operations) against the simulator at low load
+    th = {}
+    for mk, n in (("llama3-8b", 1), ("llama3-70b", 4)):
+        base = SimConfig(model=MODELS[mk], devices_per_instance=n, mode="colocated", n_colocated=1)
+        r0, f0 = row(base, lo()), row(base, tiny())
+        target = CostModel(MODELS[mk], H100_SXM, n)
+        for draft in ("mtp", "llama3.2-1b"):
+            for a, g in ((0.7, 3), (0.8, 5)):
+                sp = Speculative(draft, g, a)
+                r1, f1 = row(replace(base, speculative=sp), lo()), row(replace(base, speculative=sp), tiny())
+                dm = (replace(MODELS[mk], n_layers=1) if draft == "mtp" else MODELS[draft])
+                dcm = CostModel(dm, H100_SXM, n, 0.0)
+                c = dcm.decode_sum(1024, 1).time / target.decode_sum(1024, 1).time
+                c_hat = dm.matmul_params / MODELS[mk].matmul_params
+                th[f"{mk}|{draft}|{a}|{g}"] = {"c": c, "c_hat": c_hat, "expected": expected_speedup(a, g, c),
+                                               "simulated": r0["tpot_p50"] / r1["tpot_p50"],
+                                               "ops_expected": expected_operations(a, g, c_hat),
+                                               "ops_simulated": (f1["flops"] / f1["out_tokens"]) / (f0["flops"] / f0["out_tokens"])}
+    out["spec_theorems"] = th
+    # 25d. where it helps and where it hurts: time per output token against batch, from the cost model
+    hh = {}
+    for dev in ("h100", "a100"):
+        cm = CostModel(m8, ACCELERATORS[dev], 1)
+        dcm = CostModel(replace(m8, n_layers=1), ACCELERATORS[dev], 1, 0.0)
+        for c_len, b in [(c, b) for c in (512, 2048) for b in (1, 32, 128, 512)]:
+            ctx = b * c_len
+            plain = cm.decode_sum(ctx, b)
+            g, a = 3, 0.7
+            verify = cm.step_spec(ctx, b, g + 1)
+            draft = 0.0
+            for j in range(g):
+                draft += dcm.decode_sum(ctx + j * b, b).time
+            per_tok_spec = (verify.time + draft) / (b * expected_tokens(a, g))
+            hh[f"{dev}|{c_len}|{b}"] = {"plain": plain.time / b, "spec": per_tok_spec, "bound_plain": plain.bound,
+                                "bound_verify": verify.bound}
+    out["spec_batch"] = hh
+    # ... and in the simulator: an 8B colocated instance from light to saturated load
+    load = {}
+    for rate in (0.5, 4.0, 16.0, 64.0):
+        for label, sp in (("off", None), ("on", Speculative("mtp", 3, 0.7))):
+            cfg = replace(one, device=A100_SXM, speculative=sp, max_decode_batch=512)
+            r = row(cfg, poisson_workload(rate, L2_N, LengthDist(1024, 0.5), LengthDist(256, 0.5), seed=L2_SEED))
+            load[f"{rate:g}|{label}"] = r
+    out["spec_load"] = load
+    return out
+
+
+def render_levers2(v: dict) -> str:
+    L: list[str] = []
+    p = L.append
+    f2 = lambda x: f"{x:.2f}"
+    p("## 23. The levers in disaggregated pools")
+    p("")
+    p("Brief 20A2 (owner decision 2026-10-06). With any scheduling lever on, a disaggregated run uses"
+      " `ScheduledPrefillInstance` and `ScheduledDecodeInstance`. The **prefill pool** holds prompt KV only, from"
+      " admission until its hand-off has landed, plus the prefix cache; it batches whole prompts to the budget, or"
+      " chunks (no decode rows to piggy-back). Its cache holds prompt segments, not replies (they are generated on the"
+      " decode pool), so a session's next turn recomputes the previous reply. The **decode pool** pulls each hand-off"
+      " only once it can allocate its KV (the policy's reservation, or the prompt's blocks plus the 1% watermark when"
+      " paged), so a transfer never lands without room; then it runs the colocated scheduler's paged growth and"
+      " latest-arrival preemption (recompute here, or swap to host). With every lever at its default the scheduled pools"
+      " reproduce the old ones bit for bit (tested with one decode instance; with several, the hand-off is routed when"
+      " prefill ends rather than when the KV lands).")
+    p("")
+    p(f"**Paged KV in the decode pool** (vLLM's setting: OPT-13B, one A100-40GB per instance, ShareGPT lengths as in"
+      f" section 20; {L2_N} Poisson requests; reserved KV rows use the scheduled pools at default levers):")
+    p("")
+    rows = []
+    for k, r in v["disagg_memory"].items():
+        rate, label = k.split("|")
+        rows.append([rate, label, f"{r['tok_s']:,.0f}", f"{r.get('mean_running', 0):.1f}", str(r.get("preemptions", "-")),
+                     ms(r["ttft_p50"]), ms(r["ttft_p99"]), ms(r["tpot_p50"]), ms(r["tpot_p99"]), ms(r["kv_wait"]),
+                     f"{r['j_tok']:.3f}"])
+    table(L, ["Rate req/s", "Configuration", "Output tok/s", "Mean running (decode)", "Preemptions", "TTFT p50", "TTFT p99",
+              "TPOT p50", "TPOT p99", "Mean KV wait (ms)", "J/token"], rows)
+    p("**Prefix caching in the prefill pool** (Llama-3-8B, one H100 per instance, 2 GPUs either way; 4-turn sessions at"
+      " 2/s, 1 s think time, 4 system prompts of 1,024 tokens, turn inputs 256-512):")
+    p("")
+    rows = []
+    for k, r in v["disagg_prefix"].items():
+        outs, label = k.split("|")
+        rows.append([outs, label, pct(r.get("hit_rate", 0.0)), f"{r['computed_prefill_tokens']:,}", ms(r["ttft_p50"]),
+                     ms(r["ttft_p99"]), ms(r["tpot_p50"]), f"{r['link_GB']:.1f}"])
+    table(L, ["Outputs", "Configuration", "Hit rate", "Prefill tokens computed", "TTFT p50", "TTFT p99", "TPOT p50",
+              "Hand-off GB"], rows)
+    p("**Interactions with the other options** (Llama-3-8B, 1P1D, one GPU per instance, prompts 2,048 / outputs 256;"
+      " 4 req/s, 2 req/s on 25 GbE):")
+    p("")
+    rows = [[k, f"{r['tok_s']:,.0f}", ms(r["ttft_p50"]), ms(r["tpot_p50"]), ms(r["kv_wait"]), f"{r['link_GB']:.1f}",
+             str(r.get("preemptions", "-"))] for k, r in v["interactions"].items()]
+    table(L, ["Configuration", "Output tok/s", "TTFT p50", "TPOT p50", "Mean KV wait (ms)", "GB on the link", "Preemptions"], rows)
+    p("Combinations that are **not modelled** and are rejected with these errors:")
+    p("")
+    for k, e in v["rejected"].items():
+        p(f"- {k}: \"{e}\"")
+    p("")
+    p("So heterogeneous pools and in-transit or endpoint hand-off compression combine with the levers. The CED option"
+      " and the FFT-mixing models (the only ones an optical prefill pool speeds up) do not: the levers are modelled for"
+      " attention models without CED.")
+    p("")
+
+    p("## 24. Parallelism, mixture of experts and storage formats")
+    p("")
+    p("`hardware.Parallel` (first-order, illustrative): ring all-reduces after attention and after the MLP"
+      " (Megatron-LM, arXiv:1909.08053), 2(n-1)/n S / B + 2(n-1) x link latency each, on the device's NVLink, not"
+      " overlapped with compute; GPipe micro-batches (arXiv:1811.06965), m + p - 1 slots, each slot re-reading its"
+      " stage's weights; MoE all-to-all dispatch and combine (GShard, arXiv:2006.16668). Memory is checked per GPU, stage"
+      " by stage. Cost-model steps below (no queueing).")
+    p("")
+    p("**Tensor parallelism**, Llama-3-70B on H100s (decode contexts 2,048 tokens):")
+    p("")
+    rows = []
+    for n, r in v["tp"].items():
+        rows.append([str(n), ms(r["decode1"]), pct(r["decode1_comm"] / r["decode1"]), ms(r["decode64"]),
+                     pct(r["decode64_comm"] / r["decode64"]), ms(r["decode64_plain"]), ms(r["prefill8k"]),
+                     pct(r["prefill8k_comm"] / r["prefill8k"]), f"{r['tok_s_gpu_64']:,.0f}", f"{r['kv_tokens']:,}"])
+    table(L, ["TP GPUs", "Decode b=1", "of it all-reduce", "Decode b=64", "of it all-reduce", "b=64 without the all-reduce",
+              "Prefill 8,192", "of it all-reduce", "Decode tok/s per GPU at b=64", "KV tokens"], rows)
+    p("**Pipeline against tensor parallelism** on 4 H100s (prefill: 4 prompts of 4,096; decode: 64 rows of 2,048):")
+    p("")
+    rows = [[k, ms(r["prefill"]), ms(r["decode64"]), pct(r["bubble"]), f"{r['kv_tokens']:,}"] for k, r in v["pp"].items()]
+    table(L, ["Layout", "Prefill step", "Decode step", "GPipe bubble (p-1)/(m+p-1)", "KV tokens"], rows)
+    p("Micro-batches shrink the bubble of a compute-bound prefill but re-read every stage's weights, so they lengthen a"
+      " memory-bound decode step. Successive steps are not overlapped across stages here (no cross-step pipelining, as"
+      " serving engines do with several batches in flight), so pipeline parallelism shows its cost, not its"
+      " throughput: a known gap.")
+    p("")
+    mo = v["moe"]
+    p(f"**Mixture of experts**, Mixtral-8x7B ({mo['params'] / 1e9:.1f}B parameters, {mo['active'] / 1e9:.1f}B active with"
+      " the input embedding; 8 experts, top-2) on 2 H100s. Expected experts a layer touches, E(1 - (1 - k/E)^tokens), and"
+      " the bytes a decode step reads:")
+    p("")
+    table(L, ["Tokens in the step"] + [str(b) for b in mo["touched"]], [["Experts touched (of 8)"] + [f"{x:.2f}" for x in mo["touched"].values()]])
+    table(L, ["Decode batch"] + [str(b) for b in mo["decode_bytes"]], [["GB read per step"] + [f"{x / 1e9:.1f}" for x in mo["decode_bytes"].values()]])
+    rows = [[k, ms(r["prefill"]), pct(r["prefill_comm"] / r["prefill"]), ms(r["decode32"]), pct(r["decode32_comm"] / r["decode32"]),
+             f"{r['prefill_J']:.0f}"] for k, r in mo["layouts"].items()]
+    table(L, ["Layout (2 GPUs)", "Prefill 4 x 2,048", "of it link", "Decode b=32", "of it link", "Prefill dynamic J"], rows)
+    p("**Storage and compute formats**, Llama-3-70B on 4 GPUs (no all-reduce, to isolate the format; decode contexts"
+      " 2,048). Bytes per value include block scales (INT4: groups of 128 with an FP16 scale, AWQ arXiv:2306.00978; FP4:"
+      " MXFP4, 32 values per 8-bit scale, arXiv:2310.10537). A compute format runs at the datasheet's dense rate when the"
+      " device has units for it (H100: FP8, INT8; B200: FP8, FP4); otherwise weights are dequantised to BF16 before the"
+      " multiply (weight-only), at no modelled cost. **Accuracy is not simulated**: see the Numerics site for what each"
+      " format does to accuracy.")
+    p("")
+    rows = []
+    for k, r in v["formats"].items():
+        dev, label = k.split("|")
+        rows.append([dev.upper(), label, f"{r['weights_GB']:.1f}", f"{r['kv_tokens']:,}", ms(r["decode1"]), ms(r["decode64"]),
+                     f"{r['bound64']}", ms(r["prefill8k"]), f"{r['boundpf']}", f"{r['j_tok64']:.3f}"])
+    table(L, ["Device", "Format", "Weights GB", "KV tokens", "Decode b=1", "Decode b=64", "bound", "Prefill 8,192", "bound",
+              "J/token at b=64 (incl. idle)"], rows)
+
+    p("## 25. Speculative decoding against Leviathan et al.")
+    p("")
+    p("`--speculative DRAFT --gamma G --alpha A`: each decode step drafts G tokens per row (G draft passes over the batch),"
+      " verifies them in one target pass over G + 1 positions per row (`CostModel.step_spec`), and keeps the accepted run"
+      " plus one token, drawn per request with acceptance rate A (i.i.d., the paper's assumption, section 3.1). Drafts:"
+      " `mtp` (one extra layer of the target sharing its embedding and LM head, DeepSeek-V3's multi-token prediction"
+      " module, arXiv:2412.19437) or `llama3.2-1b`. The draft's weights and KV share the instance's memory and its KV"
+      " crosses the hand-off in disaggregated mode. Closed forms from arXiv:2211.17192 (read 2026-10-06, v2).")
+    p("")
+    p("**The paper's Table 1** (c = c^ = 0), from the closed forms in `speculative.py`:")
+    p("")
+    paper = {(0.6, 2): (1.53, 1.96), (0.7, 3): (1.58, 2.53), (0.8, 2): (1.23, 2.44), (0.8, 5): (1.63, 3.69),
+             (0.9, 2): (1.11, 2.71), (0.9, 10): (1.60, 6.86)}
+    rows = [[f"{r['alpha']:g}", str(r["gamma"]), f"{paper[(r['alpha'], r['gamma'])][0]:.2f}x", f"{r['ops']:.2f}x",
+             f"{paper[(r['alpha'], r['gamma'])][1]:.2f}x", f"{r['speed']:.2f}x"] for r in v["lev_table1"]]
+    table(L, ["alpha", "gamma", "Operations (paper)", "Operations (Theorem 3.11 here)", "Speed (paper)", "Speed (Theorem 3.8 here)"], rows)
+    p("**Tokens per verify pass**: the simulator's draws against equation (1) (Llama-3-8B, one H100, MTP draft, 150"
+      " requests at 0.2/s, outputs mean 512; the last pass of a request is capped at its remaining tokens):")
+    p("")
+    rows = [[k.split("|")[0], k.split("|")[1], f"{r['closed']:.3f}", f"{r['sim']:.3f}", pct(r["sim"] / r["closed"] - 1)]
+            for k, r in v["spec_draws"].items()]
+    table(L, ["alpha", "gamma", "Equation (1)", "Simulated", "Difference"], rows)
+    p("**Wall time and operations at low load** (one instance, 0.2 req/s, outputs mean 512): Theorem 3.8 with"
+      " c = one draft decode step over one target decode step (batch 1, from the cost model), against the simulated"
+      " TPOT p50 ratio (prompts mean 512); Theorem 3.11 with c^ = draft over target matmul parameters per token, against"
+      " the simulated FLOPs per output token ratio (16-token prompts, so decode is nearly all the work; attention FLOPs"
+      " are not in c^):")
+    p("")
+    rows = []
+    for k, r in v["spec_theorems"].items():
+        mk, dr, a, g = k.split("|")
+        rows.append([mk, dr, a, g, f"{r['c']:.3f}", f"{r['expected']:.2f}x", f"{r['simulated']:.2f}x", f"{r['ops_expected']:.2f}x",
+                     f"{r['ops_simulated']:.2f}x"])
+    table(L, ["Target", "Draft", "alpha", "gamma", "c", "Speed-up, Theorem 3.8", "Simulated", "Operations, Theorem 3.11",
+              "Simulated"], rows)
+    p("**Where it helps and where it hurts**: time per output token from the cost model (one step, no queueing),"
+      " Llama-3-8B with an MTP draft, gamma 3, alpha 0.7 (2.53 tokens per pass), against context and batch size:")
+    p("")
+    rows = []
+    for k, r in v["spec_batch"].items():
+        dev, c_len, b = k.split("|")
+        rows.append([dev.upper(), f"{int(c_len):,}", b, f"{1e3 * r['plain']:.3f}", r["bound_plain"], f"{1e3 * r['spec']:.3f}",
+                     r["bound_verify"], f"{r['plain'] / r['spec']:.2f}x"])
+    table(L, ["Device", "Context", "Batch", "ms/token plain", "bound", "ms/token speculative", "verify bound", "Speed-up"], rows)
+    p("In the simulator (Llama-3-8B on one A100, prompts 1,024 / outputs 256, max batch 512), from light load to"
+      " saturation:")
+    p("")
+    rows = []
+    for rate in dict.fromkeys(k.split("|")[0] for k in v["spec_load"]):
+        off, on = v["spec_load"][f"{rate}|off"], v["spec_load"][f"{rate}|on"]
+        rows.append([rate, f"{off['tok_s']:,.0f}", f"{on['tok_s']:,.0f}", f"{on['tok_s'] / off['tok_s']:.2f}x", ms(off["tpot_p50"]),
+                     ms(on["tpot_p50"]), f"{off.get('mean_running', 0):.0f}" if 'mean_running' in off else "-",
+                     f"{on['mean_running']:.0f}", pct(on["draft_time_frac"])])
+    table(L, ["Rate req/s", "Throughput off", "on", "Ratio", "TPOT p50 off", "on", "Mean running off", "on",
+              "Draft share of busy time"], rows)
+    return "\n".join(L) + "\n"
+
+
+def render_tradeoffs(t: dict) -> str:
+    """Section 26: the sweep's summary, rendered from examples/tradeoffs.json (written by examples/tradeoffs.py)."""
+    L: list[str] = []
+    p = L.append
+    meta = t["meta"]
+    p("## 26. The trade-off sweep (`examples/tradeoffs.py` -> `examples/tradeoffs.json`)")
+    p("")
+    p(f"Every point is the same {meta['gpus']} GPUs serving {meta['model']}; the baseline is 2 colocated instances of TP4"
+      " (all-reduces priced), prefill-priority batching, reserved KV and BF16, and each lever changes that. Capacity:"
+      f" the highest arrival rate with at least {meta['slo_target']:.0%} of requests meeting both SLOs (DistServe's"
+      " goodput, arXiv:2401.09670; rejected requests count as misses), by doubling and bisection to"
+      f" {meta['capacity_tolerance']:.0%}. Cost per million output tokens at capacity uses illustrative prices per"
+      " GPU-hour (" + ", ".join(f"{k.upper()} ${v:.2f}" for k, v in meta["usd_per_gpu_hour"].items()) + "); energy"
+      " per token is the power model's (illustrative coefficients, static power included). Latencies are at each"
+      f" workload's reference load. Speculative rows use alpha {meta['speculative_alpha']} (a parameter). Simulator"
+      f" {meta['simulator_commit']}, {meta['generated']}, {meta['wall_s'] / 60:.0f} min on {meta['workers']} workers."
+      " Accuracy is not simulated.")
+    p("")
+    rows = []
+    for k, w in t["workloads"].items():
+        rows.append([w["label"], f"{w['prompt_mean']:,.0f} (cv {w['prompt_cv']:g})", f"{w['output_mean']:,.0f}",
+                     str(w["turns"]), f"{w['system_prompts']} x {w['system_len']:,}" if w["system_prompts"] else "-",
+                     f"{w['ttft_slo']:g} s / {1e3 * w['tpot_slo']:g} ms",
+                     "saturated" if w["reference_rate"] > 1e4 else f"{w['reference_rate']:.3g}"])
+    table(L, ["Workload", "New input tokens", "Output tokens", "Turns", "Shared prefixes", "SLO TTFT / TPOT",
+              "Reference load (/s)"], rows)
+    pts = {(q["workload"], q["hardware"], q["lever"]): q for q in t["points"]}
+    eff = t["effects"]
+    levers = t["levers"]
+    hdr = ["Lever", "Goodput/GPU", "$/M tok", "J/tok", "TTFT p99", "TPOT p99", "ITL p99"]
+    keys = ["goodput_req_s_per_gpu", "usd_per_mtok", "j_per_tok", "ttft_p99", "tpot_p99", "itl_p99"]
+
+    def cell(x):
+        return "-" if x is None else f"{100 * x:+.0f}%"
+    for wk, w in t["workloads"].items():
+        b = pts.get((wk, "h100", "baseline"))
+        if b is None or "metrics" not in b:
+            continue
+        bm = b["metrics"]
+        p(f"**{w['label']}** on H100. Baseline: goodput {bm['goodput_req_s_per_gpu']:.3f} req/s per GPU, "
+          + (f"${bm['usd_per_mtok']:.2f} per M output tokens, {bm['j_per_tok']:.2f} J/token" if bm.get("usd_per_mtok") else "no capacity")
+          + f"; at {'saturation' if w['reference_rate'] > 1e4 else format(w['reference_rate'], '.3g') + '/s'} TTFT p99"
+            f" {ms(bm['ttft_p99']).strip()}, TPOT p99 {ms(bm['tpot_p99']).strip()}."
+          " Relative change per lever (Pareto-optimal over all six metrics marked *):")
+        p("")
+        rows = []
+        for lk, info in levers.items():
+            if lk == "baseline":
+                continue
+            q = pts.get((wk, "h100", lk))
+            if q is None:
+                continue
+            if "error" in q:
+                rows.append([info["label"], "error: " + q["error"][:60]] + [""] * 5)
+                continue
+            e = eff[wk]["h100"].get(lk, {})
+            star = "*" if q.get("pareto", {}).get("all") else ""
+            rows.append([info["label"] + star] + [cell(e.get(k)) for k in keys])
+        table(L, hdr, rows)
+    # sign flips across workloads
+    p("**Levers whose effect on goodput per GPU changes sign between workloads** (H100; +/- is more/less goodput"
+      " than the baseline by more than 2%):")
+    p("")
+    rows = []
+    for lk, info in levers.items():
+        if lk == "baseline":
+            continue
+        signs = {}
+        for wk in t["workloads"]:
+            x = eff.get(wk, {}).get("h100", {}).get(lk, {}).get("goodput_req_s_per_gpu")
+            if x is not None:
+                signs[wk] = "+" if x > 0.02 else "-" if x < -0.02 else "0"
+        if len({s for s in signs.values() if s != "0"}) > 1:
+            rows.append([info["label"]] + [signs.get(wk, "") for wk in t["workloads"]])
+    table(L, ["Lever"] + [w["label"] for w in t["workloads"].values()], rows)
+    # hardware
+    p("**Hardware**: goodput per GPU and cost per M output tokens of the baseline and of the best lever on each device"
+      " (best = highest goodput per GPU):")
+    p("")
+    rows = []
+    for wk, w in t["workloads"].items():
+        for hw in t["hardware"]:
+            b = pts.get((wk, hw, "baseline"))
+            cand = [q for q in t["points"] if q["workload"] == wk and q["hardware"] == hw and "metrics" in q]
+            if b is None or not cand:
+                continue
+            best = max(cand, key=lambda q: q["metrics"]["goodput_req_s_per_gpu"])
+            bm, xm = b["metrics"], best["metrics"]
+            usd = lambda m: f"{m['usd_per_mtok']:.2f}" if m.get("usd_per_mtok") else "-"
+            rows.append([w["label"], hw.upper(), f"{bm['goodput_req_s_per_gpu']:.3f}", usd(bm), levers[best["lever"]]["label"],
+                         f"{xm['goodput_req_s_per_gpu']:.3f}", usd(xm)])
+    table(L, ["Workload", "Device", "Baseline goodput/GPU", "Baseline $/M tok", "Best lever", "Its goodput/GPU", "Its $/M tok"], rows)
+    return "\n".join(L) + "\n"
+
+
 def cpu_name() -> str:
     try:
         for line in Path("/proc/cpuinfo").read_text().splitlines():
@@ -1353,6 +1833,8 @@ def main():
                     help="render sections 16-18 from examples/results_ced.json instead of rerunning them")
     ap.add_argument("--levers-from-json", action="store_true",
                     help="render sections 19-21 from examples/results_levers.json instead of rerunning them")
+    ap.add_argument("--levers2-from-json", action="store_true",
+                    help="render sections 23-25 from examples/results_levers2.json instead of rerunning them")
     a = ap.parse_args()
     sys.path.insert(0, str(ROOT / "src"))
     new = json.loads(json.dumps(collect()))          # same key types as the legacy side
@@ -1382,8 +1864,18 @@ def main():
     else:
         levers = json.loads(json.dumps(collect_levers()))
         lj.write_text(json.dumps(levers, indent=1))
+    l2j = ROOT / "examples" / "results_levers2.json"
+    if a.levers2_from_json:
+        levers2 = json.loads(l2j.read_text())
+    else:
+        levers2 = json.loads(json.dumps(collect_levers2()))
+        l2j.write_text(json.dumps(levers2, indent=1))
+    tail = "\n" + render_levers2(levers2)
+    tj = ROOT / "examples" / "tradeoffs.json"
+    if tj.exists():
+        tail += "\n" + render_tradeoffs(json.loads(tj.read_text()))
     OUT.write_text(render(new, old, timings) + render_optical(optical) + "\n" + render_ced(ced) + "\n"
-                   + render_levers(levers))
+                   + render_levers(levers) + tail)
     print(f"wrote {OUT}")
 
 

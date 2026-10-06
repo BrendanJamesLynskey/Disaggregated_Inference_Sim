@@ -11,6 +11,9 @@
     disagg-sim --mode colocated --model llama3-8b --devices-per-instance 1 --batch-policy chunked --max-num-batched-tokens 512
     disagg-sim --mode colocated --model opt-13b --device a100-40g --devices-per-instance 1 --kv-policy paged --preemption swap
     disagg-sim --mode colocated --model llama3-8b --devices-per-instance 1 --prefix-caching --turns 4 --think 2 --system-prompts 4 --system-len 1024
+    disagg-sim --model opt-13b --device a100-40g --devices-per-instance 1 --kv-policy paged --preemption swap
+    disagg-sim --mode colocated --model llama3-70b --tp 4 --weight-format fp8 --compute-format fp8 --workload chat
+    disagg-sim --mode colocated --model llama3-8b --devices-per-instance 1 --speculative mtp --gamma 3 --alpha 0.7
 """
 
 from __future__ import annotations
@@ -19,12 +22,13 @@ import argparse
 import json
 from dataclasses import replace
 
-from .hardware import ACCELERATORS, KV_PRESETS, LINKS, MODELS, KVTransit
+from .hardware import ACCELERATORS, KV_PRESETS, LINKS, MODELS, QUANT_FORMATS, KVTransit, Parallel
 from .metrics import format_report, summarise
 from .ppa import ppa_report
 from .sim import SimConfig, simulate
+from .speculative import Speculative
 from .trace import write_trace
-from .workload import LengthDist, chat_sessions, poisson_workload
+from .workload import WORKLOADS, LengthDist, chat_sessions, poisson_workload
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -44,8 +48,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--prompt-cv", type=float, default=0.5)
     p.add_argument("--output", type=float, default=256, help="mean output length")
     p.add_argument("--output-cv", type=float, default=0.5)
-    p.add_argument("--ttft-slo", type=float, default=1.0)
-    p.add_argument("--tpot-slo", type=float, default=0.025)
+    p.add_argument("--ttft-slo", type=float, help="seconds (default 1.0, or the --workload preset's)")
+    p.add_argument("--tpot-slo", type=float, help="seconds per token (default 0.025, or the --workload preset's)")
+    p.add_argument("--workload", choices=WORKLOADS,
+                   help="a named workload: its lengths, sessions and SLOs replace --prompt/--output/--turns/...")
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--compare", action="store_true",
                    help="also run colocated on prefill+decode instances")
@@ -107,8 +113,38 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--system-prompts", type=int, default=0, help="distinct shared system prompts")
     g.add_argument("--system-len", type=int, default=0, help="system prompt length, tokens")
     g.add_argument("--prefix-share", type=float, default=1.0, help="fraction of sessions with a system prompt")
+    g = p.add_argument_group("parallelism inside an instance (brief 20A2; devices per instance = tp x pp)")
+    g.add_argument("--tp", type=int, help="tensor-parallel GPUs per pipeline stage")
+    g.add_argument("--pp", type=int, help="pipeline stages")
+    g.add_argument("--ep", type=int, help="expert parallelism, 1 or tp (MoE models)")
+    g.add_argument("--microbatches", type=int, help="pipeline micro-batches per step (default pp)")
+    g.add_argument("--expert-imbalance", type=float, help="busiest GPU's expert load over the mean (default 1)")
+    g.add_argument("--scale-up-link", choices=LINKS, help="link inside an instance (default: the device's NVLink)")
+    for pool in ("prefill", "decode"):
+        g.add_argument(f"--{pool}-tp", type=int, help=f"tensor parallelism of the {pool} pool")
+        g.add_argument(f"--{pool}-pp", type=int, help=f"pipeline stages of the {pool} pool")
+    g = p.add_argument_group("quantisation as a performance lever (brief 20A2; accuracy is not simulated)")
+    g.add_argument("--weight-format", choices=QUANT_FORMATS, default="bf16")
+    g.add_argument("--kv-format", choices=QUANT_FORMATS, default="bf16")
+    g.add_argument("--compute-format", choices=QUANT_FORMATS, default="bf16",
+                   help="bf16 (weight-only) or the weight format on a device with units for it (W8A8, W4A4)")
+    g = p.add_argument_group("speculative decoding (brief 20A2; Leviathan et al., arXiv:2211.17192)")
+    g.add_argument("--speculative", metavar="DRAFT", choices=["mtp", *MODELS],
+                   help="draft model: 'mtp' (one extra target layer) or a model with the target's vocabulary")
+    g.add_argument("--gamma", type=int, default=3, help="drafted tokens per verify pass")
+    g.add_argument("--alpha", type=float, default=0.7, help="acceptance rate per drafted token")
+    g.add_argument("--spec-seed", type=int, default=0)
     p.add_argument("--ppa", action="store_true", help="also report area, silicon cost and perf/W, /mm², /$")
     return p
+
+
+def parallel_from_args(a, tp, pp):
+    if tp is None and pp is None and (a is None or (a.ep is None and a.microbatches is None)):
+        return None
+    return Parallel(tp=tp or 1, pp=pp or 1, ep=(a.ep or 1) if a is not None else 1,
+                    microbatches=a.microbatches if a is not None else None,
+                    expert_imbalance=(a.expert_imbalance or 1.0) if a is not None else 1.0,
+                    link=a.scale_up_link if a is not None else None)
 
 
 def engine_overrides(a) -> dict:
@@ -166,6 +202,17 @@ def config_from_args(a) -> SimConfig:
     if ced:
         model = replace(model, **ced)
     fe = a.fft_efficiency
+    wp = WORKLOADS[a.workload] if getattr(a, "workload", None) else None
+    ttft = a.ttft_slo if a.ttft_slo is not None else (wp.ttft_slo if wp else 1.0)
+    tpot = a.tpot_slo if a.tpot_slo is not None else (wp.tpot_slo if wp else 0.025)
+    par = parallel_from_args(a, a.tp, a.pp)
+    pools = {}
+    for pool in ("prefill", "decode"):
+        t, q = getattr(a, f"{pool}_tp"), getattr(a, f"{pool}_pp")
+        if t is not None or q is not None:
+            pools[f"{pool}_parallel"] = Parallel(tp=t or 1, pp=q or 1, ep=a.ep or 1, microbatches=a.microbatches,
+                                                 expert_imbalance=a.expert_imbalance or 1.0, link=a.scale_up_link)
+    spec = Speculative(a.speculative, a.gamma, a.alpha, a.spec_seed) if a.speculative else None
     return SimConfig(model=model, device=pick_device(a.device, over, fe),
                      prefill_device=pick_device(a.prefill_device, over, fe),
                      decode_device=pick_device(a.decode_device, over, fe),
@@ -175,15 +222,19 @@ def config_from_args(a) -> SimConfig:
                      devices_per_instance=a.devices_per_instance, mode=a.mode,
                      n_prefill=a.prefill, n_decode=a.decode,
                      n_colocated=a.prefill + a.decode, link=link,
-                     ttft_slo=a.ttft_slo, tpot_slo=a.tpot_slo, trace=bool(a.trace),
+                     ttft_slo=ttft, tpot_slo=tpot, trace=bool(a.trace),
                      fast_forward=a.fast, power_cap_w=a.power_cap,
                      prefill_power_cap_w=a.prefill_power_cap, decode_power_cap_w=a.decode_power_cap,
                      dvfs=a.dvfs, batch_policy=a.batch_policy, max_num_batched_tokens=a.max_num_batched_tokens,
                      kv_policy=a.kv_policy, kv_block_size=a.kv_block_size, max_seq_len=a.max_seq_len,
-                     preemption=a.preemption, host_link=LINKS[a.host_link], prefix_caching=a.prefix_caching)
+                     preemption=a.preemption, host_link=LINKS[a.host_link], prefix_caching=a.prefix_caching,
+                     parallel=par, weight_format=a.weight_format, kv_format=a.kv_format,
+                     compute_format=a.compute_format, speculative=spec, **pools)
 
 
 def workload_from_args(a, rate: float):
+    if getattr(a, "workload", None):
+        return WORKLOADS[a.workload].generate(rate, a.requests, seed=a.seed)
     prompt, output = LengthDist(a.prompt, a.prompt_cv), LengthDist(a.output, a.output_cv)
     if getattr(a, "turns", 1) > 1 or getattr(a, "system_prompts", 0):
         return chat_sessions(rate, a.requests, prompt, output, seed=a.seed, turns=a.turns, think=a.think,
