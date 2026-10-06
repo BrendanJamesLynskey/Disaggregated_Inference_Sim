@@ -32,6 +32,13 @@ the decoder: on the prefill instance (``ced_replay_on="prefill"``, the paper's D
 Bounded Replay) or as the decode instance's first step (``"decode"``, the asymmetric P/D
 deployment of SGLang RFC #39963, where a prefill instance holds only the encoder's weights).
 Off by default: every other model is unchanged. Decode always runs the whole model.
+
+Added 2026-10-06 (brief 20A1): ``CostModel.step_mixed``, one forward pass that mixes decode rows
+with prefill chunks that start after ``p0`` tokens already in the KV cache. It prices chunked
+prefill (Sarathi-Serve, arXiv:2403.02310), prefill after a prefix-cache hit (SGLang, arXiv:2312.07104)
+and the recompute of a preempted request (vLLM, arXiv:2309.06180); the schedulers are in ``sim.py``.
+Validation presets for those papers: Mistral-7B, Yi-34B and OPT-13B shapes (from their Hugging Face
+configs), an A100 40 GB and a PCIe Gen4 x16 host link. Nothing existing changes.
 """
 
 from __future__ import annotations
@@ -441,10 +448,20 @@ LLAMA3_8B_HYENA_CIRC = replace(LLAMA3_8B_HYENA, name="Llama-3-8B-shape Hyena-2 +
 LLAMA3_8B_CED = replace(LLAMA3_8B, name="Llama-3-8B-shape CED 16+16", ced_encoder_layers=16)
 LLAMA3_70B_CED = replace(LLAMA3_70B, name="Llama-3-70B-shape CED 40+40", ced_encoder_layers=40)
 
+# Validation shapes for brief 20A1 (from each model's Hugging Face config.json). Mistral-7B and Yi-34B are
+# Sarathi-Serve's models; OPT-13B is vLLM's. Approximations, stated: Mistral-7B's 4,096-token sliding window
+# is ignored (full attention); OPT's two-matrix GELU MLP (2 x 5120 x 20480 parameters) is written as this
+# class's three-matrix MLP with d_ff = 13653 (209.7M parameters per layer either way, within 0.003%); OPT's
+# tied embedding is counted twice like every model here (26.2 GB of weights; vLLM's Table 1: 26 GB).
+MISTRAL_7B = ModelSpec("Mistral-7B", n_layers=32, d_model=4096, n_heads=32, n_kv_heads=8, d_ff=14336, vocab=32000)
+YI_34B = ModelSpec("Yi-34B", n_layers=60, d_model=7168, n_heads=56, n_kv_heads=8, d_ff=20480, vocab=64000)
+OPT_13B = ModelSpec("OPT-13B", n_layers=40, d_model=5120, n_heads=40, n_kv_heads=40, d_ff=13653, vocab=50272)
+
 MODELS = {"llama3-8b": LLAMA3_8B, "llama3-70b": LLAMA3_70B, "llama3-8b-hyena": LLAMA3_8B_HYENA,
           "llama3-8b-hyena-dist": LLAMA3_8B_HYENA_DIST, "llama3-8b-hybrid": LLAMA3_8B_HYBRID,
           "llama3-8b-hyena-circ": LLAMA3_8B_HYENA_CIRC,
-          "llama3-8b-ced": LLAMA3_8B_CED, "llama3-70b-ced": LLAMA3_70B_CED}
+          "llama3-8b-ced": LLAMA3_8B_CED, "llama3-70b-ced": LLAMA3_70B_CED,
+          "mistral-7b": MISTRAL_7B, "yi-34b": YI_34B, "opt-13b": OPT_13B}
 
 
 # ──────────────────────────────────────────────────────────── hardware ──
@@ -533,7 +550,10 @@ HYPOTHETICAL_OPTICAL = Accelerator("Hypothetical-optical-MAC", peak_flops=4000 *
 OPTICAL_FFT = replace(H100_SXM, name="Optical-FFT + H100-class", transform=TransformEngine())
 OPTICAL_FFT_SMALL = replace(A100_SXM, name="Optical-FFT + A100-class", transform=TransformEngine())
 
-ACCELERATORS = {"h100": H100_SXM, "a100": A100_SXM, "optical": HYPOTHETICAL_OPTICAL,
+# The 40 GB A100 (HBM2, 1,555 GB/s; NVIDIA A100 datasheet): vLLM's OPT-13B server (arXiv:2309.06180, Table 1).
+A100_40G = replace(A100_SXM, name="A100-SXM-40GB", mem_bw=1.555 * TB, mem_capacity=40 * GB)
+
+ACCELERATORS = {"h100": H100_SXM, "a100": A100_SXM, "a100-40g": A100_40G, "optical": HYPOTHETICAL_OPTICAL,
                 "optical-fft": OPTICAL_FFT, "optical-fft-small": OPTICAL_FFT_SMALL}
 
 
@@ -555,6 +575,8 @@ LINKS = {
     "nvlink4": Link("NVLink 4 (one direction)", bandwidth=450 * GB, latency=5e-6, pj_per_bit=5.0),
     "ib-ndr": Link("InfiniBand NDR 400G", bandwidth=50 * GB, latency=10e-6, pj_per_bit=15.0),
     "pcie5": Link("PCIe Gen5 x16", bandwidth=64 * GB, latency=5e-6, pj_per_bit=6.0),
+    # An A100's host link (vLLM's swap-to-CPU path): about 32 GB/s each way; energy as Gen5 (illustrative).
+    "pcie4": Link("PCIe Gen4 x16", bandwidth=32 * GB, latency=5e-6, pj_per_bit=6.0),
     "eth-100g": Link("100 GbE", bandwidth=12.5 * GB, latency=20e-6, pj_per_bit=15.0),
     "eth-25g": Link("25 GbE", bandwidth=3.125 * GB, latency=20e-6, pj_per_bit=15.0),
     # Photonic interconnect (NOT Fourier optics): an illustrative co-packaged-optics link.
@@ -904,6 +926,30 @@ class CostModel:
         flops = 2 * m.matmul_params * batch + 4 * m.n_layers * m.d_model * (ctx + batch)
         nbytes = m.weight_bytes_read(batch) + (ctx + batch) * m.kv_bytes_per_token
         return self._time(flops, nbytes)
+
+    def step_mixed(self, ctx: int, batch: int, chunks) -> StepCost:
+        """One forward pass that mixes ``batch`` decode rows over ``ctx`` cached positions (as
+        ``decode_sum``) with prefill chunks ``(p0, c, last)``: c new prompt tokens after p0 already
+        in the KV cache (earlier chunks, a prefix-cache hit, or nothing). ``last`` marks a chunk that
+        ends its prompt (it reaches the LM head under ``prefill_lm_head="last"``).
+
+        A chunk's attention is the tail of the causal sum, 4 L d j for j = p0+1 .. p0+c, and its KV
+        traffic reads the p0 cached positions and writes c (Sarathi-Serve, arXiv:2403.02310, section
+        4.3: every chunk re-reads the KV of the chunks before it). Weights are read once per pass, which
+        is why piggy-backing prefill tokens on a memory-bound decode batch is nearly free. With no decode
+        rows and p0 = 0 this is exactly ``prefill``. Attention models only (``sim.py`` checks)."""
+        m = self.model
+        flops = 2 * m.matmul_params * batch + 4 * m.n_layers * m.d_model * (ctx + batch)
+        tokens, kv = batch, ctx + batch
+        for p0, c, last in chunks:
+            if m.prefill_lm_head == "all":
+                flops += 2 * m.matmul_params * c
+            else:
+                flops += 2 * m.layer_params * c + (2 * m.vocab * m.d_model if last else 0)
+            flops += 2 * m.n_layers * m.d_model * c * (2 * p0 + c + 1)
+            tokens += c
+            kv += p0 + c
+        return self._time(flops, m.weight_bytes_read(tokens) + kv * m.kv_bytes_per_token)
 
     def compress_pass(self, cost: StepCost, ops: float, nbytes: float) -> StepCost:
         """Add a KV-compression kernel after a prefill step (endpoint compression): an

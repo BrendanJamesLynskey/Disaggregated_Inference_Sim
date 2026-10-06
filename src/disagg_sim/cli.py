@@ -8,6 +8,9 @@
     disagg-sim --model llama3-8b-hyena-circ --devices-per-instance 1 --prefill-device optical-fft --decode-device h100
     disagg-sim --model llama3-8b --devices-per-instance 1 --link eth-25g --kv-compress fp8 --kv-compress-at transit
     disagg-sim --model llama3-70b-ced --ced-replay-on decode --prefill-devices-per-instance 2
+    disagg-sim --mode colocated --model llama3-8b --devices-per-instance 1 --batch-policy chunked --max-num-batched-tokens 512
+    disagg-sim --mode colocated --model opt-13b --device a100-40g --devices-per-instance 1 --kv-policy paged --preemption swap
+    disagg-sim --mode colocated --model llama3-8b --devices-per-instance 1 --prefix-caching --turns 4 --think 2 --system-prompts 4 --system-len 1024
 """
 
 from __future__ import annotations
@@ -21,7 +24,7 @@ from .metrics import format_report, summarise
 from .ppa import ppa_report
 from .sim import SimConfig, simulate
 from .trace import write_trace
-from .workload import LengthDist, poisson_workload
+from .workload import LengthDist, chat_sessions, poisson_workload
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -85,6 +88,25 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--ced-replay", type=int, metavar="W", help="prompt tokens replayed through the decoder (default 128)")
     g.add_argument("--ced-replay-on", choices=["prefill", "decode"],
                    help="replay on the prefill instance (the paper) or as decode's first step (SGLang RFC #39963)")
+    g = p.add_argument_group("scheduling and KV memory (colocated mode; brief 20A1)")
+    g.add_argument("--batch-policy", choices=["prefill-priority", "decode-priority", "chunked"],
+                   default="prefill-priority", help="chunked = Sarathi-Serve stall-free batching (arXiv:2403.02310)")
+    g.add_argument("--max-num-batched-tokens", type=int, metavar="N",
+                   help="token budget of one step (default: the prefill budget, 8192)")
+    g.add_argument("--kv-policy", choices=["oracle", "pow2", "max", "paged"], default="oracle",
+                   help="reserve prompt + output (default), over-reserve (pow2, max) or paged blocks (vLLM, arXiv:2309.06180)")
+    g.add_argument("--kv-block-size", type=int, default=16)
+    g.add_argument("--max-seq-len", type=int, default=2048, help="the 'max' policy's reservation")
+    g.add_argument("--preemption", choices=["recompute", "swap"], default="recompute")
+    g.add_argument("--host-link", choices=LINKS, default="pcie5", help="swap path to host memory")
+    g.add_argument("--prefix-caching", action="store_true",
+                   help="LRU cache of shared prompt segments (SGLang RadixAttention, arXiv:2312.07104)")
+    g = p.add_argument_group("sessions with shared prefixes (the workload; --prompt is each turn's new input)")
+    g.add_argument("--turns", type=int, default=1, help="turns per session (closed loop)")
+    g.add_argument("--think", type=float, default=0.0, help="mean think time between turns, seconds")
+    g.add_argument("--system-prompts", type=int, default=0, help="distinct shared system prompts")
+    g.add_argument("--system-len", type=int, default=0, help="system prompt length, tokens")
+    g.add_argument("--prefix-share", type=float, default=1.0, help="fraction of sessions with a system prompt")
     p.add_argument("--ppa", action="store_true", help="also report area, silicon cost and perf/W, /mm², /$")
     return p
 
@@ -156,13 +178,21 @@ def config_from_args(a) -> SimConfig:
                      ttft_slo=a.ttft_slo, tpot_slo=a.tpot_slo, trace=bool(a.trace),
                      fast_forward=a.fast, power_cap_w=a.power_cap,
                      prefill_power_cap_w=a.prefill_power_cap, decode_power_cap_w=a.decode_power_cap,
-                     dvfs=a.dvfs)
+                     dvfs=a.dvfs, batch_policy=a.batch_policy, max_num_batched_tokens=a.max_num_batched_tokens,
+                     kv_policy=a.kv_policy, kv_block_size=a.kv_block_size, max_seq_len=a.max_seq_len,
+                     preemption=a.preemption, host_link=LINKS[a.host_link], prefix_caching=a.prefix_caching)
+
+
+def workload_from_args(a, rate: float):
+    prompt, output = LengthDist(a.prompt, a.prompt_cv), LengthDist(a.output, a.output_cv)
+    if getattr(a, "turns", 1) > 1 or getattr(a, "system_prompts", 0):
+        return chat_sessions(rate, a.requests, prompt, output, seed=a.seed, turns=a.turns, think=a.think,
+                             system_prompts=a.system_prompts, system_len=a.system_len, share=a.prefix_share)
+    return poisson_workload(rate, a.requests, prompt, output, seed=a.seed)
 
 
 def run_once(cfg: SimConfig, a, rate: float) -> dict:
-    wl = poisson_workload(rate, a.requests, LengthDist(a.prompt, a.prompt_cv),
-                          LengthDist(a.output, a.output_cv), seed=a.seed)
-    res = simulate(cfg, wl)
+    res = simulate(cfg, workload_from_args(a, rate))
     if a.trace and res.trace:
         write_trace(res.trace, a.trace)
     m = summarise(res)

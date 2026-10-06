@@ -127,6 +127,8 @@ def summarise(res: SimResult) -> dict:
             "optical_bound_frac": i.optical_bound_time / i.busy if i.busy else 0.0,
             "optical_flops": i.optical_flops, "conversion_J": i.optical_j,
             "static_J": i.cost.optical_static_w * res.horizon} for i in res.instances}
+    if cfg.scheduled:
+        out["scheduler"] = scheduler_report(res)
     tr = cfg.kv_transit
     if tr is not None:
         lk = res.link
@@ -135,6 +137,36 @@ def summarise(res: SimResult) -> dict:
             "handoff_GB": lk.handoff_bytes / 1e9,
             "transit_bound_frac": lk.transit_bound / lk.transfers if lk.transfers else 0.0,
             "transit_J": lk.transit_j}
+    return out
+
+
+def scheduler_report(res: SimResult) -> dict:
+    """The brief-20A1 levers: what the schedulers did (only when ``SimConfig.scheduled``)."""
+    cfg, insts = res.cfg, res.instances
+    busy = run = tok = alloc = 0.0          # plain loops, not sum(): Python 3.12's sum() of floats is compensated
+    for i in insts:
+        busy, run, tok, alloc = busy + i.busy, run + i.run_area, tok + i.tok_area, alloc + i.alloc_area
+    out = {"batch_policy": cfg.batch_policy, "token_budget": insts[0].budget, "kv_policy": cfg.kv_policy,
+           "kv_capacity_units": insts[0].kv_cap, "kv_unit_tokens": insts[0].blk,
+           "mean_running": run / busy if busy else 0.0,
+           "kv_token_frac": tok / alloc if alloc else math.nan,
+           "computed_prefill_tokens": sum(i.computed_tokens for i in insts)}
+    if cfg.kv_policy == "paged":
+        out["preemption"] = cfg.preemption
+        out["preemptions"] = sum(i.preemptions for i in insts)
+        out["recompute_tokens"] = sum(i.recompute_tokens for i in insts)
+        if cfg.preemption == "swap":
+            so = si = ss = sj = 0.0
+            for i in insts:
+                so, si, ss, sj = so + i.swap_out_bytes, si + i.swap_in_bytes, ss + i.swap_time, sj + i.swap_j
+            out["swap"] = {"out_GB": so / 1e9, "in_GB": si / 1e9, "seconds": ss, "J": sj}
+    if cfg.prefix_caching:
+        prompt = sum(i.prompt_tokens for i in insts)
+        hit = sum(i.hit_tokens for i in insts)
+        out["prefix_cache"] = {"hit_rate": hit / prompt if prompt else 0.0, "hit_tokens": hit,
+                               "prompt_tokens": prompt,
+                               "evicted_tokens": sum(i.cache.evicted_tokens for i in insts),
+                               "cached_tokens_end": sum(i.cache.cached_tokens for i in insts)}
     return out
 
 
@@ -174,10 +206,16 @@ def energy_report(res: SimResult, out_tokens: int, slo_met: int) -> dict:
     link = res.link.energy
     total = static + compute + memory + link
     transit = res.cfg.kv_transit is not None
+    swap = res.cfg.scheduled and res.cfg.kv_policy == "paged" and res.cfg.preemption == "swap"
     if optical:
         total = total + o_static + o_conv
     if transit:
         total = total + res.link.transit_j
+    if swap:
+        swap_j = 0.0
+        for i in res.instances:
+            swap_j += i.swap_j
+        total = total + swap_j
     breakdown = {"static": static / total, "compute": compute / total,
                  "memory": memory / total, "link": link / total}
     if optical:
@@ -185,6 +223,8 @@ def energy_report(res: SimResult, out_tokens: int, slo_met: int) -> dict:
         breakdown["optical_conversions"] = o_conv / total
     if transit:
         breakdown["transit"] = res.link.transit_j / total
+    if swap:
+        breakdown["swap"] = swap_j / total
     return {
         "total_J": total,
         "avg_power_W": total / H,
@@ -228,6 +268,20 @@ def format_report(m: dict) -> str:
         lines.append(f"kv hand-off  {t['preset']} at {t['where']} (ratio {t['ratio']:.2f}): "
                      f"{t['handoff_GB']:.1f} GB -> {m['kv_link']['bytes_GB']:.1f} GB on the link, "
                      f"transit-bound {100 * t['transit_bound_frac']:.0f}% of transfers, stage {t['transit_J']:,.1f} J")
+    if "scheduler" in m:
+        s = m["scheduler"]
+        line = (f"scheduler    {s['batch_policy']} (budget {s['token_budget']:,} tokens), KV {s['kv_policy']}"
+                + (f" ({s['kv_unit_tokens']}-token blocks, {s['preemption']})" if s["kv_policy"] == "paged" else "")
+                + f": {s['mean_running']:.1f} running, {100 * s['kv_token_frac']:.0f}% of allocated KV holds tokens")
+        if "preemptions" in s:
+            line += f", {s['preemptions']} preemptions"
+        if "swap" in s:
+            line += f" ({s['swap']['out_GB']:.1f} GB swapped out, {s['swap']['seconds']:.2f} s)"
+        lines.append(line)
+        if "prefix_cache" in s:
+            c = s["prefix_cache"]
+            lines.append(f"prefix cache hit rate {100 * c['hit_rate']:.1f}% of {c['prompt_tokens']:,} prompt tokens, "
+                         f"{c['evicted_tokens']:,} tokens evicted")
     capped = {k: v["power_bound_frac"] for k, v in e["per_instance"].items() if v["power_bound_frac"] > 0}
     if capped:
         lines.append("power-capped " + "  ".join(f"{k} {100 * v:.0f}% of busy time" for k, v in capped.items()))

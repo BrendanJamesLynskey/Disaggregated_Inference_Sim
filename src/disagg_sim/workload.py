@@ -35,6 +35,25 @@ class Request:
     itls: list[float] = field(default_factory=list, repr=False)
     adm_step: int | None = field(default=None, repr=False)   # used by FastDecodeInstance
 
+    # Shared prefixes (brief 20A1; read only when SimConfig.prefix_caching is on). ``prefix`` is the
+    # chain of cacheable segments the prompt starts with, ((key, tokens), ...) from the root (a system
+    # prompt, then earlier turns of the same session); ``emit_key`` names the segment this request adds
+    # (the rest of its prompt plus its output), which the next turn's chain ends with.
+    prefix: tuple = field(default=(), repr=False)
+    emit_key: str | None = field(default=None, repr=False)
+    # Closed-loop sessions: released ``think`` seconds after request ``after`` (a rid) finishes.
+    after: int | None = field(default=None, repr=False)
+    think: float = field(default=0.0, repr=False)
+    # ScheduledInstance state: prompt tokens to (re)compute, done so far, tokens out at (re)admission,
+    # private KV units held, pinned prefix segments and the tokens they cover, units parked in host memory
+    target: int = field(default=0, repr=False)
+    done_prompt: int = field(default=0, repr=False)
+    base_out: int = field(default=0, repr=False)
+    alloc: int = field(default=0, repr=False)
+    nodes: list = field(default_factory=list, repr=False)
+    covered: int = field(default=0, repr=False)
+    swapped_units: int = field(default=0, repr=False)
+
     # ── derived latencies ────────────────────────────────────────────────
     @property
     def ttft(self) -> float:
@@ -106,11 +125,70 @@ def poisson_workload(rate: float, n: int, prompt: LengthDist, output: LengthDist
     return reqs
 
 
+def chat_sessions(rate: float, n: int, prompt: LengthDist, output: LengthDist, seed: int = 0, *,
+                  turns: int = 1, think: float = 0.0, system_prompts: int = 0, system_len: int = 0,
+                  share: float = 1.0) -> list[Request]:
+    """``n`` requests in sessions with shared prefixes, for prefix caching (brief 20A1).
+
+    Sessions start as a Poisson process at ``rate`` per second; each has ``turns`` turns (the last
+    session is cut at ``n`` requests). ``prompt`` is the *new* input of a turn and ``output`` its reply.
+    With probability ``share`` a session opens with one of ``system_prompts`` system prompts (chosen
+    uniformly) of ``system_len`` tokens. Turn k's prompt is the system prompt, every earlier turn's input
+    and output, then its own input, so its ``prefix`` chain is (system prompt, turn 0, ..., turn k-1).
+    Turns after the first are closed-loop: released ``think`` x Exp(1) seconds after the previous turn
+    finishes (``after`` / ``think``), so the reuse distance is set by the think time and the load.
+    ``arrival`` of a released turn is a placeholder until the simulator releases it. With ``turns=1`` and
+    no system prompt this draws the same requests as ``poisson_workload``.
+    """
+    rng = random.Random(seed)
+    t, reqs = 0.0, []
+    sid = 0
+    while len(reqs) < n:
+        t += rng.expovariate(rate)
+        sys_seg = ()
+        if system_prompts and system_len and (share >= 1.0 or rng.random() < share):
+            sys_seg = ((f"sys{rng.randrange(system_prompts)}", system_len),)
+        chain, hist = sys_seg, sum(x for _, x in sys_seg)
+        prev = None
+        for k in range(turns):
+            if len(reqs) >= n:
+                break
+            new, out = prompt.sample(rng), output.sample(rng)
+            gap = think * rng.expovariate(1.0) if (k and think > 0) else 0.0
+            r = Request(len(reqs), t if k == 0 else 0.0, hist + new, out, prefix=chain,
+                        emit_key=f"s{sid}t{k}" if turns > 1 else None, after=prev, think=gap)
+            reqs.append(r)
+            chain = chain + ((f"s{sid}t{k}", new + out),)
+            hist += new + out
+            prev = r.rid
+        sid += 1
+    return reqs
+
+
+def _extras(r: Request) -> dict:
+    return {"chain": [list(c) for c in r.prefix], "emit": r.emit_key, "after": r.after, "think": r.think}
+
+
 def dump_workload(reqs: list[Request], path: str | Path) -> None:
-    rows = [[r.arrival, r.prompt_len, r.output_len] for r in reqs]
-    Path(path).write_text(json.dumps(rows))
+    """Rows of [arrival, prompt, output]; a fourth column (prefix chain, emitted key, closed-loop
+    predecessor and think time) only when some request has one (the JS port reads the same rows)."""
+    Path(path).write_text(json.dumps(workload_rows(reqs)))
+
+
+def workload_rows(reqs: list[Request]) -> list[list]:
+    if not any(r.prefix or r.emit_key or r.after is not None for r in reqs):
+        return [[r.arrival, r.prompt_len, r.output_len] for r in reqs]
+    return [[r.arrival, r.prompt_len, r.output_len, _extras(r)] for r in reqs]
 
 
 def load_workload(path: str | Path) -> list[Request]:
     rows = json.loads(Path(path).read_text())
-    return [Request(i, float(a), int(p), int(o)) for i, (a, p, o) in enumerate(rows)]
+    out = []
+    for i, row in enumerate(rows):
+        r = Request(i, float(row[0]), int(row[1]), int(row[2]))
+        if len(row) > 3:
+            x = row[3]
+            r.prefix = tuple((k, int(v)) for k, v in x["chain"])
+            r.emit_key, r.after, r.think = x["emit"], x["after"], float(x["think"])
+        out.append(r)
+    return out

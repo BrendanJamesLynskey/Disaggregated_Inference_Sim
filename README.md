@@ -40,11 +40,20 @@ queueing theory.
   (`--ced-replay-on decode`, the asymmetric P/D deployment of
   [SGLang RFC #39963](https://github.com/sgl-project/sglang/issues/39963), where a prefill instance holds only the
   encoder's weights and the first token comes from the decode pool). Off by default: every other run is unchanged.
+* **Scheduling and KV-memory levers** (added 2026-10-06, brief 20A1; colocated mode, all off by default):
+  `--batch-policy prefill-priority|decode-priority|chunked` with `--max-num-batched-tokens` (Sarathi-Serve's
+  chunked prefill, [arXiv:2403.02310](https://arxiv.org/abs/2403.02310)); `--kv-policy oracle|pow2|max|paged`
+  with `--kv-block-size` and `--preemption recompute|swap` over `--host-link` (vLLM's PagedAttention and the
+  baselines it compares against, [arXiv:2309.06180](https://arxiv.org/abs/2309.06180)); `--prefix-caching`, an
+  LRU cache of shared prompt segments (SGLang's RadixAttention, [arXiv:2312.07104](https://arxiv.org/abs/2312.07104)),
+  fed by `chat_sessions` workloads (shared system prompts, closed-loop multi-turn sessions: `--turns`, `--think`,
+  `--system-prompts`, `--system-len`, `--prefix-share`). Validation presets `mistral-7b`, `yi-34b`, `opt-13b`,
+  `a100-40g` and `pcie4`. With every lever off, every earlier number is unchanged.
 * A JavaScript port (`web/sim_engine.js`) that runs live in
   [deck 05](https://brendanjameslynskey.github.io/InfSim_05_Disaggregated_Inference/) and
   [FOptInf deck 03](https://brendanjameslynskey.github.io/FOptInf_03_Optical_Prefill_Pools/),
   and is tested to match the Python exactly, every new feature included.
-* 154 tests: unit, invariant, analytic (M/D/1, Little's law), behavioural,
+* 203 tests: unit, invariant, analytic (M/D/1, Little's law), behavioural,
   property-based (Hypothesis), power and energy, differential (fast path vs
   baseline, JS vs Python), the cost model pinned against an operator trace
   of the real Llama-3-8B, and (94, added 2026-10-04) the new features: identical pools
@@ -53,7 +62,11 @@ queueing theory.
   the averaging-pass rule, monotone energy in static power, and JS parity on 21 new
   configurations; and (24, added 2026-10-05, `tests/test_ced.py`) the CED option: closed-form prefill FLOPs, the
   encoder-only residency, replay settings inert when CED is off (bit-identical runs), every request's stages and
-  timestamps in both replay placements, the fast path exact, and JS parity on 10 configurations.
+  timestamps in both replay placements, the fast path exact, and JS parity on 10 configurations; and (49, added
+  2026-10-06, `tests/test_levers.py`) the scheduling and KV-memory levers: inert settings and the new scheduler at
+  default levers bit-identical to the old colocated instance, the mixed step's closed forms (chunks sum to the whole
+  prompt plus KV re-reads), memory never over-committed, each paper's ordering, LRU eviction, closed-loop sessions,
+  and JS parity on 15 configurations (preemption, swap, prefix hits, evictions and LRU ties all exercised).
 * Every number below comes from [`examples/results.md`](examples/results.md),
   written by `examples/results.py`.
 
@@ -76,7 +89,7 @@ queueing theory.
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .[dev]
-pytest                                   # 154 tests, about a minute
+pytest                                   # 203 tests, about a minute
 
 disagg-sim                               # one disaggregated run (70B, 4xH100 per instance)
 disagg-sim --compare                     # colocated vs disaggregated, same request stream
@@ -97,6 +110,14 @@ disagg-sim --model llama3-8b --devices-per-instance 1 --link eth-25g --rate 14 -
 disagg-sim --model llama3-70b-ced --prompt 8192 --output 128 --rate 3
 disagg-sim --model llama3-70b-ced --ced-replay-on decode --prefill-devices-per-instance 2 --prompt 8192 --output 128 --rate 3
 
+# scheduling and KV memory (colocated): chunked prefill, paged KV with preemption, prefix caching
+disagg-sim --mode colocated --model mistral-7b --device a100 --devices-per-instance 1 --prefill 1 --decode 0 \
+           --prompt 2666 --prompt-cv 1.17 --output 481 --output-cv 0.59 --rate 2 --batch-policy chunked --max-num-batched-tokens 512
+disagg-sim --mode colocated --model opt-13b --device a100-40g --devices-per-instance 1 --prefill 1 --decode 0 \
+           --prompt 161 --prompt-cv 1 --output 338 --output-cv 1 --rate 6 --kv-policy paged --preemption swap --host-link pcie4
+disagg-sim --mode colocated --model mistral-7b --device a100 --devices-per-instance 1 --prefill 1 --decode 0 \
+           --prompt 384 --prompt-cv 0.19 --output 6 --output-cv 0.19 --turns 4 --rate 4 --prefix-caching
+
 python examples/benchmark_acceleration.py   # measure every acceleration technique
 python examples/results.py               # regenerate examples/results.md (every quoted number)
 ```
@@ -116,8 +137,8 @@ hot-spot     stage=kv_wait -> kv-link (busy 96%)   busy>90%: decode-0, kv-link
 | Module | Role |
 |--------|------|
 | `src/disagg_sim/hardware.py` | `ModelSpec`, `Accelerator`, `Link`, and the roofline `CostModel` (the only place that knows about time) |
-| `src/disagg_sim/workload.py` | `Request` and all its timestamps; lognormal lengths; Poisson arrivals; JSON replay |
-| `src/disagg_sim/sim.py` | SimPy processes for prefill, decode and colocated instances; the KV link as a `simpy.Resource`; routers; `FastDecodeInstance` |
+| `src/disagg_sim/workload.py` | `Request` and all its timestamps; lognormal lengths; Poisson arrivals; sessions with shared prefixes (`chat_sessions`); JSON replay |
+| `src/disagg_sim/sim.py` | SimPy processes for prefill, decode and colocated instances; the KV link as a `simpy.Resource`; routers; `FastDecodeInstance`; `ScheduledInstance` (batching policy, paged KV, preemption) and `PrefixCache` |
 | `src/disagg_sim/metrics.py` | Percentiles, goodput, utilisation, MFU/MBU, stage breakdown, hot-spot attribution, Little's law |
 | `src/disagg_sim/ppa.py` | Area, silicon cost and perf/W, perf/mm², perf/$ per pool (FHE_Accelerator_Sim's method, illustrative) |
 | `src/disagg_sim/trace.py` | Chrome trace-event export |
@@ -193,15 +214,40 @@ prefill; TPOT 25 ms; the prompt:output ratios are illustrative stand-ins for age
 With the replay on decode a prefill instance holds 71.9 GB of weights instead of 141.1 GB: on two H100s that leaves
 KV room for 220,048 tokens instead of 8,835. Gains above 2× are queueing (a fixed TTFT SLO), not FLOPs.
 
+### Scheduling and KV-memory levers (results.md sections 19–22)
+
+Validated against their papers, colocated instances; section 22 lists what reproduces and what does not.
+
+* **Chunked prefill** (Mistral-7B on 1×A100, ShareGPT-like lengths, 2.02 req/s): ITL p99 246.1 ms with
+  prefill-priority, 51.1 ms with a 512-token budget, 10.0 ms with decode-priority (whose TTFT p50 is 496,500 ms);
+  TTFT p50 249.4 ms against 268.3 ms chunked. Capacity under the strict 100 ms TBT SLO: 1.31 → 4.25 req/s (3.24×;
+  the paper reports 2.6–3.5×); under the relaxed 0.5 s SLO 1.68×. Chunking costs only 0.4% here against the paper's
+  measured ~25% at 512 tokens, so the model never prefers the larger relaxed-SLO budget the paper chose.
+* **Paged KV** (OPT-13B on one A100-40GB, ShareGPT means, 6 req/s): 27.04 requests batched against 16.98 with exact
+  reservation and 4.99 with 2,048-token reservation; 97.3% of allocated KV holds tokens (paper 96.3%), 20.3% for
+  max-length reservation (paper 20.4%). Sustainable rate 2.16× exact reservation (paper 1.7–2.7×). Swap costs
+  0.037 s/GB with 1-token blocks against 0.031 with 64.
+* **Prefix caching** (Mistral-7B on 1×A100): 4-turn chat throughput 2.48× with 4–8-token outputs and 1.27× with
+  256–512 (paper: noticeable against almost none); a 1,024-token shared system prompt gives a 66.8% hit rate,
+  3.19× lower TTFT p50 and 2.21× throughput; longer think times (reuse distance) cut an LRU cache's hit rate from
+  68.8% to 23.1% when KV memory is tight.
+
+All coefficients are the simulator's illustrative roofline ones; the papers measured real systems on other models
+and traces, so only orderings and ranges are compared.
+
 **Ports.** JavaScript: everything, bit-exact. Rust
 ([Rust_DES_Kernel](https://github.com/BrendanJamesLynskey/Rust_DES_Kernel)): heterogeneous pools only,
 bit-exact; the FFT-mixing models, the optical transform engine, KV hand-off compression and the CED option
 are **Python and JS only, not in the Rust port**; the Rust side rejects the first three by name and the
-`*-ced` models as unknown models.
+`*-ced` models as unknown models. The scheduling and KV-memory levers (sections 19–21) are also **Python and JS
+only**: the JS port is bit-exact on every one of them, and Rust_DES_Kernel rejects a configuration that turns any of
+them on ("... are Python and JS only, not in the Rust port"), closed-loop sessions and the validation presets
+included.
 
-`examples/results.py --keep-timings` regenerates sections 1–8 and 10–18 and keeps section 9 (wall
-clock) from the previous run; `--optical-from-json` re-renders 10–15 from `examples/results_optical.json`
-and `--ced-from-json` re-renders 16–18 from `examples/results_ced.json`.
+`examples/results.py --keep-timings` regenerates sections 1–8 and 10–22 and keeps section 9 (wall
+clock) from the previous run; `--optical-from-json` re-renders 10–15 from `examples/results_optical.json`,
+`--ced-from-json` re-renders 16–18 from `examples/results_ced.json` and `--levers-from-json` re-renders 19–22
+from `examples/results_levers.json`.
 
 ---
 
@@ -210,8 +256,14 @@ and `--ced-from-json` re-renders 16–18 from `examples/results_ced.json`.
 * A tensor-parallel group is treated as one larger device; **no all-reduce cost**.
 * KV is transferred **after** the whole prefill (no layer-wise streaming), FCFS over
   `channels` independent link channels.
-* Each sequence reserves its full KV (prompt + output) at admission; no pre-emption,
-  swapping, prefix caching or chunked prefill.
+* By default each sequence reserves its full KV (prompt + output) at admission, with no
+  pre-emption, swapping, prefix caching or chunked prefill. The brief-20A1 levers add those to
+  **colocated** instances only (disaggregated pools keep whole prompts and reserved KV). They are
+  roofline-priced: chunking costs only its weight and KV re-reads plus the step overhead (no kernel
+  or tile-quantisation penalty, so chunking overhead is far below Sarathi-Serve's measured ~25% at
+  512 tokens); paged attention has no kernel slowdown; swapping costs blocks × link latency + bytes /
+  bandwidth, serialised before the next step; a cached segment rounds up to whole KV blocks; prefix
+  caching with swap preemption is not modelled.
 * Efficiency factors (MFU/MBU derating) are constants, not shape-dependent.
 * Disaggregated TPOT includes the KV transfer and decode queueing (DistServe's definition); TTFT
   does not (the first token leaves the prefill pool), except under CED with the replay on decode, where

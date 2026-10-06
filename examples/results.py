@@ -20,6 +20,10 @@ Sections 16-18 (added 2026-10-05, brief 11) measure the Causal Encoder-Decoder o
 arXiv:2609.19969) on a dense Llama-3-70B-shape proxy: prefill cost, pool split and capacity across prompt:output
 ratios. ``--ced-from-json`` re-renders them from examples/results_ced.json; with ``--keep-timings
 --optical-from-json --ced-from-json`` nothing is rerun except sections 1-8.
+
+Sections 19-21 (added 2026-10-06, brief 20A1) validate the simulator levers against their papers: batching policy
+and chunked prefill (Sarathi-Serve, arXiv:2403.02310), paged KV and preemption (vLLM, arXiv:2309.06180) and prefix
+caching (SGLang, arXiv:2312.07104). ``--levers-from-json`` re-renders them from examples/results_levers.json.
 """
 
 from __future__ import annotations
@@ -928,6 +932,402 @@ def render_ced(c: dict) -> str:
     return "\n".join(L) + "\n"
 
 
+# ───────────────────────────────────── brief 20A1: simulator levers I (sections 19-21) ──
+LV_N, LV_SEED, LV_TOL = 500, 1, 0.02
+SCHED_DELAY_CAP = 2.0          # Sarathi-Serve: median scheduling delay at most 2 s (section 5.1)
+Z90 = 1.2815515655446004       # standard normal 90th percentile
+
+
+def lognormal_fit(median: float, p90: float) -> tuple[float, float]:
+    """(mean, cv) of the lognormal with this median and 90th percentile."""
+    import math
+    sigma = math.log(p90 / median) / Z90
+    return median * math.exp(sigma * sigma / 2), math.sqrt(math.exp(sigma * sigma) - 1)
+
+
+# Sarathi-Serve Table 2 (median, P90) and its length filters (total <= 8,192 / 16,384 tokens), as lognormal
+# fits clipped so that prompt + output stays within the filter.
+SARATHI_DATA = {"openchat_sharegpt4": ((1730, 5696), (415, 834), 7168, 1024),
+                "arxiv_summarization": ((7059, 12985), (208, 371), 15360, 1024)}
+SARATHI_MODELS = {"Mistral-7B, 1xA100": ("mistral-7b", 1, 0.1, 0.5), "Yi-34B, 2xA100": ("yi-34b", 2, 0.2, 1.0)}
+
+
+def collect_levers() -> dict:
+    import math
+    from dataclasses import replace
+    from statistics import median
+    from disagg_sim.hardware import A100_40G, A100_SXM, LINKS, MODELS, CostModel
+    from disagg_sim.metrics import summarise
+    from disagg_sim.sim import SimConfig, simulate
+    from disagg_sim.workload import LengthDist, chat_sessions, poisson_workload
+
+    out: dict = {}
+
+    def dists(name):
+        (pm, p9), (om, o9), phi, ohi = SARATHI_DATA[name]
+        (pmean, pcv), (omean, ocv) = lognormal_fit(pm, p9), lognormal_fit(om, o9)
+        return LengthDist(pmean, pcv, hi=phi), LengthDist(omean, ocv, hi=ohi)
+
+    def measure(cfg, reqs):
+        res = simulate(cfg, reqs)
+        m = summarise(res)
+        done = sorted((r for r in res.requests if r.finish is not None), key=lambda r: r.arrival)
+        steady = done[int(len(done) * cfg.warmup_frac):]
+        lat, s = m["latency_s"], m.get("scheduler", {})
+        row = {"ttft_p50": lat["ttft"]["p50"], "ttft_p99": lat["ttft"]["p99"], "itl_p50": lat["itl"]["p50"],
+               "itl_p99": lat["itl"]["p99"], "tpot_p99": lat["tpot"]["p99"],
+               "sched_delay_p50": median(r.prefill_start - r.arrival for r in steady),
+               "norm_latency": sum(r.e2e / r.output_len for r in steady) / len(steady),
+               "tok_s": m["throughput"]["output_tok_per_s"], "req_s": m["throughput"]["req_per_s"],
+               "j_tok": m["energy"]["J_per_output_token"], "completed": m["requests"]["completed"],
+               "rejected": m["requests"]["rejected"], "sim_time": m["sim_time_s"]}
+        for k in ("mean_running", "kv_token_frac", "preemptions", "recompute_tokens", "computed_prefill_tokens",
+                  "kv_capacity_units"):
+            if k in s:
+                row[k] = s[k]
+        if "swap" in s:
+            row["swap_s"], row["swap_gb"] = s["swap"]["seconds"], s["swap"]["out_GB"] + s["swap"]["in_GB"]
+        if "prefix_cache" in s:
+            row["hit_rate"] = s["prefix_cache"]["hit_rate"]
+            row["evicted_tokens"] = s["prefix_cache"]["evicted_tokens"]
+        return row
+
+    def bisect_rate(ok, lo=0.0, hi=0.5):
+        """Highest rate where ok(rate) holds, to LV_TOL (ok is assumed true below and false above)."""
+        while ok(hi):
+            lo, hi = hi, hi * 2
+        while hi - lo > LV_TOL * hi:
+            mid = (lo + hi) / 2
+            lo, hi = (mid, hi) if ok(mid) else (lo, mid)
+        return lo
+
+    # 19. batching policy (Sarathi-Serve, arXiv:2403.02310)
+    sar = {}
+    for label, (mkey, n, strict, relaxed) in SARATHI_MODELS.items():
+        base = SimConfig(mode="colocated", model=MODELS[mkey], device=A100_SXM, devices_per_instance=n, n_colocated=1,
+                         max_decode_batch=128)
+        for data in (("openchat_sharegpt4", "arxiv_summarization") if mkey == "mistral-7b" else ("openchat_sharegpt4",)):
+            pd, od = dists(data)
+
+            def wl(rate):
+                return poisson_workload(rate, LV_N, pd, od, seed=LV_SEED)
+
+            caps = {}
+            for slo_name, slo in (("strict", strict), ("relaxed", relaxed)):
+                for pol, cfg in (("prefill-priority (vLLM)", base),
+                                 ("chunked 512", replace(base, batch_policy="chunked", max_num_batched_tokens=512)),
+                                 ("chunked 2048", replace(base, batch_policy="chunked", max_num_batched_tokens=2048))):
+                    def ok(rate, cfg=cfg, slo=slo):
+                        r = measure(cfg, wl(rate))
+                        return r["itl_p99"] <= slo and r["sched_delay_p50"] <= SCHED_DELAY_CAP
+                    caps[f"{slo_name}|{pol}"] = bisect_rate(ok)
+            sar[f"{label}|{data}"] = {"slo": {"strict": strict, "relaxed": relaxed}, "capacity": caps,
+                                      "prompt_mean": pd.mean, "prompt_cv": pd.cv, "output_mean": od.mean, "output_cv": od.cv}
+    out["sarathi_capacity"] = sar
+
+    # 19a. mechanism at one load (Mistral-7B, sharegpt): every policy
+    pd, od = dists("openchat_sharegpt4")
+    base = SimConfig(mode="colocated", model=MODELS["mistral-7b"], device=A100_SXM, devices_per_instance=1, n_colocated=1,
+                     max_decode_batch=128)
+    rate = sar["Mistral-7B, 1xA100|openchat_sharegpt4"]["capacity"]["relaxed|prefill-priority (vLLM)"] * 0.8
+    pol_rows = {}
+    for pol, kw in (("prefill-priority", {}), ("decode-priority", {"batch_policy": "decode-priority"}),
+                    ("chunked 256", {"batch_policy": "chunked", "max_num_batched_tokens": 256}),
+                    ("chunked 512", {"batch_policy": "chunked", "max_num_batched_tokens": 512}),
+                    ("chunked 1024", {"batch_policy": "chunked", "max_num_batched_tokens": 1024}),
+                    ("chunked 2048", {"batch_policy": "chunked", "max_num_batched_tokens": 2048}),
+                    ("chunked 4096", {"batch_policy": "chunked", "max_num_batched_tokens": 4096})):
+        pol_rows[pol] = measure(replace(base, max_num_batched_tokens=8192, **kw) if not kw else replace(base, **kw),
+                                poisson_workload(rate, LV_N, pd, od, seed=LV_SEED))
+    out["policies"] = {"rate": rate, "rows": pol_rows}
+
+    # 19c. chunking overhead on one prompt (Yi-34B on 2xA100, Sarathi-Serve Fig. 14's setting)
+    cm = CostModel(MODELS["yi-34b"], A100_SXM, 2)
+    over = {}
+    for s in (2048, 4096, 8192, 16384):
+        whole = cm.step_mixed(0, 0, [(0, s, True)]).time
+        over[s] = {c: sum(cm.step_mixed(0, 0, [(p0, min(c, s - p0), p0 + c >= s)]).time for p0 in range(0, s, c)) / whole - 1
+                   for c in (512, 1024, 2048)}
+    out["chunk_overhead"] = over
+
+    # 20. KV memory (vLLM, arXiv:2309.06180): OPT-13B on one A100-40GB, ShareGPT lengths (means 161 / 338)
+    kv_base = SimConfig(mode="colocated", model=MODELS["opt-13b"], device=A100_40G, devices_per_instance=1,
+                        n_colocated=1, host_link=LINKS["pcie4"], max_num_batched_tokens=8192)
+    p_d, o_d = LengthDist(161.31, 1.0, hi=1024), LengthDist(337.99, 1.0, hi=1024)
+
+    def kv_wl(rate, n=1000):
+        return poisson_workload(rate, n, p_d, o_d, seed=LV_SEED)
+
+    sample = kv_wl(1.0)
+    out["vllm_workload"] = {"prompt_mean": sum(r.prompt_len for r in sample) / len(sample),
+                            "output_mean": sum(r.output_len for r in sample) / len(sample),
+                            "kv_room_tokens": CostModel(MODELS["opt-13b"], A100_40G, 1).kv_capacity_tokens}
+    pols = {"Orca (Max)": {"kv_policy": "max"}, "Orca (Pow2)": {"kv_policy": "pow2"}, "Orca (Oracle)": {},
+            "paged, 16-token blocks": {"kv_policy": "paged"}}
+    out["vllm_batch"] = {str(rate): {k: measure(replace(kv_base, **kw), kv_wl(rate)) for k, kw in pols.items()}
+                         for rate in (2.0, 6.0)}
+    thr = 0.5      # s/token: "normalized latency" stays low (vLLM Fig. 12 plots 0 to 1 s/token)
+
+    def kv_ok(cfg):
+        return lambda rate: measure(cfg, kv_wl(rate, 600))["norm_latency"] <= thr
+    out["vllm_capacity"] = {"threshold": thr,
+                            "rates": {k: bisect_rate(kv_ok(replace(kv_base, **kw))) for k, kw in pols.items()}}
+    # block size, recompute against swap, at the memory-bound load
+    blocks = {}
+    for b in (1, 2, 4, 8, 16, 32, 64, 128, 256):
+        blocks[b] = {mode: measure(replace(kv_base, kv_policy="paged", kv_block_size=b, preemption=mode), kv_wl(6.0))
+                     for mode in ("recompute", "swap")}
+    out["vllm_blocks"] = blocks
+
+    # 21. prefix caching (SGLang, arXiv:2312.07104)
+    pc_base = SimConfig(mode="colocated", model=MODELS["mistral-7b"], device=A100_SXM, devices_per_instance=1,
+                        n_colocated=1, max_num_batched_tokens=8192)
+    turn_in = LengthDist(384, 0.19, lo=256, hi=512)        # SGLang's multi-turn chat: inputs 256-512 tokens
+
+    def mt(out_d, rate, n=800, think=0.0, **kw):
+        return chat_sessions(rate, n, turn_in, out_d, seed=LV_SEED, turns=4, think=think, **kw)
+    multi = {}
+    for name, od_ in (("short (4-8 tokens)", LengthDist(6, 0.19, lo=4, hi=8)),
+                      ("long (256-512 tokens)", LengthDist(384, 0.19, lo=256, hi=512))):
+        multi[name] = {str(pc): measure(replace(pc_base, prefix_caching=pc), mt(od_, 50.0)) for pc in (False, True)}
+    out["sglang_multiturn"] = multi
+    # hit rate against latency and throughput: a shared system prompt of growing length, one-turn requests
+    hits = {}
+    od_ = LengthDist(128, 0.5)
+    for sys_len in (0, 256, 1024, 2048, 4096, 8192):
+        def one(pc, rate):
+            reqs = chat_sessions(rate, 600, LengthDist(512, 0.5), od_, seed=LV_SEED, system_prompts=4 if sys_len else 0,
+                                 system_len=sys_len)
+            return measure(replace(pc_base, prefix_caching=pc), reqs)
+        sat = {str(pc): one(pc, 200.0)["req_s"] for pc in (False, True)}
+        rate = 0.5 * sat["False"]            # latency at half the cache-off capacity, so neither side is overloaded
+        hits[sys_len] = {str(pc): one(pc, rate) for pc in (False, True)}
+        hits[sys_len]["saturated"], hits[sys_len]["rate"] = sat, rate
+    out["sglang_hits"] = hits
+    # reuse distance under LRU: think time against hit rate, little KV memory (OPT-13B on an A100-40GB)
+    reuse = {}
+    lr_base = replace(kv_base, prefix_caching=True)
+    for think in (1.0, 10.0, 30.0, 100.0, 300.0):
+        reuse[think] = measure(lr_base, chat_sessions(0.2, 400, LengthDist(384, 0.19, lo=256, hi=512),
+                                                      LengthDist(64, 0.5), seed=LV_SEED, turns=4, think=think,
+                                                      system_prompts=8, system_len=256))
+    out["reuse"] = reuse
+    return out
+
+
+def render_levers(v: dict) -> str:
+    L: list[str] = []
+    p = L.append
+    f2 = lambda x: f"{x:.2f}"
+    sar = v["sarathi_capacity"]
+    p("## 19. Batching policy: prefill-priority, decode-priority and chunked prefill (Sarathi-Serve)")
+    p("")
+    p("Brief 20A1. Colocated instances, `--batch-policy`: `prefill-priority` (today's default, vLLM v0), `decode-priority`"
+      " (admit new prompts only when the running batch has drained) and `chunked` (Sarathi-Serve's stall-free batching,"
+      " arXiv:2403.02310 Algorithm 3: every decode row, then unfinished prefill chunks, then new prompts, cut to the"
+      " `--max-num-batched-tokens` budget, in one forward pass). Model shapes from the Hugging Face configs; the A100 is"
+      " the 80 GB part; a 2xA100 instance is treated as one device (no tensor-parallel all-reduce). Workloads: lognormal"
+      " fits to the paper's Table 2 medians and 90th percentiles, clipped to its length filters (shown below);"
+      f" {LV_N} Poisson requests, seed {LV_SEED}; max batch 128 (the paper's largest vLLM setting).")
+    p("")
+    pol = v["policies"]
+    p(f"**Mechanism** (Mistral-7B on 1xA100, openchat_sharegpt4 lengths, {pol['rate']:.2f} req/s = 0.8x the"
+      " prefill-priority capacity under the relaxed SLO below):")
+    p("")
+    rows = []
+    for k, r in pol["rows"].items():
+        rows.append([k, ms(r["ttft_p50"]), ms(r["ttft_p99"]), ms(r["itl_p50"]), ms(r["itl_p99"]), ms(r["tpot_p99"]),
+                     ms(r["sched_delay_p50"]), f"{r['tok_s']:,.0f}", f"{r['mean_running']:.1f}", f"{r['j_tok']:.3f}"])
+    table(L, ["Policy", "TTFT p50", "TTFT p99", "ITL p50", "ITL p99", "TPOT p99", "Scheduling delay p50", "Output tok/s",
+              "Mean running", "J/token"], rows)
+    p("")
+    p(f"**Capacity** (the paper's section 5.1 definition: the highest Poisson rate with ITL p99 inside the SLO and a"
+      f" median scheduling delay of at most {SCHED_DELAY_CAP:g} s; bisection to {LV_TOL:.0%}). SLOs are the paper's"
+      " Table 3 (strict / relaxed P99 TBT).")
+    p("")
+    rows = []
+    for key, d in sar.items():
+        label, data = key.split("|")
+        c = d["capacity"]
+        for slo in ("strict", "relaxed"):
+            base = c[f"{slo}|prefill-priority (vLLM)"]
+            best = max(c[f"{slo}|chunked 512"], c[f"{slo}|chunked 2048"])
+            rows.append([label, data, f"{slo} ({d['slo'][slo]:g} s)", f2(base), f2(c[f"{slo}|chunked 512"]),
+                         f2(c[f"{slo}|chunked 2048"]), f"{best / base:.2f}x" if base else "inf"])
+    table(L, ["Model", "Dataset", "SLO", "Prefill-priority req/s", "Chunked 512 req/s", "Chunked 2048 req/s",
+              "Best chunked vs prefill-priority"], rows)
+    fits = []
+    for key, d in sar.items():
+        fits.append(f"{key.split('|')[1]}: prompt mean {d['prompt_mean']:,.0f} cv {d['prompt_cv']:.2f},"
+                    f" output mean {d['output_mean']:,.0f} cv {d['output_cv']:.2f}")
+    p("Length fits: " + "; ".join(dict.fromkeys(fits)) + ".")
+    p("")
+    p("**Chunking overhead** on one prompt (Yi-34B on 2xA100, the setting of the paper's Fig. 14): total time of the"
+      " chunks over one whole-prompt step, minus 1.")
+    p("")
+    rows = [[f"{int(s_):,}"] + [pct(x) for x in r.values()] for s_, r in v["chunk_overhead"].items()]
+    table(L, ["Prompt", "Chunks of 512", "Chunks of 1,024", "Chunks of 2,048"], rows)
+
+    p("## 20. KV memory: reservation against paged blocks, and preemption (vLLM / PagedAttention)")
+    p("")
+    w = v["vllm_workload"]
+    p("`--kv-policy`: `oracle` reserves prompt + output at admission (today's behaviour; vLLM's \"Orca (Oracle)\"), `pow2`"
+      " the prompt plus the output rounded up to a power of two (\"Orca (Pow2)\"), `max` the model's 2,048-token maximum"
+      " (\"Orca (Max)\"), and `paged` allocates 16-token blocks as tokens arrive, keeps 1% free at admission and, when"
+      " no block is left, preempts the latest-arrived request (recompute or swap to host memory; arXiv:2309.06180"
+      " sections 4.2-4.5 and 6.1). Setting of the paper's Figs. 2 and 13a: OPT-13B on one A100-40GB, ShareGPT lengths"
+      f" (lognormal, cv 1.0, each clipped to 1,024; sampled means {w['prompt_mean']:.1f} / {w['output_mean']:.1f} against"
+      f" the paper's 161.31 / 337.99), prefill-priority scheduling. KV room here: {w['kv_room_tokens']:,} tokens (90% of"
+      " 40 GB less 26.2 GB of weights) against the paper's 15.7K slots (12 GB). The Orca baselines here have no"
+      " allocator fragmentation (the paper's use a buddy allocator).")
+    p("")
+    rows = []
+    for rate, d in v["vllm_batch"].items():
+        for k, r in d.items():
+            rows.append([f"{float(rate):g}", k, f"{r['mean_running']:.2f}", pct(r["kv_token_frac"]),
+                         f"{r['norm_latency']:.3f}", f2(r["req_s"]), str(r.get("preemptions", 0))])
+    table(L, ["Rate req/s", "KV policy", "Mean running requests", "Allocated KV holding tokens",
+              "Normalised latency s/token", "Completed req/s", "Preemptions"], rows)
+    cap = v["vllm_capacity"]
+    rows = [[k, f2(x), f"{cap['rates']['paged, 16-token blocks'] / x:.2f}x"] for k, x in cap["rates"].items()]
+    p(f"Highest rate whose mean normalised latency (end-to-end time over output tokens, the paper's metric) stays at or"
+      f" below {cap['threshold']:g} s/token (600 requests, bisection to {LV_TOL:.0%}):")
+    p("")
+    table(L, ["KV policy", "Rate req/s", "Paged vs this"], rows)
+    p("**Block size and preemption mode** at 6 req/s (memory-bound), swap over PCIe Gen4 x16 (32 GB/s, 5 us per"
+      " block transfer):")
+    p("")
+    rows = []
+    for b, d in v["vllm_blocks"].items():
+        rc, sw = d["recompute"], d["swap"]
+        rows.append([str(b), pct(rc["kv_token_frac"]), f"{rc['mean_running']:.2f}", f"{rc['norm_latency']:.3f}",
+                     str(rc["preemptions"]), f"{sw['norm_latency']:.3f}", str(sw["preemptions"]),
+                     f"{sw['swap_s']:.2f}", f"{sw['swap_s'] / sw['swap_gb']:.3f}" if sw.get("swap_gb") else "-"])
+    table(L, ["Block tokens", "KV holding tokens", "Mean running", "Recompute: norm. latency", "preemptions",
+              "Swap: norm. latency", "preemptions", "swap seconds", "s per GB swapped"], rows)
+
+    p("## 21. Prefix caching (SGLang RadixAttention)")
+    p("")
+    p("`--prefix-caching`: an LRU cache of shared prompt segments (a radix tree whose edges are whole segments: system"
+      " prompts and earlier turns). A prompt skips its longest cached prefix (never its last token); segments are"
+      " inserted when its prefill ends and its own turn when it finishes; unpinned leaves are evicted least recently used"
+      " first (arXiv:2312.07104 section 3). Sessions (`chat_sessions`): turns are closed-loop, released a think time"
+      " after the previous turn finishes. Mistral-7B on 1xA100 unless stated; hit rate = cached prompt tokens / prompt"
+      " tokens (the paper's definition).")
+    p("")
+    p("**Multi-turn chat** (the paper's benchmark: 4 turns, inputs 256-512 tokens, outputs 4-8 or 256-512; here"
+      " lognormal cv 0.19 clipped to those ranges, no think time, sessions arriving at 50/s so the server is saturated):")
+    p("")
+    rows = []
+    for name, d in v["sglang_multiturn"].items():
+        off, on = d["False"], d["True"]
+        rows.append([name, f2(off["req_s"]), f2(on["req_s"]), f"{on['req_s'] / off['req_s']:.2f}x", pct(on["hit_rate"]),
+                     ms(off["ttft_p50"]), ms(on["ttft_p50"]), f"{off['mean_running']:.1f}", f"{on['mean_running']:.1f}"])
+    table(L, ["Outputs", "Throughput off req/s", "on req/s", "Gain", "Hit rate", "TTFT p50 off", "TTFT p50 on",
+              "Mean running off", "on"], rows)
+    p("**Hit rate against latency and throughput** (one-turn requests, 4 shared system prompts of the length shown,"
+      " user input lognormal mean 512 cv 0.5, output mean 128 cv 0.5, 600 requests; throughput with arrivals at 200 req/s"
+      " (saturated); latency at half the cache-off throughput, shown, for both):")
+    p("")
+    rows = []
+    for sl, d in v["sglang_hits"].items():
+        off, on = d["False"], d["True"]
+        sat = d["saturated"]
+        rows.append([f"{int(sl):,}", pct(on["hit_rate"]), f2(d["rate"]), ms(off["ttft_p50"]), ms(on["ttft_p50"]),
+                     f"{off['ttft_p50'] / on['ttft_p50']:.2f}x", f2(sat["False"]), f2(sat["True"]),
+                     f"{sat['True'] / sat['False']:.2f}x"])
+    table(L, ["System prompt tokens", "Hit rate", "Latency at req/s", "TTFT p50 off", "TTFT p50 on", "TTFT gain", "Saturated req/s off",
+              "on", "Throughput gain"], rows)
+    p("**Reuse distance under LRU** (OPT-13B on one A100-40GB, little KV memory; 4-turn sessions at 0.2 sessions/s,"
+      " 8 system prompts of 256 tokens, inputs 256-512, outputs mean 64): a longer think time puts more other"
+      " sessions between two turns of one session.")
+    p("")
+    rows = [[f"{float(t):g} s", pct(r["hit_rate"]), f"{r['evicted_tokens']:,}", ms(r["ttft_p50"])] for t, r in v["reuse"].items()]
+    table(L, ["Mean think time", "Hit rate", "Tokens evicted", "TTFT p50"], rows)
+    L.extend(render_validation(v))
+    return "\n".join(L) + "\n"
+
+
+def render_validation(v: dict) -> list[str]:
+    """Section 22: each paper's figure against this simulator's, with a verdict. The papers' numbers are quoted
+    from their text (arXiv versions read 2026-10-06: 2403.02310v3, 2309.06180v1, 2312.07104v2)."""
+    L: list[str] = []
+    sar = v["sarathi_capacity"]
+    cap = lambda k, slo, pol: sar[k]["capacity"][f"{slo}|{pol}"]
+    ms_s, yi = "Mistral-7B, 1xA100|openchat_sharegpt4", "Yi-34B, 2xA100|openchat_sharegpt4"
+    ratio = lambda k, slo: max(cap(k, slo, "chunked 512"), cap(k, slo, "chunked 2048")) / cap(k, slo, "prefill-priority (vLLM)")
+    best = lambda k, slo: "512" if cap(k, slo, "chunked 512") >= cap(k, slo, "chunked 2048") else "2048"
+    ov = v["chunk_overhead"]
+    b6 = v["vllm_batch"]["6.0"]
+    b2 = v["vllm_batch"]["2.0"]
+    run = lambda d, k: d[k]["mean_running"]
+    pg = "paged, 16-token blocks"
+    vc = v["vllm_capacity"]["rates"]
+    blk = v["vllm_blocks"]
+    s_small = blk["1"]["swap"]["swap_s"] / blk["1"]["swap"]["swap_gb"]
+    s_big = blk["64"]["swap"]["swap_s"] / blk["64"]["swap"]["swap_gb"]
+    swap_wins = sum(d["swap"]["norm_latency"] < d["recompute"]["norm_latency"] for d in blk.values())
+    mt = v["sglang_multiturn"]
+    g = lambda name: mt[name]["True"]["req_s"] / mt[name]["False"]["req_s"]
+    hits = v["sglang_hits"]
+    hr = [(d["True"]["hit_rate"], d["False"]["ttft_p50"] / d["True"]["ttft_p50"],
+           d["saturated"]["True"] / d["saturated"]["False"]) for d in hits.values()]
+    mono = all(a[0] <= b[0] and a[1] <= b[1] and a[2] <= b[2] for a, b in zip(hr, hr[1:]))
+    tok = lambda d, k: 100 * d[k]["kv_token_frac"]
+    rows = [
+        ["Sarathi-Serve", "Capacity gain over vLLM, strict SLO: Mistral-7B \"2.6x\" (abstract), \"3.5x\" at 100 ms with a"
+         " 512 budget (section 5.2)", f"{ratio(ms_s, 'strict'):.2f}x", "Reproduces (inside the paper's range)"],
+        ["Sarathi-Serve", "Strict SLO, Yi-34B on 2 A100s: \"up to 3.7x\" (section 5.1)", f"{ratio(yi, 'strict'):.2f}x",
+         "Same direction, smaller gain"],
+        ["Sarathi-Serve", "Relaxed SLO: smaller gains, \"1.65x\" for Yi-34B at 1 s (section 5.2)",
+         f"Yi-34B {ratio(yi, 'relaxed'):.2f}x, Mistral-7B {ratio(ms_s, 'relaxed'):.2f}x", "Reproduces the ordering (strict > relaxed); Yi-34B lower"],
+        ["Sarathi-Serve", "Token budget 512 for strict SLOs, 2,048 for relaxed (section 5.1)",
+         f"best budget strict: {best(ms_s, 'strict')} (Mistral), {best(yi, 'strict')} (Yi); relaxed: {best(ms_s, 'relaxed')} (Mistral),"
+         f" {best(yi, 'relaxed')} (Yi)", "Strict reproduces; relaxed does not: chunking costs almost nothing here, so a small budget never loses"],
+        ["Sarathi-Serve", "Chunking overhead at most ~25% with 512-token chunks, negligible at 2,048 (section 5.4.1, Fig. 14)",
+         f"{100 * max(r['512'] for r in ov.values()):.1f}% / {100 * max(r['2048'] for r in ov.values()):.1f}%",
+         "Does not reproduce: the roofline hides re-read weights under compute and has no tile-quantisation or kernel cost"],
+        ["Sarathi-Serve", "Prefill-priority stalls decodes (ITL tail); decode-priority starves prefills (TTFT); chunked keeps ITL"
+         " low at a small TTFT cost (sections 3.2, 4.2; Table 4)",
+         "ITL p99 {:.0f} / {:.0f} / {:.0f} ms, TTFT p50 {:.0f} / {:,.0f} / {:.0f} ms (prefill-priority / decode-priority / chunked 512)".format(
+             *[1e3 * v["policies"]["rows"][k]["itl_p99"] for k in ("prefill-priority", "decode-priority", "chunked 512")],
+             *[1e3 * v["policies"]["rows"][k]["ttft_p50"] for k in ("prefill-priority", "decode-priority", "chunked 512")]),
+         "Reproduces (qualitative)"],
+        ["vLLM", "KV memory holding token states: Orca Max 20.4%, Pow2 26.8%, Oracle 38.2%, vLLM 96.3% (Fig. 2)",
+         f"{tok(b6, 'Orca (Max)'):.1f}% / {tok(b6, 'Orca (Pow2)'):.1f}% / {tok(b6, 'Orca (Oracle)'):.1f}% / {tok(b6, pg):.1f}%",
+         "Max and paged reproduce; Pow2 and Oracle do not (the paper's baselines also lose memory to a buddy"
+         " allocator's fragmentation, which is not modelled here)"],
+        ["vLLM", "Batched requests at 2 req/s: 7.00 / 9.81 / 13.62 / 30.42, paged 2.2x Oracle and 4.3x Max (Fig. 13a)",
+         f"2 req/s: {run(b2, 'Orca (Max)'):.2f} / {run(b2, 'Orca (Pow2)'):.2f} / {run(b2, 'Orca (Oracle)'):.2f} / {run(b2, pg):.2f};"
+         f" 6 req/s: {run(b6, 'Orca (Max)'):.2f} / {run(b6, 'Orca (Pow2)'):.2f} / {run(b6, 'Orca (Oracle)'):.2f} / {run(b6, pg):.2f}"
+         f" ({run(b6, pg) / run(b6, 'Orca (Oracle)'):.2f}x, {run(b6, pg) / run(b6, 'Orca (Max)'):.2f}x)",
+         "Ordering reproduces; at 2 req/s this faster roofline is not memory-bound, at 6 req/s the ratios are 1.6x / 5.4x against 2.2x / 4.3x"],
+        ["vLLM", "Sustainable rate on ShareGPT: 1.7-2.7x Orca (Oracle), 2.7-8x Orca (Max) (section 6.2)",
+         f"{vc[pg] / vc['Orca (Oracle)']:.2f}x / {vc[pg] / vc['Orca (Max)']:.2f}x",
+         "Oracle reproduces; Max does not (larger here: 11,969 tokens of KV room hold five 2,048-token reservations,"
+         " the paper's 15.7K slots seven)"],
+        ["vLLM", "Swapping is slow with small blocks; recompute is better at small blocks, swap at large, comparable at 16-64"
+         " (section 7.3, Fig. 19)", f"swap {s_small:.3f} s/GB at 1-token blocks, {s_big:.3f} at 64; swap has the lower normalised"
+         f" latency at {swap_wins} of {len(blk)} block sizes", "Direction of the swap cost reproduces; the crossover does not (5 us per block is"
+         " too small to make swapping lose here)"],
+        ["SGLang", "Multi-turn chat: a noticeable speed-up with short outputs, almost none with long ones (section 6.2)",
+         f"short {g('short (4-8 tokens)'):.2f}x, long {g('long (256-512 tokens)'):.2f}x", "Ordering reproduces; the long-output gain is larger here"],
+        ["SGLang", "A higher cache hit rate gives a larger batch, higher throughput and lower latency (Fig. 8a-b)",
+         "monotone in every column" if mono else "not monotone", "Reproduces" if mono else "Does not reproduce"],
+        ["SGLang", "74.1% hit rate in production cut first-token latency 1.7x on average (Vicuna-33B, section 6.2)",
+         f"{100 * hr[2][0]:.1f}% gives {hr[2][1]:.2f}x, {100 * hr[3][0]:.1f}% gives {hr[3][1]:.2f}x (Mistral-7B, half load)",
+         "Not comparable: different model, traffic and load; the direction holds"],
+    ]
+    L.append("## 22. Validation against the papers: what reproduces and what does not")
+    L.append("")
+    L.append("Quoted figures are from the papers' text (arXiv 2403.02310, 2309.06180, 2312.07104, each checked at"
+             " export.arxiv.org). Settings differ where the simulator cannot follow them, as stated in sections 19-21;"
+             " \"reproduces\" means the measured value lies in the paper's range or has its ordering, nothing more.")
+    L.append("")
+    table(L, ["Paper", "Paper's figure", "This simulator", "Verdict"], rows)
+    return L
+
+
 def cpu_name() -> str:
     try:
         for line in Path("/proc/cpuinfo").read_text().splitlines():
@@ -951,6 +1351,8 @@ def main():
                     help="render sections 10-15 from examples/results_optical.json instead of rerunning them")
     ap.add_argument("--ced-from-json", action="store_true",
                     help="render sections 16-18 from examples/results_ced.json instead of rerunning them")
+    ap.add_argument("--levers-from-json", action="store_true",
+                    help="render sections 19-21 from examples/results_levers.json instead of rerunning them")
     a = ap.parse_args()
     sys.path.insert(0, str(ROOT / "src"))
     new = json.loads(json.dumps(collect()))          # same key types as the legacy side
@@ -974,7 +1376,14 @@ def main():
     else:
         ced = json.loads(json.dumps(collect_ced()))
         cj.write_text(json.dumps(ced, indent=1))
-    OUT.write_text(render(new, old, timings) + render_optical(optical) + "\n" + render_ced(ced))
+    lj = ROOT / "examples" / "results_levers.json"
+    if a.levers_from_json:
+        levers = json.loads(lj.read_text())
+    else:
+        levers = json.loads(json.dumps(collect_levers()))
+        lj.write_text(json.dumps(levers, indent=1))
+    OUT.write_text(render(new, old, timings) + render_optical(optical) + "\n" + render_ced(ced) + "\n"
+                   + render_levers(levers))
     print(f"wrote {OUT}")
 
 

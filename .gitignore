@@ -8,3 +8,4 @@ __pycache__/
 .venv/
 !examples/results_optical.json
 !examples/results_ced.json
+!examples/results_levers.json

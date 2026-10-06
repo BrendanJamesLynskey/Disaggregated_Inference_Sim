@@ -7,6 +7,10 @@
 // 2026-10-05: the Causal Encoder-Decoder (CED) option of DeepSeek-V4.1-Flash (arXiv:2609.19969):
 // cedE encoder layers, a cedW-token replay through the decoder on prefill or (SGLang RFC #39963)
 // as the decode instance's first step. Off unless a model or cfg turns it on (tested bit-exact).
+// 2026-10-06 (brief 20A1): colocated batching policies (prefill-priority, decode-priority, Sarathi-Serve
+// chunked prefill with a token budget), KV policies (oracle reservation, pow2, max, paged blocks with
+// recompute or swap preemption), prefix caching (LRU cache of shared prompt segments) and closed-loop
+// sessions; sim.ScheduledInstance, bit-exact (tested). Off unless cfg turns a lever on.
 (function (root) {
     // mixer: 'attention' | 'hyena' | 'hybrid'; see hardware.ModelSpec for the fields
     const MODELS = {
@@ -23,6 +27,10 @@
         // CED proxies: half encoder, half decoder (DeepSeek-V4.1-Flash splits 40 layers 20/20); illustrative
         'llama3-8b-ced':  { name: 'Llama-3-8B-shape CED 16+16',  L: 32, d: 4096, h: 32, kvh: 8, ff: 14336, V: 128256, cedE: 16 },
         'llama3-70b-ced': { name: 'Llama-3-70B-shape CED 40+40', L: 80, d: 8192, h: 64, kvh: 8, ff: 28672, V: 128256, cedE: 40 },
+        // brief 20A1 validation shapes (Hugging Face configs; OPT's MLP as d_ff = 13653, see hardware.py)
+        'mistral-7b': { name: 'Mistral-7B', L: 32, d: 4096, h: 32, kvh: 8, ff: 14336, V: 32000 },
+        'yi-34b':     { name: 'Yi-34B',     L: 60, d: 7168, h: 56, kvh: 8, ff: 20480, V: 64000 },
+        'opt-13b':    { name: 'OPT-13B',    L: 40, d: 5120, h: 40, kvh: 40, ff: 13653, V: 50272 },
     };
     const ENOB_REQUIRED = { bf16: 11, int8: 8, fp8: 7 };
     // Fourier-optical transform engine (illustrative; hardware.TransformEngine)
@@ -33,6 +41,7 @@
         // written as hardware.py computes them (2.039 * TB is not the literal 2.039e12).
         h100:    { name: 'H100-SXM', F: 989e12,  B: 3.35e12,  M: 80e9, fe: 0.55, be: 0.8, tdp: 700, idle: 100, pjF: 1.0, pjB: 60 },
         a100:    { name: 'A100-SXM', F: 312e12,  B: 2.039 * 1e12, M: 80e9, fe: 0.55, be: 0.8, tdp: 400, idle: 60,  pjF: 1.6, pjB: 70 },
+        'a100-40g': { name: 'A100-SXM-40GB', F: 312e12, B: 1.555 * 1e12, M: 40e9, fe: 0.55, be: 0.8, tdp: 400, idle: 60, pjF: 1.6, pjB: 70 },
         optical: { name: 'Hypothetical optical MAC', F: 4000e12, B: 3.35e12, M: 80e9, fe: 0.4, be: 0.8, tdp: 700, idle: 180, pjF: 0.1, pjB: 60 },
         // optical transform engine co-packaged with an H100-class / A100-class digital part
         'optical-fft':       { name: 'Optical-FFT + H100-class', F: 989e12, B: 3.35e12, M: 80e9, fe: 0.55, be: 0.8, tdp: 700, idle: 100, pjF: 1.0, pjB: 60, transform: ENGINE },
@@ -42,6 +51,7 @@
         'nvlink4':  { name: 'NVLink 4',      bw: 450e9,   lat: 5e-6,  pjBit: 5 },
         'ib-ndr':   { name: 'IB NDR 400G',   bw: 50e9,    lat: 10e-6, pjBit: 15 },
         'pcie5':    { name: 'PCIe Gen5 x16', bw: 64e9,    lat: 5e-6,  pjBit: 6 },
+        'pcie4':    { name: 'PCIe Gen4 x16', bw: 32e9,    lat: 5e-6,  pjBit: 6 },
         'eth-100g': { name: '100 GbE',       bw: 12.5e9,  lat: 20e-6, pjBit: 15 },
         'eth-25g':  { name: '25 GbE',        bw: 3.125e9, lat: 20e-6, pjBit: 15 },
         // photonic interconnect, not Fourier optics: illustrative round numbers
@@ -291,6 +301,22 @@
                 const mmf = model.lmHead === 'all' ? 2 * model.matmul * tok : 2 * model.layers * tok + 2 * model.V * model.d * lens.length;
                 return t(mmf + fl, model.weightStream + tok * model.embRow + tok * model.kvTok);
             },
+            // decode rows plus prefill chunks [p0, c, last] in one pass (CostModel.step_mixed)
+            mixed(ctx, b, chunks) {
+                let flops = 2 * model.matmul * b + 4 * model.L * model.d * (ctx + b);
+                let tokens = b, kv = ctx + b;
+                for (const [p0, c, last] of chunks) {
+                    if (model.lmHead === 'all') flops += 2 * model.matmul * c;
+                    else flops += 2 * model.layers * c + (last ? 2 * model.V * model.d : 0);
+                    flops += 2 * model.L * model.d * c * (2 * p0 + c + 1);
+                    tokens += c; kv += p0 + c;
+                }
+                return t(flops, model.weightStream + tokens * model.embRow + kv * model.kvTok);
+            },
+            decodeSum(c, b) {
+                return t(2 * model.matmul * b + 4 * model.L * model.d * (c + b),
+                         model.weightStream + b * model.embRow + (c + b) * model.kvTok);
+            },
             decode(ctx) {
                 let c = 0; for (const x of ctx) c += x;
                 const b = ctx.length;
@@ -371,6 +397,20 @@
                    ...(cfg.transitNativeFft != null ? { nativeFft: cfg.transitNativeFft } : {}) };
         }
         const maxPT = cfg.maxPrefillTokens || 8192, maxB = cfg.maxDecodeBatch || 256;
+        // brief 20A1 levers (sim.ScheduledInstance): any of them on switches the colocated instances over
+        const policy = cfg.batchPolicy || 'prefill-priority', kvPolicy = cfg.kvPolicy || 'oracle';
+        const sched = policy !== 'prefill-priority' || cfg.maxNumBatchedTokens != null || kvPolicy !== 'oracle' || !!cfg.prefixCaching;
+        const preemptMode = cfg.preemption || 'recompute';
+        if (sched) {
+            if (!['prefill-priority', 'decode-priority', 'chunked'].includes(policy)) throw new Error(`unknown batch_policy ${policy}`);
+            if (!['oracle', 'pow2', 'max', 'paged'].includes(kvPolicy)) throw new Error(`unknown kv_policy ${kvPolicy}`);
+            if (preemptMode !== 'recompute' && preemptMode !== 'swap') throw new Error(`unknown preemption ${preemptMode}`);
+            if (cfg.mode !== 'colocated') throw new Error("batch_policy, max_num_batched_tokens, kv_policy and prefix_caching are modelled for mode='colocated' only");
+            if (!model.transformer || model.cedE) throw new Error('the brief-20A1 levers are modelled for attention models without CED only');
+            if (cfg.prefixCaching && kvPolicy === 'paged' && preemptMode === 'swap') throw new Error("prefix caching with swap preemption is not modelled: use preemption='recompute'");
+        }
+        const hostLink = LINKS[cfg.hostLink || 'pcie5'];
+        const maxSeqLen = cfg.maxSeqLen ?? 2048;
 
         let now = 0, seq = 0, nDone = 0, nRej = 0, stop = false;
         const heap = [];
@@ -394,15 +434,32 @@
             return top;
         };
 
-        const reqs = rows.map(([a, p, o], i) => ({ rid: i, arrival: a, prompt: p, output: o,
+        const reqs = rows.map(([a, p, o, x], i) => ({ rid: i, arrival: a, prompt: p, output: o,
             prefillStart: null, firstToken: null, prefillDone: null, kvStart: null, kvReady: null, decodeStart: null,
-            finish: null, tokensOut: 0, lastToken: null, itls: [] }));
+            finish: null, tokensOut: 0, lastToken: null, itls: [],
+            // shared prefixes and closed-loop sessions (Request.prefix / emit_key / after / think)
+            prefix: x ? x.chain : [], emit: x ? x.emit : null, after: x && x.after != null ? x.after : null, think: x ? x.think : 0,
+            // ScheduledInstance state
+            target: 0, done: 0, baseOut: 0, alloc: 0, nodes: [], covered: 0, swappedUnits: 0 }));
+        const successor = new Map();
+        for (const r of reqs) if (r.after !== null) successor.set(r.after, r);
         const samples = [];
 
         function mkInst(role, idx) {
-            return { role, name: `${role}-${idx}`, queue: [], running: [], kvUsed: 0, busy: 0, steps: 0,
+            const inst = { role, name: `${role}-${idx}`, queue: [], running: [], kvUsed: 0, busy: 0, steps: 0,
                      flops: 0, bytes: 0, batchSum: 0, active: false, wake: false, cm: cmFor(role),
                      ec: 0, em: 0, peakW: 0, powerBound: 0, oj: 0, oflops: 0, opticalBound: 0 };
+            if (sched && role === 'colocated') {
+                const paged = kvPolicy === 'paged', blk = paged ? (cfg.kvBlockSize ?? 16) : 1;
+                if (blk < 1 || (cfg.maxNumBatchedTokens != null && cfg.maxNumBatchedTokens < 1)) throw new Error('kv_block_size and max_num_batched_tokens must be at least 1');
+                const cap = Math.floor(inst.cm.kvCap / blk);
+                Object.assign(inst, { budget: cfg.maxNumBatchedTokens != null ? cfg.maxNumBatchedTokens : maxPT, paged, blk, cap,
+                    watermark: paged ? Math.trunc((cfg.kvWatermark ?? 0.01) * cap) : 0, swap: paged && preemptMode === 'swap',
+                    cache: cfg.prefixCaching ? { nodes: new Map(), seq: 0, evictedTokens: 0, evictedUnits: 0 } : null,
+                    swapped: [], swapT: 0.0, preemptions: 0, recomputeTokens: 0, swapOut: 0.0, swapIn: 0.0, swapTime: 0.0,
+                    swapJ: 0.0, promptTokens: 0, hitTokens: 0, computedTokens: 0, runArea: 0.0, tokArea: 0.0, allocArea: 0.0 });
+            }
+            return inst;
         }
         const prefill = [], decode = [], coloc = [];
         if (cfg.mode === 'disagg') {
@@ -415,10 +472,21 @@
                      handoff: 0, transitJ: 0, transitBound: 0 };
 
         const kvNeed = r => model.units(r.prompt, r.output);
-        const load = i => i.role === 'prefill' ? i.queue.reduce((s, r) => s + r.prompt, 0) : i.queue.length + i.running.length;
+        const load = i => {
+            if (i.role === 'prefill') return i.queue.reduce((s, r) => s + r.prompt, 0);
+            if (i.cap === undefined) return i.queue.length + i.running.length;
+            let n = i.queue.length + i.swapped.length;            // queued + decoding (ScheduledInstance.load)
+            for (const r of i.running) if (r.done >= r.target) n++;
+            return n;
+        };
         const pick = arr => arr.reduce((b, i) => load(i) < load(b) ? i : b, arr[0]);
 
-        function finish(r) { r.finish = now; nDone++; if (nDone + nRej === reqs.length) stop = true; }
+        function finish(r) {
+            r.finish = now; nDone++;
+            const nxt = successor.get(r.rid);          // closed-loop session: the next turn after the think time
+            if (nxt !== undefined) push(now + nxt.think, () => { nxt.arrival = now; arrive(nxt); });
+            if (nDone + nRej === reqs.length) stop = true;
+        }
         function submit(inst, r) {
             inst.queue.push(r);
             if (!inst.active && !inst.wake) { inst.wake = true; push(now, () => { inst.wake = false; loop(inst); }); }
@@ -471,8 +539,243 @@
                 inst.running = still;
             });
         }
+        // ── ScheduledInstance (sim.py): batching policy, KV policy, preemption, prefix cache ──
+        const units = (inst, n) => Math.floor((n + inst.blk - 1) / inst.blk);
+        const byArrival = (a, b) => a.arrival - b.arrival || a.rid - b.rid;
+        const pow2 = o => pow2AtLeast(o);
+        function removeRow(rows, r) { const i = rows.indexOf(r); if (i >= 0) rows.splice(i, 1); }
+        function fullNeed(inst, r) {
+            const p = r.prompt, o = r.output;
+            if (inst.paged) return units(inst, p + o) + inst.watermark;
+            if (kvPolicy === 'pow2') return p + pow2(o);
+            if (kvPolicy === 'max') return Math.max(maxSeqLen, p + o);
+            return p + o;
+        }
+        function admitNeed(inst, r, hit) {
+            if (inst.paged) return units(inst, r.target - hit);
+            if (kvPolicy === 'pow2') return r.prompt - hit + pow2(r.output);
+            if (kvPolicy === 'max') return Math.max(maxSeqLen, r.prompt + r.output) - hit;
+            return r.prompt - hit + r.output;
+        }
+        // PrefixCache: LRU over unpinned leaves, ties by insertion order
+        function cacheEvict(c, need) {
+            let freed = 0;
+            while (freed < need) {
+                let best = null;
+                for (const n of c.nodes.values())
+                    if (n.refs === 0 && n.children === 0 && (best === null || n.last < best.last || (n.last === best.last && n.seq < best.seq))) best = n;
+                if (best === null) break;
+                c.nodes.delete(best.key); freed += best.units; c.evictedTokens += best.tokens; c.evictedUnits += best.units;
+                if (best.parent !== null) best.parent.children--;
+            }
+            return freed;
+        }
+        function room(inst, need) {
+            const short = inst.kvUsed + need - inst.cap;
+            if (short > 0 && inst.cache) inst.kvUsed -= cacheEvict(inst.cache, short);
+            return inst.kvUsed + need <= inst.cap;
+        }
+        function setAlloc(inst, r, u) { inst.kvUsed += u - r.alloc; r.alloc = u; }
+        const ref = n => { n.refs++; n.last = now; };
+        const unref = n => { n.refs--; n.last = now; };
+        function release(inst, r) {
+            inst.kvUsed -= r.alloc; r.alloc = 0;
+            if (r.nodes.length) { for (const n of r.nodes) unref(n); r.nodes = []; }
+            r.covered = 0;
+        }
+        function lookup(inst, r) {
+            if (!inst.cache || !r.prefix.length) return [[], 0];
+            const nodes = []; let hit = 0;
+            for (const [k] of r.prefix) { const n = inst.cache.nodes.get(k); if (n === undefined) break; nodes.push(n); }
+            for (const n of nodes) hit += n.tokens;
+            while (nodes.length && hit > r.target - 1) hit -= nodes.pop().tokens;
+            return [nodes, hit];
+        }
+        function tryAdmit(inst) {
+            const r = inst.queue[0];
+            if (r.target === 0) r.target = r.prompt;
+            const [nodes, hit] = lookup(inst, r);
+            const need = admitNeed(inst, r, hit);
+            for (const n of nodes) ref(n);
+            if (!room(inst, need + inst.watermark)) { for (const n of nodes) unref(n); return null; }
+            inst.queue.shift();
+            r.nodes = nodes; r.covered = hit; r.alloc = 0;
+            setAlloc(inst, r, need);
+            r.done = hit; r.baseOut = r.tokensOut;
+            if (r.prefillStart === null) { r.prefillStart = now; inst.promptTokens += r.prompt; inst.hitTokens += hit; }
+            inst.running.push(r); inst.running.sort(byArrival);
+            return r;
+        }
+        function grow(inst) {
+            if (!inst.paged) return;
+            let i = 0;
+            while (i < inst.running.length) {
+                const r = inst.running[i];
+                if (r.done < r.target) { i++; continue; }
+                const need = units(inst, r.prompt + r.tokensOut - r.covered);
+                if (need <= r.alloc) { i++; continue; }
+                let gone = false;
+                while (!room(inst, need - r.alloc)) {
+                    const v = inst.running[inst.running.length - 1];
+                    preempt(inst, v);
+                    if (v === r) { gone = true; break; }
+                }
+                if (!gone) { setAlloc(inst, r, need); i++; }
+            }
+        }
+        function preempt(inst, r) {
+            removeRow(inst.running, r); inst.preemptions++;
+            if (inst.swap && r.done >= r.target) {
+                const nbytes = r.alloc * inst.blk * model.kvTok;
+                const tt = r.alloc * hostLink.lat + nbytes / hostLink.bw;
+                inst.swapT += tt; inst.swapTime += tt; inst.swapOut += nbytes;
+                inst.swapJ += nbytes * 8 * hostLink.pjBit * 1e-12;
+                r.swappedUnits = r.alloc; inst.kvUsed -= r.alloc; r.alloc = 0;
+                inst.swapped.push(r); inst.swapped.sort(byArrival);
+                return;
+            }
+            release(inst, r);
+            r.target = r.prompt + r.tokensOut; r.done = 0;
+            inst.queue.unshift(r);
+        }
+        function swapIn(inst) {
+            while (inst.swapped.length && inst.running.length < maxB) {
+                const r = inst.swapped[0];
+                if (!room(inst, r.swappedUnits)) break;
+                inst.swapped.shift();
+                const nbytes = r.swappedUnits * inst.blk * model.kvTok;
+                const tt = r.swappedUnits * hostLink.lat + nbytes / hostLink.bw;
+                inst.swapT += tt; inst.swapTime += tt; inst.swapIn += nbytes;
+                inst.swapJ += nbytes * 8 * hostLink.pjBit * 1e-12;
+                inst.kvUsed += r.swappedUnits; r.alloc = r.swappedUnits; r.swappedUnits = 0;
+                inst.running.push(r); inst.running.sort(byArrival);
+            }
+        }
+        function privateUnits(inst, r, covered) {
+            if (inst.paged) return units(inst, Math.max(0, r.done + r.tokensOut - r.baseOut - covered));
+            return r.alloc - (covered - r.covered);
+        }
+        function insertChain(inst, r) {
+            const c = inst.cache;
+            if (!c) return;
+            for (let k = r.nodes.length; k < r.prefix.length; k++) {
+                const [key, tokens] = r.prefix[k];
+                const parent = r.nodes.length ? r.nodes[r.nodes.length - 1] : null;
+                let n = c.nodes.get(key);
+                if (n !== undefined && n.parent === parent) ref(n);
+                else {
+                    if (n !== undefined) break;
+                    const u = units(inst, tokens);
+                    if (!room(inst, u + privateUnits(inst, r, r.covered + tokens) - r.alloc)) break;
+                    n = { key, tokens, units: u, parent, children: 0, refs: 1, last: now, seq: c.seq++ };
+                    if (parent !== null) parent.children++;
+                    c.nodes.set(key, n); inst.kvUsed += u;
+                }
+                setAlloc(inst, r, privateUnits(inst, r, r.covered + tokens));
+                r.nodes.push(n); r.covered += tokens;
+            }
+        }
+        function emitSegment(inst, r) {
+            const c = inst.cache;
+            if (!c || r.emit === null || r.nodes.length !== r.prefix.length) return;
+            const tokens = r.prompt - r.covered + r.output, u = units(inst, tokens);
+            if (c.nodes.has(r.emit) || !room(inst, u - r.alloc)) return;
+            const parent = r.nodes.length ? r.nodes[r.nodes.length - 1] : null;
+            const n = { key: r.emit, tokens, units: u, parent, children: 0, refs: 1, last: now, seq: c.seq++ };
+            if (parent !== null) parent.children++;
+            c.nodes.set(r.emit, n); inst.kvUsed += u; r.nodes.push(n);
+        }
+        function finishRow(inst, r) { emitSegment(inst, r); release(inst, r); finish(r); }
+        function prefillDone(inst, r) {
+            insertChain(inst, r);
+            if (r.tokensOut) { r.itls.push(now - r.lastToken); r.tokensOut++; r.lastToken = now; }
+            else firstToken(r);
+            if (r.decodeStart === null && r.output > 1) r.decodeStart = now;
+            if (r.tokensOut >= r.output) { removeRow(inst.running, r); finishRow(inst, r); }
+        }
+        function schedStep(inst, cost, batch, then) {
+            if (inst.swapT) { cost = { ...cost, time: cost.time + inst.swapT }; inst.swapT = 0.0; }
+            let tok = 0, alloc = 0;
+            for (const r of inst.running) { tok += r.done - r.covered + r.tokensOut - r.baseOut; alloc += r.alloc; }
+            inst.runArea += cost.time * inst.running.length;
+            inst.tokArea += cost.time * tok;
+            inst.allocArea += cost.time * (alloc * inst.blk);
+            step(inst, cost, batch, then);
+        }
+        function afterDecode(inst, rows) {
+            for (const r of rows) {
+                r.itls.push(now - r.lastToken); r.tokensOut++; r.lastToken = now;
+                if (r.tokensOut >= r.output) { removeRow(inst.running, r); finishRow(inst, r); }
+            }
+        }
+        function decodeAll(inst) {
+            grow(inst);
+            if (!inst.running.length) return false;
+            const rows = inst.running.slice();
+            let ctx = 0; for (const r of rows) ctx += r.prompt + r.tokensOut;
+            schedStep(inst, inst.cm.decodeSum(ctx, rows.length), rows.length, () => afterDecode(inst, rows));
+            return true;
+        }
+        function admitPrompts(inst) {
+            const batch = []; let tokens = 0;
+            while (inst.queue.length && inst.running.length < maxB && !inst.swapped.length) {
+                const r = inst.queue[0];
+                if (r.target === 0) r.target = r.prompt;
+                const tk = r.target - lookup(inst, r)[1];
+                if (batch.length && tokens + tk > inst.budget) break;
+                if (tryAdmit(inst) === null) break;
+                batch.push(r); tokens += r.target - r.done;
+            }
+            return batch;
+        }
+        function prefillBatch(inst, batch) {
+            const chunks = batch.map(r => [r.done, r.target - r.done, true]);
+            let tokens = 0, rec = 0;
+            for (let k = 0; k < batch.length; k++) { tokens += chunks[k][1]; if (batch[k].tokensOut) rec += chunks[k][1]; }
+            inst.computedTokens += tokens; inst.recomputeTokens += rec;
+            schedStep(inst, inst.cm.mixed(0, 0, chunks), batch.length, () => {
+                for (const r of batch) { r.done = r.target; prefillDone(inst, r); }
+            });
+        }
+        function chunkedStep(inst) {
+            grow(inst);
+            const tau = inst.budget;
+            const dec = inst.running.filter(r => r.done >= r.target);
+            let nt = dec.length, ctx = 0;
+            for (const r of dec) ctx += r.prompt + r.tokensOut;
+            const part = [];
+            for (const r of inst.running)
+                if (r.done < r.target && nt < tau) { const c = Math.min(r.target - r.done, tau - nt); part.push([r, c]); nt += c; }
+            while (inst.queue.length && nt < tau && inst.running.length < maxB && !inst.swapped.length) {
+                const r = tryAdmit(inst);
+                if (r === null) break;
+                const c = Math.min(r.target - r.done, tau - nt); part.push([r, c]); nt += c;
+            }
+            if (!dec.length && !part.length) return false;
+            const chunks = part.map(([r, c]) => [r.done, c, r.done + c === r.target]);
+            let pre = 0, rec = 0;
+            for (const [r, c] of part) { pre += c; if (r.tokensOut) rec += c; }
+            inst.computedTokens += pre; inst.recomputeTokens += rec;
+            schedStep(inst, inst.cm.mixed(ctx, dec.length, chunks), dec.length + part.length, () => {
+                afterDecode(inst, dec);
+                for (const [r, c] of part) { r.done += c; if (r.done === r.target) prefillDone(inst, r); }
+            });
+            return true;
+        }
+        function schedLoop(inst) {
+            for (;;) {
+                if (inst.swapped.length) swapIn(inst);
+                if (policy === 'chunked') { chunkedStep(inst); return; }
+                if (policy === 'decode-priority' && inst.running.length) { if (decodeAll(inst)) return; continue; }
+                const batch = admitPrompts(inst);
+                if (batch.length) { prefillBatch(inst, batch); return; }
+                if (inst.running.length) { if (decodeAll(inst)) return; continue; }
+                return;
+            }
+        }
         function loop(inst) {
             if (inst.active) return;
+            if (inst.cap !== undefined) { schedLoop(inst); return; }
             if (inst.role === 'prefill') {
                 if (!inst.queue.length) return;
                 const batch = []; let tok = 0;
@@ -536,11 +839,17 @@
             });
         }
         // arrivals
-        for (const r of reqs) push(r.arrival, () => {
+        function arrive(r) {
             const pool = cfg.mode === 'disagg' ? decode : coloc;
-            if (kvNeed(r) > front.cm.kvCap) { nRej++; r.rejected = true; if (nDone + nRej === reqs.length) stop = true; return; }
+            const tooBig = sched ? fullNeed(front, r) > front.cap : kvNeed(r) > front.cm.kvCap;
+            if (tooBig) {
+                nRej++; r.rejected = true;
+                for (let x = successor.get(r.rid); x !== undefined; x = successor.get(x.rid)) { nRej++; x.rejected = true; }
+                if (nDone + nRej === reqs.length) stop = true; return;
+            }
             submit(pick(cfg.mode === 'disagg' ? prefill : pool), r);
-        });
+        }
+        for (const r of reqs) if (r.after === null) push(r.arrival, () => arrive(r));
         // sampler (passive probe)
         const dt = cfg.sampleDt || 0.25;
         const sample = () => {
@@ -552,7 +861,8 @@
         push(0, sample);
 
         while (heap.length && !stop) { const e = pop(); now = e[0]; e[2](); }
-        return { cfg, model, reqs, insts, link: ls, linkCh: link.ch, horizon: now, samples, tr };
+        return { cfg, model, reqs, insts, link: ls, linkCh: link.ch, horizon: now, samples, tr, sched,
+                 swap: sched && kvPolicy === 'paged' && preemptMode === 'swap' };
     }
 
     // ── metrics (mirror of metrics.py) ─────────────────────────────────
@@ -612,9 +922,11 @@
         let totJ = st_ + ce + me + res.link.energy;
         if (opt) totJ = totJ + os + oc;
         if (res.tr) totJ = totJ + res.link.transitJ;
+        let swapJ = 0; if (res.swap) { for (const i of res.insts) swapJ += i.swapJ; totJ = totJ + swapJ; }
         const breakdown = { static: st_ / totJ, compute: ce / totJ, memory: me / totJ, link: res.link.energy / totJ };
         if (opt) { breakdown.opticalStatic = os / totJ; breakdown.opticalConversions = oc / totJ; }
         if (res.tr) breakdown.transit = res.link.transitJ / totJ;
+        if (res.swap) breakdown.swap = swapJ / totJ;
         const energy = { totalJ: totJ, avgW: totJ / H, jPerTok: totJ / outTok, tokPerJ: outTok / totJ,
             breakdown, perInstance: perE };
         const pools = {};
@@ -622,8 +934,33 @@
         const lk = res.link;
         const transit = res.tr ? { preset: res.tr.preset.name, where: res.tr.where, ratio: res.tr.preset.ratio,
             handoffGB: lk.handoff / 1e9, transitBoundFrac: lk.transfers ? lk.transitBound / lk.transfers : 0, transitJ: lk.transitJ } : null;
+        // brief 20A1 levers (metrics.scheduler_report)
+        let scheduler = null;
+        if (res.sched) {
+            const I = res.insts, i0 = I[0];
+            let busy = 0, run = 0, tok = 0, al = 0, comp = 0;
+            for (const i of I) { busy += i.busy; run += i.runArea; tok += i.tokArea; al += i.allocArea; comp += i.computedTokens; }
+            scheduler = { batchPolicy: cfg.batchPolicy || 'prefill-priority', tokenBudget: i0.budget, kvPolicy: cfg.kvPolicy || 'oracle',
+                          kvCapacityUnits: i0.cap, kvUnitTokens: i0.blk, meanRunning: busy ? run / busy : 0.0,
+                          kvTokenFrac: al ? tok / al : NaN, computedPrefillTokens: comp };
+            if (i0.paged) {
+                let pre = 0, rec = 0; for (const i of I) { pre += i.preemptions; rec += i.recomputeTokens; }
+                Object.assign(scheduler, { preemption: cfg.preemption || 'recompute', preemptions: pre, recomputeTokens: rec });
+                if (i0.swap) {
+                    let so = 0, si = 0, ss = 0, sj = 0;
+                    for (const i of I) { so += i.swapOut; si += i.swapIn; ss += i.swapTime; sj += i.swapJ; }
+                    scheduler.swap = { outGB: so / 1e9, inGB: si / 1e9, seconds: ss, J: sj };
+                }
+            }
+            if (i0.cache) {
+                let pt = 0, ht = 0, ev = 0, ce = 0;
+                for (const i of I) { pt += i.promptTokens; ht += i.hitTokens; ev += i.cache.evictedTokens;
+                                     for (const n of i.cache.nodes.values()) ce += n.tokens; }
+                scheduler.prefixCache = { hitRate: pt ? ht / pt : 0.0, hitTokens: ht, promptTokens: pt, evictedTokens: ev, cachedTokensEnd: ce };
+            }
+        }
         return {
-            mode: cfg.mode, completed: done.length, measured: steady.length, energy, pools, optical: opt ? optical : null, transit,
+            mode: cfg.mode, completed: done.length, scheduler, measured: steady.length, energy, pools, optical: opt ? optical : null, transit,
             rejected: res.reqs.length - done.length,
             ttft: dist(ttft), tpot: dist(tpot), itl: dist(itl), e2e: dist(e2e),
             tokPerS: done.reduce((s, r) => s + r.output, 0) / H, reqPerS: done.length / H,
