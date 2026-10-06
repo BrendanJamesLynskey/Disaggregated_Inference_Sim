@@ -1728,7 +1728,8 @@ def render_tradeoffs(t: dict) -> str:
       " GPU-hour (" + ", ".join(f"{k.upper()} ${v:.2f}" for k, v in meta["usd_per_gpu_hour"].items()) + "); energy"
       " per token is the power model's (illustrative coefficients, static power included). Latencies are at each"
       f" workload's reference load. Speculative rows use alpha {meta['speculative_alpha']} (a parameter). Simulator"
-      f" {meta['simulator_commit']}, {meta['generated']}, {meta['wall_s'] / 60:.0f} min on {meta['workers']} workers."
+      f" {meta['simulator_commit']}, {meta['generated']}: {len(t['points'])} points in {meta['wall_s'] / 60:.0f} min on"
+      f" {meta['workers']} workers."
       " Accuracy is not simulated.")
     p("")
     rows = []
@@ -1747,6 +1748,25 @@ def render_tradeoffs(t: dict) -> str:
 
     def cell(x):
         return "-" if x is None else f"{100 * x:+.0f}%"
+    sense = t["meta"]["objectives"]
+
+    def vec(q):
+        out = []
+        for k, d in sense.items():
+            x = q["metrics"].get(k)
+            x = (float("inf") if d == "min" else float("-inf")) if x is None else x
+            out.append(x if d == "min" else -x)
+        return out
+
+    def front_h100(wk, lk):
+        """Non-dominated among this workload's H100 points (recomputed here from the recorded metrics)."""
+        group = [q for q in t["points"] if q["workload"] == wk and q["hardware"] == "h100" and "metrics" in q]
+        me = next(q for q in group if q["lever"] == lk)
+        a = vec(me)
+        if not all(abs(x) != float("inf") for x in a):
+            return False
+        return not any(all(x <= y for x, y in zip(vec(o), a)) and any(x < y for x, y in zip(vec(o), a))
+                       for o in group if o is not me)
     for wk, w in t["workloads"].items():
         b = pts.get((wk, "h100", "baseline"))
         if b is None or "metrics" not in b:
@@ -1756,7 +1776,8 @@ def render_tradeoffs(t: dict) -> str:
           + (f"${bm['usd_per_mtok']:.2f} per M output tokens, {bm['j_per_tok']:.2f} J/token" if bm.get("usd_per_mtok") else "no capacity")
           + f"; at {'saturation' if w['reference_rate'] > 1e4 else format(w['reference_rate'], '.3g') + '/s'} TTFT p99"
             f" {ms(bm['ttft_p99']).strip()}, TPOT p99 {ms(bm['tpot_p99']).strip()}."
-          " Relative change per lever (Pareto-optimal over all six metrics marked *):")
+          " Relative change per lever; * marks the H100 points on the six-metric Pareto front of this workload"
+          " (the JSON's `pareto.all` flag is over every device, where B200 points dominate):")
         p("")
         rows = []
         for lk, info in levers.items():
@@ -1769,7 +1790,7 @@ def render_tradeoffs(t: dict) -> str:
                 rows.append([info["label"], "error: " + q["error"][:60]] + [""] * 5)
                 continue
             e = eff[wk]["h100"].get(lk, {})
-            star = "*" if q.get("pareto", {}).get("all") else ""
+            star = "*" if front_h100(wk, lk) else ""
             rows.append([info["label"] + star] + [cell(e.get(k)) for k in keys])
         table(L, hdr, rows)
     # sign flips across workloads

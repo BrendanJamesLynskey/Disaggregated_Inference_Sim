@@ -659,3 +659,366 @@ Quoted figures are from the papers' text (arXiv 2403.02310, 2309.06180, 2312.071
 | SGLang | A higher cache hit rate gives a larger batch, higher throughput and lower latency (Fig. 8a-b) | monotone in every column | Reproduces |
 | SGLang | 74.1% hit rate in production cut first-token latency 1.7x on average (Vicuna-33B, section 6.2) | 66.8% gives 3.19x, 79.9% gives 5.34x (Mistral-7B, half load) | Not comparable: different model, traffic and load; the direction holds |
 
+
+## 23. The levers in disaggregated pools
+
+Brief 20A2 (owner decision 2026-10-06). With any scheduling lever on, a disaggregated run uses `ScheduledPrefillInstance` and `ScheduledDecodeInstance`. The **prefill pool** holds prompt KV only, from admission until its hand-off has landed, plus the prefix cache; it batches whole prompts to the budget, or chunks (no decode rows to piggy-back). Its cache holds prompt segments, not replies (they are generated on the decode pool), so a session's next turn recomputes the previous reply. The **decode pool** pulls each hand-off only once it can allocate its KV (the policy's reservation, or the prompt's blocks plus the 1% watermark when paged), so a transfer never lands without room; then it runs the colocated scheduler's paged growth and latest-arrival preemption (recompute here, or swap to host). With every lever at its default the scheduled pools reproduce the old ones bit for bit (tested with one decode instance; with several, the hand-off is routed when prefill ends rather than when the KV lands).
+
+**Paged KV in the decode pool** (vLLM's setting: OPT-13B, one A100-40GB per instance, ShareGPT lengths as in section 20; 600 Poisson requests; reserved KV rows use the scheduled pools at default levers):
+
+| Rate req/s | Configuration | Output tok/s | Mean running (decode) | Preemptions | TTFT p50 | TTFT p99 | TPOT p50 | TPOT p99 | Mean KV wait (ms) | J/token |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 2 | colocated x2, reserved | 586 | 7.0 | - | 37.3 ms | 156.4 ms | 23.7 ms | 25.7 ms | 0.0 ms | 0.551 |
+| 2 | colocated x2, paged | 586 | 7.0 | 0 | 37.3 ms | 156.4 ms | 23.7 ms | 25.7 ms | 0.0 ms | 0.551 |
+| 2 | 1P1D, reserved | 584 | 14.7 | - | 21.2 ms | 156.2 ms | 25.7 ms | 89.3 ms | 901.7 ms | 0.418 |
+| 2 | 1P1D, paged, recompute | 585 | 14.8 | 0 | 21.2 ms | 156.2 ms | 25.5 ms | 27.7 ms | 0.0 ms | 0.418 |
+| 2 | 1P1D, paged, swap | 585 | 14.8 | 0 | 21.2 ms | 156.2 ms | 25.5 ms | 27.7 ms | 0.0 ms | 0.418 |
+| 2 | 1P1D, paged, chunked 512 | 585 | 14.8 | 0 | 21.2 ms | 156.7 ms | 25.5 ms | 27.7 ms | 0.0 ms | 0.418 |
+| 4 | colocated x2, reserved | 1,093 | 14.8 | - | 45.4 ms | 7,298 ms | 26.7 ms | 28.6 ms | 0.0 ms | 0.322 |
+| 4 | colocated x2, paged | 1,104 | 14.9 | 0 | 38.0 ms | 161.7 ms | 26.9 ms | 29.7 ms | 0.0 ms | 0.321 |
+| 4 | 1P1D, reserved | 652 | 16.7 | - | 22,189 ms | 80,827 ms | 161.2 ms | 1,069 ms | 34,229 ms | 0.380 |
+| 4 | 1P1D, paged, recompute | 836 | 26.3 | 652 | 21.2 ms | 156.2 ms | 49.5 ms | 1,636 ms | 2,082 ms | 0.334 |
+| 4 | 1P1D, paged, swap | 888 | 26.3 | 762 | 30.0 ms | 9,369 ms | 96.1 ms | 720.1 ms | 17,716 ms | 0.294 |
+| 4 | 1P1D, paged, chunked 512 | 867 | 26.0 | 621 | 21.2 ms | 156.7 ms | 45.1 ms | 1,363 ms | 1,608 ms | 0.326 |
+
+**Prefix caching in the prefill pool** (Llama-3-8B, one H100 per instance, 2 GPUs either way; 4-turn sessions at 2/s, 1 s think time, 4 system prompts of 1,024 tokens, turn inputs 256-512):
+
+| Outputs | Configuration | Hit rate | Prefill tokens computed | TTFT p50 | TTFT p99 | TPOT p50 | Hand-off GB |
+|---|---|---|---|---|---|---|---|
+| short (4-8) | colocated x2, off | 0.0% | 1,193,276 | 65.1 ms | 137.1 ms | 6.3 ms | 0.0 |
+| short (4-8) | colocated x2, on | 74.6% | 303,672 | 13.0 ms | 49.2 ms | 6.2 ms | 0.0 |
+| short (4-8) | 1P1D, off | 0.0% | 1,193,276 | 72.9 ms | 296.7 ms | 7.4 ms | 156.4 |
+| short (4-8) | 1P1D, on | 65.8% | 407,861 | 22.4 ms | 66.5 ms | 7.4 ms | 156.4 |
+| medium (64) | colocated x2, off | 0.0% | 1,244,487 | 72.1 ms | 187.4 ms | 7.9 ms | 0.0 |
+| medium (64) | colocated x2, on | 70.2% | 371,018 | 17.5 ms | 57.5 ms | 6.7 ms | 0.0 |
+| medium (64) | 1P1D, off | 0.0% | 1,244,487 | 77.2 ms | 397.1 ms | 6.7 ms | 163.1 |
+| medium (64) | 1P1D, on | 65.2% | 433,486 | 24.3 ms | 105.1 ms | 6.7 ms | 163.1 |
+
+**Interactions with the other options** (Llama-3-8B, 1P1D, one GPU per instance, prompts 2,048 / outputs 256; 4 req/s, 2 req/s on 25 GbE):
+
+| Configuration | Output tok/s | TTFT p50 | TPOT p50 | Mean KV wait (ms) | GB on the link | Preemptions |
+|---|---|---|---|---|---|---|
+| H100 prefill, H100 decode, reserved | 967 | 54.9 ms | 6.9 ms | 0.1 ms | 156.2 | - |
+| H100 prefill, A100 decode, reserved | 951 | 54.9 ms | 11.8 ms | 0.1 ms | 156.2 | - |
+| H100 prefill, A100 decode, paged | 951 | 54.9 ms | 11.8 ms | 0.1 ms | 156.2 | 0 |
+| 25 GbE link, reserved | 488 | 51.4 ms | 6.9 ms | 10.5 ms | 156.2 | - |
+| 25 GbE link, fp8 in transit, paged | 488 | 51.4 ms | 6.7 ms | 2.0 ms | 78.1 | 0 |
+| 25 GbE link, fp8 at the GPU, paged | 488 | 51.6 ms | 6.7 ms | 2.0 ms | 78.1 | 0 |
+
+Combinations that are **not modelled** and are rejected with these errors:
+
+- CED model (llama3-70b-ced): "the scheduling levers (batch_policy, max_num_batched_tokens, kv_policy, prefix_caching, speculative) are modelled for attention models without CED only"
+- Optical prefill pool (Hyena model on optical-fft): "the scheduling levers (batch_policy, max_num_batched_tokens, kv_policy, prefix_caching, speculative) are modelled for attention models without CED only"
+- Prefix caching + swap preemption: "prefix caching with swap preemption is not modelled: use preemption='recompute'"
+- fast_forward decode: "fast_forward is the plain decode instance's fast path: not with the scheduling levers"
+- Speculative decoding + hand-off compression: "speculative decoding with KV hand-off compression is not modelled (the draft's KV would cross uncompressed)"
+
+So heterogeneous pools and in-transit or endpoint hand-off compression combine with the levers. The CED option and the FFT-mixing models (the only ones an optical prefill pool speeds up) do not: the levers are modelled for attention models without CED.
+
+## 24. Parallelism, mixture of experts and storage formats
+
+`hardware.Parallel` (first-order, illustrative): ring all-reduces after attention and after the MLP (Megatron-LM, arXiv:1909.08053), 2(n-1)/n S / B + 2(n-1) x link latency each, on the device's NVLink, not overlapped with compute; GPipe micro-batches (arXiv:1811.06965), m + p - 1 slots, each slot re-reading its stage's weights; MoE all-to-all dispatch and combine (GShard, arXiv:2006.16668). Memory is checked per GPU, stage by stage. Cost-model steps below (no queueing).
+
+**Tensor parallelism**, Llama-3-70B on H100s (decode contexts 2,048 tokens):
+
+| TP GPUs | Decode b=1 | of it all-reduce | Decode b=64 | of it all-reduce | b=64 without the all-reduce | Prefill 8,192 | of it all-reduce | Decode tok/s per GPU at b=64 | KV tokens |
+|---|---|---|---|---|---|---|---|---|---|
+| 2 | 28.2 ms | 5.7% | 36.4 ms | 5.4% | 34.5 ms | 1,177 ms | 4.2% | 879 | 8,835 |
+| 4 | 18.3 ms | 26.2% | 22.8 ms | 23.5% | 17.5 ms | 640.7 ms | 11.9% | 701 | 448,288 |
+| 8 | 18.2 ms | 61.5% | 20.8 ms | 56.9% | 9.0 ms | 377.1 ms | 25.1% | 384 | 1,327,194 |
+
+**Pipeline against tensor parallelism** on 4 H100s (prefill: 4 prompts of 4,096; decode: 64 rows of 2,048):
+
+| Layout | Prefill step | Decode step | GPipe bubble (p-1)/(m+p-1) | KV tokens |
+|---|---|---|---|---|
+| TP4 | 1,236 ms | 22.8 ms | 0.0% | 448,288 |
+| TP2 x PP2, 1 micro-batch | 2,273 ms | 36.4 ms | 50.0% | 448,288 |
+| TP2 x PP2, 2 micro-batches | 1,706 ms | 48.1 ms | 33.3% | 448,288 |
+| TP2 x PP2, 4 micro-batches | 1,424 ms | 74.6 ms | 20.0% | 448,288 |
+| PP4, 4 micro-batches | 1,904 ms | 98.3 ms | 42.9% | 435,463 |
+
+Micro-batches shrink the bubble of a compute-bound prefill but re-read every stage's weights, so they lengthen a memory-bound decode step. Successive steps are not overlapped across stages here (no cross-step pipelining, as serving engines do with several batches in flight), so pipeline parallelism shows its cost, not its throughput: a known gap.
+
+**Mixture of experts**, Mixtral-8x7B (46.7B parameters, 12.9B active with the input embedding; 8 experts, top-2) on 2 H100s. Expected experts a layer touches, E(1 - (1 - k/E)^tokens), and the bytes a decode step reads:
+
+| Tokens in the step | 1 | 2 | 4 | 8 | 16 | 64 |
+|---|---|---|---|---|---|---|
+| Experts touched (of 8) | 2.00 | 3.50 | 5.47 | 7.20 | 7.92 | 8.00 |
+
+| Decode batch | 1 | 4 | 16 | 64 |
+|---|---|---|---|---|
+| GB read per step | 25.8 | 65.7 | 96.5 | 110.3 |
+
+| Layout (2 GPUs) | Prefill 4 x 2,048 | of it link | Decode b=32 | of it link | Prefill dynamic J |
+|---|---|---|---|---|---|
+| TP2 | 206.7 ms | 4.9% | 20.2 ms | 3.4% | 219 |
+| EP2 | 211.5 ms | 7.1% | 20.2 ms | 3.4% | 219 |
+| EP2, imbalance 1.25 | 253.9 ms | 5.9% | 20.2 ms | 3.4% | 219 |
+| EP2, imbalance 1.5 | 296.4 ms | 5.0% | 20.2 ms | 3.4% | 219 |
+
+**Storage and compute formats**, Llama-3-70B on 4 GPUs (no all-reduce, to isolate the format; decode contexts 2,048). Bytes per value include block scales (INT4: groups of 128 with an FP16 scale, AWQ arXiv:2306.00978; FP4: MXFP4, 32 values per 8-bit scale, arXiv:2310.10537). A compute format runs at the datasheet's dense rate when the device has units for it (H100: FP8, INT8; B200: FP8, FP4); otherwise weights are dequantised to BF16 before the multiply (weight-only), at no modelled cost. **Accuracy is not simulated**: see the Numerics site for what each format does to accuracy.
+
+| Device | Format | Weights GB | KV tokens | Decode b=1 | Decode b=64 | bound | Prefill 8,192 | bound | J/token at b=64 (incl. idle) |
+|---|---|---|---|---|---|---|---|---|---|
+| H100 | BF16 | 141.1 | 448,288 | 13.5 ms | 17.5 ms | memory | 564.3 ms | compute | 0.424 |
+| H100 | FP8 weights only (W8A16) | 70.6 | 663,597 | 7.0 ms | 11.0 ms | memory | 564.3 ms | compute | 0.319 |
+| H100 | FP8 W8A8 | 70.6 | 663,597 | 7.0 ms | 11.0 ms | memory | 282.4 ms | compute | 0.246 |
+| H100 | INT8 W8A8 | 70.6 | 663,597 | 7.0 ms | 11.0 ms | memory | 282.4 ms | compute | 0.246 |
+| H100 | INT4 weights only (W4A16) | 36.4 | 767,887 | 3.9 ms | 7.9 ms | memory | 564.3 ms | compute | 0.267 |
+| H100 | FP4 weights only (W4A16) | 37.5 | 764,523 | 4.0 ms | 8.0 ms | memory | 564.3 ms | compute | 0.269 |
+| H100 | FP8 KV cache | 141.1 | 896,577 | 13.5 ms | 15.5 ms | memory | 564.3 ms | compute | 0.392 |
+| H100 | INT4 KV cache | 141.1 | 1,738,816 | 13.5 ms | 14.5 ms | memory | 564.3 ms | compute | 0.376 |
+| H100 | FP8 W8A8 + FP8 KV | 70.6 | 1,327,194 | 7.0 ms | 9.0 ms | memory | 282.4 ms | compute | 0.214 |
+| B200 | BF16 | 141.1 | 1,546,921 | 6.0 ms | 7.6 ms | memory | 248.3 ms | compute | 0.281 |
+| B200 | FP8 W8A8 | 70.6 | 1,762,230 | 3.2 ms | 4.9 ms | memory | 124.4 ms | compute | 0.165 |
+| B200 | FP4 W4A4 | 37.5 | 1,863,156 | 2.0 ms | 3.6 ms | memory | 62.5 ms | compute | 0.110 |
+| B200 | FP4 W4A4 + FP8 KV | 37.5 | 3,726,312 | 2.0 ms | 2.8 ms | memory | 62.5 ms | compute | 0.087 |
+
+## 25. Speculative decoding against Leviathan et al.
+
+`--speculative DRAFT --gamma G --alpha A`: each decode step drafts G tokens per row (G draft passes over the batch), verifies them in one target pass over G + 1 positions per row (`CostModel.step_spec`), and keeps the accepted run plus one token, drawn per request with acceptance rate A (i.i.d., the paper's assumption, section 3.1). Drafts: `mtp` (one extra layer of the target sharing its embedding and LM head, DeepSeek-V3's multi-token prediction module, arXiv:2412.19437) or `llama3.2-1b`. The draft's weights and KV share the instance's memory and its KV crosses the hand-off in disaggregated mode. Closed forms from arXiv:2211.17192 (read 2026-10-06, v2).
+
+**The paper's Table 1** (c = c^ = 0), from the closed forms in `speculative.py`:
+
+| alpha | gamma | Operations (paper) | Operations (Theorem 3.11 here) | Speed (paper) | Speed (Theorem 3.8 here) |
+|---|---|---|---|---|---|
+| 0.6 | 2 | 1.53x | 1.53x | 1.96x | 1.96x |
+| 0.7 | 3 | 1.58x | 1.58x | 2.53x | 2.53x |
+| 0.8 | 2 | 1.23x | 1.23x | 2.44x | 2.44x |
+| 0.8 | 5 | 1.63x | 1.63x | 3.69x | 3.69x |
+| 0.9 | 2 | 1.11x | 1.11x | 2.71x | 2.71x |
+| 0.9 | 10 | 1.60x | 1.60x | 6.86x | 6.86x |
+
+**Tokens per verify pass**: the simulator's draws against equation (1) (Llama-3-8B, one H100, MTP draft, 150 requests at 0.2/s, outputs mean 512; the last pass of a request is capped at its remaining tokens):
+
+| alpha | gamma | Equation (1) | Simulated | Difference |
+|---|---|---|---|---|
+| 0.6 | 2 | 1.960 | 1.949 | -0.5% |
+| 0.6 | 4 | 2.306 | 2.290 | -0.7% |
+| 0.6 | 6 | 2.430 | 2.410 | -0.8% |
+| 0.8 | 2 | 2.440 | 2.433 | -0.3% |
+| 0.8 | 4 | 3.362 | 3.353 | -0.3% |
+| 0.8 | 6 | 3.951 | 3.942 | -0.2% |
+
+**Wall time and operations at low load** (one instance, 0.2 req/s, outputs mean 512): Theorem 3.8 with c = one draft decode step over one target decode step (batch 1, from the cost model), against the simulated TPOT p50 ratio (prompts mean 512); Theorem 3.11 with c^ = draft over target matmul parameters per token, against the simulated FLOPs per output token ratio (16-token prompts, so decode is nearly all the work; attention FLOPs are not in c^):
+
+| Target | Draft | alpha | gamma | c | Speed-up, Theorem 3.8 | Simulated | Operations, Theorem 3.11 | Simulated |
+|---|---|---|---|---|---|---|---|---|
+| llama3-8b | mtp | 0.7 | 3 | 0.090 | 1.99x | 1.98x | 1.70x | 1.68x |
+| llama3-8b | mtp | 0.8 | 5 | 0.090 | 2.54x | 2.55x | 1.76x | 1.75x |
+| llama3-8b | llama3.2-1b | 0.7 | 3 | 0.152 | 1.74x | 1.73x | 1.77x | 1.76x |
+| llama3-8b | llama3.2-1b | 0.8 | 5 | 0.152 | 2.10x | 2.10x | 1.85x | 1.84x |
+| llama3-70b | mtp | 0.7 | 3 | 0.026 | 2.35x | 2.34x | 1.61x | 1.60x |
+| llama3-70b | mtp | 0.8 | 5 | 0.026 | 3.26x | 3.26x | 1.66x | 1.65x |
+| llama3-70b | llama3.2-1b | 0.7 | 3 | 0.017 | 2.41x | 2.40x | 1.60x | 1.59x |
+| llama3-70b | llama3.2-1b | 0.8 | 5 | 0.017 | 3.40x | 3.40x | 1.65x | 1.64x |
+
+**Where it helps and where it hurts**: time per output token from the cost model (one step, no queueing), Llama-3-8B with an MTP draft, gamma 3, alpha 0.7 (2.53 tokens per pass), against context and batch size:
+
+| Device | Context | Batch | ms/token plain | bound | ms/token speculative | verify bound | Speed-up |
+|---|---|---|---|---|---|---|---|
+| H100 | 512 | 1 | 6.126 | memory | 3.076 | memory | 1.99x |
+| H100 | 512 | 32 | 0.216 | memory | 0.107 | memory | 2.02x |
+| H100 | 512 | 128 | 0.073 | memory | 0.053 | power | 1.37x |
+| H100 | 512 | 512 | 0.037 | memory | 0.048 | compute | 0.77x |
+| H100 | 2,048 | 1 | 6.201 | memory | 3.109 | memory | 1.99x |
+| H100 | 2,048 | 32 | 0.291 | memory | 0.139 | memory | 2.09x |
+| H100 | 2,048 | 128 | 0.148 | memory | 0.067 | power | 2.20x |
+| H100 | 2,048 | 512 | 0.112 | memory | 0.055 | power | 2.04x |
+| A100 | 512 | 1 | 9.743 | memory | 4.927 | memory | 1.98x |
+| A100 | 512 | 32 | 0.344 | memory | 0.189 | power | 1.83x |
+| A100 | 512 | 128 | 0.117 | memory | 0.153 | compute | 0.76x |
+| A100 | 512 | 512 | 0.091 | power | 0.151 | compute | 0.60x |
+| A100 | 2,048 | 1 | 9.866 | memory | 4.981 | memory | 1.98x |
+| A100 | 2,048 | 32 | 0.468 | memory | 0.225 | power | 2.08x |
+| A100 | 2,048 | 128 | 0.240 | memory | 0.165 | power | 1.46x |
+| A100 | 2,048 | 512 | 0.184 | memory | 0.159 | compute | 1.15x |
+
+In the simulator (Llama-3-8B on one A100, prompts 1,024 / outputs 256, max batch 512), from light load to saturation:
+
+| Rate req/s | Throughput off | on | Ratio | TPOT p50 off | on | Mean running off | on | Draft share of busy time |
+|---|---|---|---|---|---|---|---|---|
+| 0.5 | 123 | 123 | 1.00x | 10.2 ms | 5.2 ms | - | 1 | 20.6% |
+| 4 | 950 | 971 | 1.02x | 16.6 ms | 8.4 ms | - | 9 | 16.6% |
+| 16 | 1,951 | 1,814 | 0.93x | 117.8 ms | 133.5 ms | - | 239 | 8.9% |
+| 64 | 1,953 | 1,815 | 0.93x | 117.8 ms | 133.4 ms | - | 239 | 8.9% |
+
+
+## 26. The trade-off sweep (`examples/tradeoffs.py` -> `examples/tradeoffs.json`)
+
+Every point is the same 8 GPUs serving Llama-3-70B; the baseline is 2 colocated instances of TP4 (all-reduces priced), prefill-priority batching, reserved KV and BF16, and each lever changes that. Capacity: the highest arrival rate with at least 90% of requests meeting both SLOs (DistServe's goodput, arXiv:2401.09670; rejected requests count as misses), by doubling and bisection to 5%. Cost per million output tokens at capacity uses illustrative prices per GPU-hour (H100 $3.00, H200 $3.50, B200 $5.00); energy per token is the power model's (illustrative coefficients, static power included). Latencies are at each workload's reference load. Speculative rows use alpha 0.7 (a parameter). Simulator 0caa090, 2026-10-06: 350 points in 56 min on 2 workers. Accuracy is not simulated.
+
+| Workload | New input tokens | Output tokens | Turns | Shared prefixes | SLO TTFT / TPOT | Reference load (/s) |
+|---|---|---|---|---|---|---|
+| Chat | 161 (cv 1) | 338 | 3 | 8 x 512 | 1 s / 50 ms | 1.94 |
+| Coding agent | 512 (cv 0.8) | 160 | 8 | 2 x 6,144 | 1.5 s / 40 ms | 0.0469 |
+| Offline batch | 2,048 (cv 0.5) | 256 | 1 | - | 60 s / 500 ms | saturated |
+| Long-context RAG | 7,904 (cv 0.5) | 230 | 1 | 4 x 1,024 | 5 s / 50 ms | 0.594 |
+| Real-time voice | 64 (cv 0.5) | 48 | 6 | 4 x 1,024 | 0.3 s / 25 ms | 0.195 |
+
+**Chat** on H100. Baseline: goodput 1.420 req/s per GPU, $1.84 per M output tokens, 1.15 J/token; at 1.94/s TTFT p99 355.5 ms, TPOT p99 33.3 ms. Relative change per lever; * marks the H100 points on the six-metric Pareto front of this workload (the JSON's `pareto.all` flag is over every device, where B200 points dominate):
+
+| Lever | Goodput/GPU | $/M tok | J/tok | TTFT p99 | TPOT p99 | ITL p99 |
+|---|---|---|---|---|---|---|
+| Decode-priority batching | -100% | - | - | +170844% | -44% | -91% |
+| Chunked prefill, 512-token budget | +28% | -21% | -11% | +8% | -19% | -80% |
+| Chunked prefill, 2,048-token budget | +13% | -11% | -7% | +23% | -6% | -33% |
+| Paged KV, preempt by recompute | +0% | +0% | +0% | +0% | +0% | +0% |
+| Paged KV, preempt by swap to host | +0% | +0% | +0% | +0% | +0% | +0% |
+| Prefix caching (paged KV) | +102% | -50% | -50% | -57% | -27% | -63% |
+| Disaggregated 1P1D (TP4 each) | -17% | +21% | +4% | +46% | -37% | -90% |
+| Disaggregated 2P (TP2) + 1D (TP4) | -5% | +5% | -1% | +54% | -37% | -90% |
+| Disaggregated 1P1D, paged decode, prefix-cached prefill | +123% | -55% | -49% | -52% | -37% | -90% |
+| 1 x TP8 | -24% | +32% | +2% | -30% | +19% | -4% |
+| 4 x TP2 | -87% | +659% | +370% | +75867% | +4% | -53% |
+| 2 x (TP2, PP2), 2 micro-batches | -85% | +568% | +273% | +69% | +152% | +136% |
+| 2 x (TP2, PP2), no micro-batching | -64% | +183% | +63% | +162% | +138% | +209% |
+| FP8 weights and matmuls (W8A8) | +89% | -46% | -50% | -52% | -47% | -60% |
+| INT4 weights, BF16 matmuls (W4A16) | +32% | -24% | -18% | +8% | -48% | -43% |
+| FP8 KV cache | +7% | -6% | -4% | +14% | -4% | -3% |
+| FP8 weights, matmuls and KV | +113% | -53% | -54% | -51% | -48% | -61% |
+| Speculative, MTP head, gamma 3, alpha 0.7 | +27% | -21% | -8% | +1% | -51% | -43% |
+| Speculative, Llama-3.2-1B draft, gamma 4, alpha 0.7 | +25% | -20% | -5% | +14% | -55% | -49% |
+| Chunked 2048 + paged + prefix cache + FP8 (W8A8, KV)* | +361% | -78% | -78% | -75% | -60% | -89% |
+| Disaggregated 1P1D + paged + prefix cache + FP8* | +260% | -72% | -74% | -78% | -61% | -94% |
+| Modern colocated + speculative (MTP)* | +344% | -77% | -75% | -75% | -81% | -94% |
+
+**Coding agent** on H100. Baseline: goodput 0.095 req/s per GPU, $55.71 per M output tokens, 20.39 J/token; at 0.0469/s TTFT p99 1,610 ms, TPOT p99 36.2 ms. Relative change per lever; * marks the H100 points on the six-metric Pareto front of this workload (the JSON's `pareto.all` flag is over every device, where B200 points dominate):
+
+| Lever | Goodput/GPU | $/M tok | J/tok | TTFT p99 | TPOT p99 | ITL p99 |
+|---|---|---|---|---|---|---|
+| Decode-priority batching | -87% | +696% | +250% | +757% | -48% | -3% |
+| Chunked prefill, 512-token budget | -24% | +31% | +17% | +16% | -19% | +142% |
+| Chunked prefill, 2,048-token budget | -9% | +10% | +5% | +7% | -4% | +712% |
+| Paged KV, preempt by recompute | +0% | +0% | +0% | +0% | +0% | +0% |
+| Paged KV, preempt by swap to host | +0% | +0% | +0% | +0% | +0% | +0% |
+| Prefix caching (paged KV) | +868% | -90% | -86% | -74% | -42% | -1% |
+| Disaggregated 1P1D (TP4 each) | -29% | +42% | +13% | +14% | -42% | +3% |
+| Disaggregated 2P (TP2) + 1D (TP4) | -100% | - | - | +89% | -42% | +2% |
+| Disaggregated 1P1D, paged decode, prefix-cached prefill | +1054% | -91% | -88% | -82% | -42% | +3% |
+| 1 x TP8 | +6% | -6% | -12% | -45% | -2% | -1% |
+| 4 x TP2 | -100% | - | - | +526% | -21% | +48% |
+| 2 x (TP2, PP2), 2 micro-batches | -93% | +1364% | +472% | +45% | +116% | +128% |
+| 2 x (TP2, PP2), no micro-batching | -100% | - | - | +121% | +122% | +59% |
+| FP8 weights and matmuls (W8A8) | +243% | -71% | -63% | -50% | -44% | -35% |
+| INT4 weights, BF16 matmuls (W4A16)* | +41% | -29% | -26% | +0% | -37% | -51% |
+| FP8 KV cache | +6% | -6% | -3% | -2% | -1% | -3% |
+| FP8 weights, matmuls and KV | +266% | -73% | -64% | -49% | -46% | -37% |
+| Speculative, MTP head, gamma 3, alpha 0.7 | +29% | -23% | -17% | +6% | -40% | +5% |
+| Speculative, Llama-3.2-1B draft, gamma 4, alpha 0.7 | +41% | -29% | -21% | +3% | -39% | +5% |
+| Chunked 2048 + paged + prefix cache + FP8 (W8A8, KV)* | +2730% | -96% | -95% | -85% | -65% | -37% |
+| Disaggregated 1P1D + paged + prefix cache + FP8* | +2314% | -96% | -94% | -90% | -64% | -35% |
+| Modern colocated + speculative (MTP)* | +3827% | -97% | -95% | -85% | -83% | -34% |
+
+**Offline batch** on H100. Baseline: goodput 1.036 req/s per GPU, $3.17 per M output tokens, 1.84 J/token; at saturation TTFT p99 32,033 ms, TPOT p99 256.2 ms. Relative change per lever; * marks the H100 points on the six-metric Pareto front of this workload (the JSON's `pareto.all` flag is over every device, where B200 points dominate):
+
+| Lever | Goodput/GPU | $/M tok | J/tok | TTFT p99 | TPOT p99 | ITL p99 |
+|---|---|---|---|---|---|---|
+| Decode-priority batching | -100% | - | - | +1130% | -93% | -90% |
+| Chunked prefill, 512-token budget | -5% | +6% | +5% | +18% | -83% | -75% |
+| Chunked prefill, 2,048-token budget | +2% | -2% | -0% | +1% | -38% | -11% |
+| Paged KV, preempt by recompute | +0% | +0% | -0% | -6% | +0% | -82% |
+| Paged KV, preempt by swap to host | +0% | +0% | -0% | -6% | +0% | -82% |
+| Prefix caching (paged KV) | +0% | +0% | -0% | -6% | +0% | -82% |
+| Disaggregated 1P1D (TP4 each) | -33% | +49% | +19% | +86% | -92% | -88% |
+| Disaggregated 2P (TP2) + 1D (TP4) | -28% | +40% | +16% | +71% | -91% | -88% |
+| Disaggregated 1P1D, paged decode, prefix-cached prefill | -33% | +49% | +19% | +86% | -92% | -88% |
+| 1 x TP8 | -15% | +18% | +1% | +35% | -28% | +101% |
+| 4 x TP2 | -100% | - | - | +675% | -87% | -84% |
+| 2 x (TP2, PP2), 2 micro-batches | -38% | +61% | +19% | +41% | +44% | +45% |
+| 2 x (TP2, PP2), no micro-batching | -43% | +74% | +15% | +82% | +81% | +77% |
+| FP8 weights and matmuls (W8A8) | +61% | -38% | -46% | -47% | -40% | -86% |
+| INT4 weights, BF16 matmuls (W4A16) | +20% | -16% | -9% | -6% | -3% | -87% |
+| FP8 KV cache | +4% | -3% | -2% | -6% | -2% | -86% |
+| FP8 weights, matmuls and KV* | +70% | -41% | -48% | -47% | -43% | -89% |
+| Speculative, MTP head, gamma 3, alpha 0.7 | +16% | -14% | -2% | +4% | -1% | +39% |
+| Speculative, Llama-3.2-1B draft, gamma 4, alpha 0.7 | +14% | -12% | -0% | +9% | -9% | +177% |
+| Chunked 2048 + paged + prefix cache + FP8 (W8A8, KV)* | +73% | -42% | -48% | -42% | -65% | -49% |
+| Disaggregated 1P1D + paged + prefix cache + FP8* | +16% | -14% | -39% | +5% | -95% | -92% |
+| Modern colocated + speculative (MTP)* | +95% | -49% | -49% | -35% | -84% | -48% |
+
+**Long-context RAG** on H100. Baseline: goodput 0.152 req/s per GPU, $23.50 per M output tokens, 10.68 J/token; at 0.594/s TTFT p99 2,077 ms, TPOT p99 42.0 ms. Relative change per lever; * marks the H100 points on the six-metric Pareto front of this workload (the JSON's `pareto.all` flag is over every device, where B200 points dominate):
+
+| Lever | Goodput/GPU | $/M tok | J/tok | TTFT p99 | TPOT p99 | ITL p99 |
+|---|---|---|---|---|---|---|
+| Decode-priority batching | -86% | +633% | +230% | +14636% | -55% | -8% |
+| Chunked prefill, 512-token budget | +94% | -48% | -22% | +19% | -22% | +140% |
+| Chunked prefill, 2,048-token budget | +12% | -11% | -5% | +6% | -12% | +719% |
+| Paged KV, preempt by recompute | +0% | +0% | +0% | +0% | +0% | +0% |
+| Paged KV, preempt by swap to host | +0% | +0% | +0% | +0% | +0% | +0% |
+| Prefix caching (paged KV) | +9% | -8% | -9% | -5% | -9% | +1% |
+| Disaggregated 1P1D (TP4 each) | -3% | +3% | -1% | +60% | -50% | +0% |
+| Disaggregated 2P (TP2) + 1D (TP4) | +0% | +0% | -3% | +94% | -50% | +2% |
+| Disaggregated 1P1D, paged decode, prefix-cached prefill | +15% | -13% | -14% | +37% | -50% | +1% |
+| 1 x TP8 | -15% | +18% | -1% | -32% | +10% | +1325% |
+| 4 x TP2 | -100% | - | - | +1011% | -26% | +40% |
+| 2 x (TP2, PP2), 2 micro-batches | -83% | +500% | +189% | +58% | +131% | +2828% |
+| 2 x (TP2, PP2), no micro-batching | -72% | +257% | +93% | +132% | +129% | +70% |
+| FP8 weights and matmuls (W8A8)* | +124% | -55% | -54% | -47% | -51% | -35% |
+| INT4 weights, BF16 matmuls (W4A16)* | +33% | -25% | -19% | +6% | -37% | -50% |
+| FP8 KV cache | +0% | +0% | -0% | +0% | -1% | -5% |
+| FP8 weights, matmuls and KV* | +142% | -59% | -56% | -46% | -53% | -38% |
+| Speculative, MTP head, gamma 3, alpha 0.7 | +39% | -28% | -15% | +9% | -42% | +2% |
+| Speculative, Llama-3.2-1B draft, gamma 4, alpha 0.7 | +45% | -31% | -16% | +2% | -43% | +3% |
+| Chunked 2048 + paged + prefix cache + FP8 (W8A8, KV)* | +227% | -69% | -63% | -47% | -56% | +330% |
+| Disaggregated 1P1D + paged + prefix cache + FP8 | +142% | -59% | -58% | -41% | -69% | -36% |
+| Modern colocated + speculative (MTP)* | +348% | -78% | -66% | -42% | -77% | -37% |
+
+**Real-time voice** on H100. Baseline: goodput 0.322 req/s per GPU, $54.22 per M output tokens, 15.78 J/token; at 0.195/s TTFT p99 213.8 ms, TPOT p99 27.5 ms. Relative change per lever; * marks the H100 points on the six-metric Pareto front of this workload (the JSON's `pareto.all` flag is over every device, where B200 points dominate):
+
+| Lever | Goodput/GPU | $/M tok | J/tok | TTFT p99 | TPOT p99 | ITL p99 |
+|---|---|---|---|---|---|---|
+| Decode-priority batching | -86% | +619% | +266% | +944% | -33% | -1% |
+| Chunked prefill, 512-token budget | +60% | -38% | -23% | +8% | -16% | +132% |
+| Chunked prefill, 2,048-token budget | +16% | -14% | -9% | -3% | -11% | -0% |
+| Paged KV, preempt by recompute | +0% | +0% | +0% | +0% | +0% | +0% |
+| Paged KV, preempt by swap to host | +0% | +0% | +0% | +0% | +0% | +0% |
+| Prefix caching (paged KV) | +656% | -87% | -82% | -77% | -29% | -0% |
+| Disaggregated 1P1D (TP4 each) | +66% | -40% | -32% | +28% | -28% | +75% |
+| Disaggregated 2P (TP2) + 1D (TP4) | -47% | +88% | +35% | +85% | -28% | +73% |
+| Disaggregated 1P1D, paged decode, prefix-cached prefill | +2577% | -96% | -93% | -84% | -28% | +75% |
+| 1 x TP8 | -36% | +55% | +17% | -28% | +5% | +402% |
+| 4 x TP2 | -100% | - | - | +91% | +40% | +53% |
+| 2 x (TP2, PP2), 2 micro-batches | -100% | - | - | +58% | +106% | +864% |
+| 2 x (TP2, PP2), no micro-batching | -100% | - | - | +136% | +74% | +933% |
+| FP8 weights and matmuls (W8A8) | +385% | -79% | -70% | -44% | -45% | -35% |
+| INT4 weights, BF16 matmuls (W4A16)* | +152% | -60% | -49% | +5% | -47% | -52% |
+| FP8 KV cache | -6% | +6% | +3% | -2% | -5% | -1% |
+| FP8 weights, matmuls and KV | +359% | -78% | -70% | -44% | -45% | -36% |
+| Speculative, MTP head, gamma 3, alpha 0.7 | +142% | -59% | -42% | +5% | -45% | +6% |
+| Speculative, Llama-3.2-1B draft, gamma 4, alpha 0.7 | +174% | -64% | -45% | +6% | -48% | +5% |
+| Chunked 2048 + paged + prefix cache + FP8 (W8A8, KV)* | +6448% | -98% | -97% | -87% | -57% | -36% |
+| Disaggregated 1P1D + paged + prefix cache + FP8* | +5395% | -98% | -96% | -90% | -54% | -6% |
+| Modern colocated + speculative (MTP)* | +7323% | -99% | -97% | -86% | -75% | -33% |
+
+**Levers whose effect on goodput per GPU changes sign between workloads** (H100; +/- is more/less goodput than the baseline by more than 2%):
+
+| Lever | Chat | Coding agent | Offline batch | Long-context RAG | Real-time voice |
+|---|---|---|---|---|---|
+| Chunked prefill, 512-token budget | + | - | - | + | + |
+| Chunked prefill, 2,048-token budget | + | - | + | + | + |
+| Disaggregated 1P1D (TP4 each) | - | - | - | - | + |
+| Disaggregated 1P1D, paged decode, prefix-cached prefill | + | + | - | + | + |
+| 1 x TP8 | - | + | - | - | - |
+| FP8 KV cache | + | + | + | 0 | - |
+
+**Hardware**: goodput per GPU and cost per M output tokens of the baseline and of the best lever on each device (best = highest goodput per GPU):
+
+| Workload | Device | Baseline goodput/GPU | Baseline $/M tok | Best lever | Its goodput/GPU | Its $/M tok |
+|---|---|---|---|---|---|---|
+| Chat | H100 | 1.420 | 1.84 | Chunked 2048 + paged + prefix cache + FP8 (W8A8, KV) | 6.543 | 0.40 |
+| Chat | H200 | 1.700 | 1.79 | Chunked 2048 + paged + prefix cache + FP8 (W8A8, KV) | 6.902 | 0.44 |
+| Chat | B200 | 3.803 | 1.15 | Modern colocated + speculative (MTP) | 12.742 | 0.34 |
+| Coding agent | H100 | 0.095 | 55.71 | Modern colocated + speculative (MTP) | 3.745 | 1.40 |
+| Coding agent | H200 | 0.118 | 52.68 | Modern colocated + speculative (MTP) | 3.880 | 1.58 |
+| Coding agent | B200 | 0.471 | 18.61 | Modern colocated + speculative (MTP) | 8.213 | 1.06 |
+| Offline batch | H100 | 1.036 | 3.17 | Modern colocated + speculative (MTP) | 2.020 | 1.63 |
+| Offline batch | H200 | 1.136 | 3.38 | Modern colocated + speculative (MTP) | 2.064 | 1.86 |
+| Offline batch | B200 | 2.102 | 2.61 | FP4 weights and matmuls (W4A4) | 4.159 | 1.32 |
+| Long-context RAG | H100 | 0.152 | 23.50 | Modern colocated + speculative (MTP) | 0.682 | 5.24 |
+| Long-context RAG | H200 | 0.175 | 23.81 | Modern colocated + speculative (MTP) | 0.682 | 6.11 |
+| Long-context RAG | B200 | 0.516 | 11.54 | Chunked 2048 + paged + prefix cache + FP8 (W8A8, KV) | 1.622 | 3.67 |
+| Real-time voice | H100 | 0.322 | 54.22 | Modern colocated + speculative (MTP) | 23.867 | 0.73 |
+| Real-time voice | H200 | 0.533 | 38.08 | Modern colocated + speculative (MTP) | 23.824 | 0.86 |
+| Real-time voice | B200 | 2.279 | 12.73 | Chunked 2048 + paged + prefix cache + FP8 (W8A8, KV) | 52.336 | 0.55 |
+

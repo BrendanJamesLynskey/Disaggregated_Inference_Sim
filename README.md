@@ -49,11 +49,25 @@ queueing theory.
   fed by `chat_sessions` workloads (shared system prompts, closed-loop multi-turn sessions: `--turns`, `--think`,
   `--system-prompts`, `--system-len`, `--prefix-share`). Validation presets `mistral-7b`, `yi-34b`, `opt-13b`,
   `a100-40g` and `pcie4`. With every lever off, every earlier number is unchanged.
+* **Levers, part II, and the trade-off sweep** (added 2026-10-06, brief 20A2; all off by default):
+  - the levers above in **disaggregated pools**: a prefill pool with prefix caching and chunking, a decode pool with
+    paged KV and preemption that pulls each hand-off only once it has room for it;
+  - **parallelism inside an instance**: `--tp`, `--pp` (`--microbatches`), `--ep` (`--expert-imbalance`), per pool with
+    `--prefill-tp` / `--decode-tp`: ring all-reduces ([Megatron-LM](https://arxiv.org/abs/1909.08053)), GPipe bubbles
+    ([arXiv:1811.06965](https://arxiv.org/abs/1811.06965)) and MoE all-to-all ([GShard](https://arxiv.org/abs/2006.16668))
+    on NVLink, memory checked per GPU; a `mixtral-8x7b` MoE shape;
+  - **quantisation as a performance lever**: `--weight-format`, `--kv-format` and `--compute-format` (bf16, fp8, int8,
+    int4, fp4), native compute rates from the datasheets, `h200` and `b200` presets. Accuracy is not simulated;
+  - **speculative decoding**: `--speculative mtp|llama3.2-1b --gamma G --alpha A`, checked against the closed forms of
+    [Leviathan et al.](https://arxiv.org/abs/2211.17192);
+  - named workloads (`--workload chat|coding-agent|offline-batch|long-rag|voice`, with their SLOs) and
+    `examples/tradeoffs.py`, a sweep of levers × workloads × hardware that writes `examples/tradeoffs.json`: every
+    metric, Pareto flags and each lever's effect, the number source of the trade-offs site.
 * A JavaScript port (`web/sim_engine.js`) that runs live in
   [deck 05](https://brendanjameslynskey.github.io/InfSim_05_Disaggregated_Inference/) and
   [FOptInf deck 03](https://brendanjameslynskey.github.io/FOptInf_03_Optical_Prefill_Pools/),
   and is tested to match the Python exactly, every new feature included.
-* 203 tests: unit, invariant, analytic (M/D/1, Little's law), behavioural,
+* 267 tests: unit, invariant, analytic (M/D/1, Little's law), behavioural,
   property-based (Hypothesis), power and energy, differential (fast path vs
   baseline, JS vs Python), the cost model pinned against an operator trace
   of the real Llama-3-8B, and (94, added 2026-10-04) the new features: identical pools
@@ -66,7 +80,12 @@ queueing theory.
   2026-10-06, `tests/test_levers.py`) the scheduling and KV-memory levers: inert settings and the new scheduler at
   default levers bit-identical to the old colocated instance, the mixed step's closed forms (chunks sum to the whole
   prompt plus KV re-reads), memory never over-committed, each paper's ordering, LRU eviction, closed-loop sessions,
-  and JS parity on 15 configurations (preemption, swap, prefix hits, evictions and LRU ties all exercised).
+  and JS parity on 15 configurations (preemption, swap, prefix hits, evictions and LRU ties all exercised); and (64,
+  added 2026-10-06, `tests/test_levers_2.py`) the second set: the scheduled disaggregated pools at default levers
+  bit-identical to the old ones, memory never over-committed in either pool, the hand-off waiting for decode blocks,
+  the prefill pool's cache, every unsupported combination raising, Leviathan et al.'s closed forms (their Table 1 to
+  the printed digits, the acceptance draws converging, a verify step's FLOPs), the all-reduce, pipeline and
+  all-to-all costs, per-GPU memory, the MoE expert count, the formats, and JS parity on 22 configurations.
 * Every number below comes from [`examples/results.md`](examples/results.md),
   written by `examples/results.py`.
 
@@ -89,7 +108,7 @@ queueing theory.
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .[dev]
-pytest                                   # 203 tests, about a minute
+pytest                                   # 267 tests, about a minute
 
 disagg-sim                               # one disaggregated run (70B, 4xH100 per instance)
 disagg-sim --compare                     # colocated vs disaggregated, same request stream
@@ -110,7 +129,7 @@ disagg-sim --model llama3-8b --devices-per-instance 1 --link eth-25g --rate 14 -
 disagg-sim --model llama3-70b-ced --prompt 8192 --output 128 --rate 3
 disagg-sim --model llama3-70b-ced --ced-replay-on decode --prefill-devices-per-instance 2 --prompt 8192 --output 128 --rate 3
 
-# scheduling and KV memory (colocated): chunked prefill, paged KV with preemption, prefix caching
+# scheduling and KV memory: chunked prefill, paged KV with preemption, prefix caching (colocated or disaggregated)
 disagg-sim --mode colocated --model mistral-7b --device a100 --devices-per-instance 1 --prefill 1 --decode 0 \
            --prompt 2666 --prompt-cv 1.17 --output 481 --output-cv 0.59 --rate 2 --batch-policy chunked --max-num-batched-tokens 512
 disagg-sim --mode colocated --model opt-13b --device a100-40g --devices-per-instance 1 --prefill 1 --decode 0 \
@@ -118,8 +137,16 @@ disagg-sim --mode colocated --model opt-13b --device a100-40g --devices-per-inst
 disagg-sim --mode colocated --model mistral-7b --device a100 --devices-per-instance 1 --prefill 1 --decode 0 \
            --prompt 384 --prompt-cv 0.19 --output 6 --output-cv 0.19 --turns 4 --rate 4 --prefix-caching
 
+# levers II: parallelism, formats, speculative decoding, named workloads; the sweep
+disagg-sim --model opt-13b --device a100-40g --devices-per-instance 1 --prompt 161 --prompt-cv 1 --output 338 \
+           --output-cv 1 --rate 4 --kv-policy paged
+disagg-sim --mode colocated --model llama3-70b --tp 4 --weight-format fp8 --compute-format fp8 --workload chat --rate 2
+disagg-sim --mode colocated --model llama3-8b --devices-per-instance 1 --speculative mtp --gamma 3 --alpha 0.7 --rate 1
+disagg-sim --mode colocated --model mixtral-8x7b --devices-per-instance 2 --tp 2 --ep 2 --expert-imbalance 1.25
+
 python examples/benchmark_acceleration.py   # measure every acceleration technique
 python examples/results.py               # regenerate examples/results.md (every quoted number)
+python examples/tradeoffs.py             # the trade-off sweep -> examples/tradeoffs.json (about an hour, 2 workers)
 ```
 
 Example report (`disagg-sim --prefill 2 --rate 6 --link eth-25g`):
@@ -136,9 +163,10 @@ hot-spot     stage=kv_wait -> kv-link (busy 96%)   busy>90%: decode-0, kv-link
 
 | Module | Role |
 |--------|------|
-| `src/disagg_sim/hardware.py` | `ModelSpec`, `Accelerator`, `Link`, and the roofline `CostModel` (the only place that knows about time) |
-| `src/disagg_sim/workload.py` | `Request` and all its timestamps; lognormal lengths; Poisson arrivals; sessions with shared prefixes (`chat_sessions`); JSON replay |
-| `src/disagg_sim/sim.py` | SimPy processes for prefill, decode and colocated instances; the KV link as a `simpy.Resource`; routers; `FastDecodeInstance`; `ScheduledInstance` (batching policy, paged KV, preemption) and `PrefixCache` |
+| `src/disagg_sim/hardware.py` | `ModelSpec`, `Accelerator`, `Link`, `Parallel`, storage formats, and the roofline `CostModel` (the only place that knows about time) |
+| `src/disagg_sim/workload.py` | `Request` and all its timestamps; lognormal lengths; Poisson arrivals; sessions with shared prefixes (`chat_sessions`); named workloads (`WORKLOADS`); JSON replay |
+| `src/disagg_sim/sim.py` | SimPy processes for prefill, decode and colocated instances; the KV link as a `simpy.Resource`; routers; `FastDecodeInstance`; `ScheduledInstance` (batching policy, paged KV, preemption, speculative decoding), its pool versions `ScheduledPrefillInstance` / `ScheduledDecodeInstance`, and `PrefixCache` |
+| `src/disagg_sim/speculative.py` | Speculative decoding: Leviathan et al.'s closed forms and the acceptance draws (bit-identical in JS) |
 | `src/disagg_sim/metrics.py` | Percentiles, goodput, utilisation, MFU/MBU, stage breakdown, hot-spot attribution, Little's law |
 | `src/disagg_sim/ppa.py` | Area, silicon cost and perf/W, perf/mm², perf/$ per pool (FHE_Accelerator_Sim's method, illustrative) |
 | `src/disagg_sim/trace.py` | Chrome trace-event export |
@@ -147,6 +175,7 @@ hot-spot     stage=kv_wait -> kv-link (busy 96%)   busy>90%: decode-0, kv-link
 | `web/sim_engine.js` | The browser port used in the deck |
 | `examples/benchmark_acceleration.py` | Speed and exactness of each acceleration technique |
 | `examples/results.py` | Regenerates `examples/results.md`, the source of every quoted number (with before/after for the 2026-10-03 correction) |
+| `examples/tradeoffs.py` | The trade-off sweep: levers × workloads × hardware → `examples/tradeoffs.json` (every metric, Pareto flags, effects) |
 | `tests/` | The verification ladder |
 
 ### Measured acceleration (i7-3770, 8 threads, Python 3.12, SimPy 4.1, power model on)
@@ -235,6 +264,31 @@ Validated against their papers, colocated instances; section 22 lists what repro
 All coefficients are the simulator's illustrative roofline ones; the papers measured real systems on other models
 and traces, so only orderings and ranges are compared.
 
+### Levers II and the trade-off sweep (results.md sections 23–26)
+
+* **The levers in disaggregated pools** (OPT-13B, one A100-40GB per instance, ShareGPT lengths, 4 req/s): a 1P1D
+  decode pool with reserved KV moves 652 output tok/s with TTFT p99 80,827 ms (prefills wait for decode memory); with
+  paged KV and recompute 836 tok/s and TTFT p99 156.2 ms, 652 preemptions. Prefix caching in the prefill pool hits
+  65.8% of prompt tokens on 4-turn chat against 74.6% colocated: replies are generated on the decode pool, so the next
+  turn recomputes them.
+* **Parallelism** (Llama-3-70B, H100s): a batch-1 decode step takes 18.3 ms on TP4 and 18.2 ms on TP8, 61.5% of it
+  all-reduce (first-order α-β cost, latency-bound at small batch). On 4 GPUs a 64-row decode step is 22.8 ms on TP4
+  and 48.1 ms on TP2 × PP2 with 2 micro-batches (the weights are re-read per micro-batch; no cross-step pipelining).
+  Mixtral-8x7B: one decode token touches 2.00 experts per layer, 16 tokens 7.92; an expert imbalance of 1.5 under EP2
+  stretches a prefill from 211.5 ms to 296.4 ms.
+* **Formats** (Llama-3-70B, 4 GPUs, accuracy not simulated): FP8 W8A8 halves the 8,192-token prefill on H100 (564.3 →
+  282.4 ms) and cuts a batch-1 decode step from 13.5 to 7.0 ms; INT4 weight-only 3.9 ms but keeps the BF16 prefill;
+  FP4 W4A4 on B200 prefills in 62.5 ms.
+* **Speculative decoding**: the closed forms reproduce Leviathan et al.'s Table 1 to the printed digits; simulated
+  tokens per verify pass are within 0.8% of their equation (1); simulated low-load speed-ups match their Theorem 3.8
+  (Llama-3-70B, MTP draft, α 0.8, γ 5: 3.26× predicted and simulated). It hurts when the verify pass turns
+  compute-bound: Llama-3-8B on an A100 at batch 512, 512-token contexts, 0.60×.
+* **The sweep** (8 GPUs, Llama-3-70B; 24 levers × 5 workloads × H100/H200/B200; 350 points in 56 min): on chat the
+  H100 baseline serves 1.420 req/s per GPU within SLO; chunked 2048 + paged + prefix cache + FP8 raises that by
+  +361%. Disaggregation with paged decode and a prefix-cached prefill pool gives +2577% on real-time voice (a 25 ms
+  TPOT SLO that prefill stalls break) but -33% on offline batch. A 512-token chunk budget helps chat (+28%) and hurts
+  the coding agent (-24%). Prices per GPU-hour and α are illustrative parameters.
+
 **Ports.** JavaScript: everything, bit-exact. Rust
 ([Rust_DES_Kernel](https://github.com/BrendanJamesLynskey/Rust_DES_Kernel)): heterogeneous pools only,
 bit-exact; the FFT-mixing models, the optical transform engine, KV hand-off compression and the CED option
@@ -242,23 +296,37 @@ are **Python and JS only, not in the Rust port**; the Rust side rejects the firs
 `*-ced` models as unknown models. The scheduling and KV-memory levers (sections 19–21) are also **Python and JS
 only**: the JS port is bit-exact on every one of them, and Rust_DES_Kernel rejects a configuration that turns any of
 them on ("... are Python and JS only, not in the Rust port"), closed-loop sessions and the validation presets
-included.
+included. So are the brief-20A2 levers (the levers in disaggregated pools, parallelism, formats, speculative
+decoding, `mixtral-8x7b`, `llama3.2-1b`, `h200`, `b200`): bit-exact in JS (22 more parity configurations), rejected
+by Rust through `SimConfig.lever_summary`.
 
 `examples/results.py --keep-timings` regenerates sections 1–8 and 10–22 and keeps section 9 (wall
 clock) from the previous run; `--optical-from-json` re-renders 10–15 from `examples/results_optical.json`,
-`--ced-from-json` re-renders 16–18 from `examples/results_ced.json` and `--levers-from-json` re-renders 19–22
-from `examples/results_levers.json`.
+`--ced-from-json` re-renders 16–18 from `examples/results_ced.json`, `--levers-from-json` re-renders 19–22
+from `examples/results_levers.json` and `--levers2-from-json` re-renders 23–25 from `examples/results_levers2.json`.
+Section 26 is always rendered from `examples/tradeoffs.json`, which only `examples/tradeoffs.py` writes.
 
 ---
 
 ## Modelling assumptions (read before trusting a number)
 
-* A tensor-parallel group is treated as one larger device; **no all-reduce cost**.
+* By default a tensor-parallel group is treated as one larger device, with **no all-reduce cost**. With
+  `--tp/--pp/--ep` (brief 20A2) the communication is priced first-order: α-β ring all-reduces (2(n−1) latencies
+  of the link's 5 µs each, so small steps are latency-bound and TP8 is pessimistic against NVSwitch systems'
+  in-switch reductions), not overlapped with compute; pipeline stages run GPipe micro-batches within a step, with
+  no pipelining across steps (serving engines keep several batches in flight), so pipeline parallelism shows its
+  cost and not its throughput; expert load imbalance stretches only expert FLOPs.
+* Storage formats change bytes (block scales included) and, on a device with units for the compute format, the
+  FLOP rate and energy per FLOP (iso-power); weight-only formats dequantise for free. **Accuracy is not simulated.**
+* Speculative decoding accepts each drafted token independently with probability α (Leviathan et al.'s
+  assumption); α is a parameter, not a property of the draft. A verify pass's tokens arrive together (their ITLs
+  after the first are 0).
 * KV is transferred **after** the whole prefill (no layer-wise streaming), FCFS over
   `channels` independent link channels.
 * By default each sequence reserves its full KV (prompt + output) at admission, with no
   pre-emption, swapping, prefix caching or chunked prefill. The brief-20A1 levers add those to
-  **colocated** instances only (disaggregated pools keep whole prompts and reserved KV). They are
+  colocated instances and (brief 20A2) to disaggregated pools, where the prefill pool's cache holds prompt
+  segments but not replies (they are generated on the decode pool). They are
   roofline-priced: chunking costs only its weight and KV re-reads plus the step overhead (no kernel
   or tile-quantisation penalty, so chunking overhead is far below Sarathi-Serve's measured ~25% at
   512 tokens); paged attention has no kernel slowdown; swapping costs blocks × link latency + bytes /
