@@ -56,6 +56,11 @@ Added 2026-10-06 (brief 20A2), all off by default:
   draft's weights and KV cache share the instance's memory (``draft``). The schedule is in ``sim.py``.
 * Presets: H200 and B200 (datasheet figures; B200's power coefficients illustrative), NVLink 3 and 5 links,
   Mixtral-8x7B, and Llama-3.2-1B as a draft for the Llama-3 family (same 128,256-token vocabulary).
+
+Added 2026-10-11 (Compute in Transit brief 06C), off by default: ``LinkKernel``, the in-transit stage as a declared
+link kernel (operation set with no comparisons, precision in bit planes, compression ratio, placement in a pluggable
+or a switch; port / optics / compute budget / FPGA stages, the slowest binding; static + laser + dynamic energy),
+calibrated illustratively to a photonic link module (Kundu et al., arXiv:2608.21536). ``KVTransit.kernel`` selects it.
 """
 
 from __future__ import annotations
@@ -754,10 +759,17 @@ class KVTransit:
     pj_per_bit: float = 1.0
     latency: float = 1e-6
     native_fft: bool = True
+    # Brief 06C: the stage as a declared link kernel (``LinkKernel``). None (the default) keeps the model above
+    # exactly; set, it replaces ``ops_per_byte``, ``pj_per_bit``, ``latency`` and ``native_fft`` (Python only).
+    kernel: LinkKernel | None = None
 
     def __post_init__(self):
         if self.where not in ("transit", "endpoint"):
             raise ValueError(f"unknown kv compression site {self.where!r}")
+        if self.kernel is not None:
+            if self.where != "transit":
+                raise ValueError("a link kernel compresses in transit: not with where='endpoint'")
+            self.kernel.check(kv_work(self.compression, 2, self.kernel.planes))
 
     def ops(self, nbytes: float, prompt_len: int, kv_bytes: float, on_gpu: bool) -> float:
         """Operations to compress ``nbytes`` of hand-off."""
@@ -767,6 +779,229 @@ class KVTransit:
         if c.fft and (on_gpu or not self.native_fft):
             per = per + c.fft_ops_per_value(prompt_len)
         return per * values
+
+
+# ─────────────────────────────────── link kernel: compute in transit, declared (brief 06C) ──
+# A general model of an in-transit stage: which operations it has, how fast each of its pipelined stages
+# runs, and what it costs in energy. Off by default (``KVTransit.kernel = None``); Python only (the JS port does
+# not model it, and the Rust port rejects any ``kv_transit``). Calibrated to a photonic link module (Kundu et
+# al., arXiv:2608.21536) with the definitions of the Compute in Transit hub's ``analysis/cit_budget.py`` and of
+# Training_Transit_Sim's module model, both of which pin this simulator at 69ffd2b:
+#
+# * port rate 25 GB/s: QSFP56 (200 Gb/s), the module's host port in the paper;
+# * optics 56 Gb/s: four modulators at 14 GBaud with NRZ input (the paper's section II). 4 x 14 Gb/s = 7 GB/s is
+#   the series' arithmetic, not a figure the paper states. A value quantised to ``planes`` bits takes ``planes``
+#   symbols (one optical pass per bit plane);
+# * compute budget 10 or 99 GFLOP/s: the series' bracket on the paper's "tens of GFLOPs", a reading, not a
+#   measurement: 0.40-3.96 operations per byte at the port, 1.43-14.14 at the optics. Whether the optical
+#   transform is charged against it is not public, so it is a switch (``transform_charged``);
+# * operations: FFT and NTT (radix-4), add and subtract, multiply, MAC, floating-point MAC, modular arithmetic (in
+#   the FPGA driver logic), plus gathers (a fixed selection: no arithmetic). No comparisons and no rounding, so
+#   top-k and requantisation are refused;
+# * static 9.7 W (the paper); dynamic 2.76 pJ per input bit (the developer's website: estimated for 45 nm silicon
+#   photonics, excluding the laser);
+# * laser power, FPGA rate, FPGA work per value and latency: illustrative.
+#
+# FLOPs of a length-n transform: 2.5 log2 n per value (FFTW's convention, as ``rfft_flops``); a separable 2-D
+# c x c transform: 2 x 2.5 log2 c per value.
+LINK_OP_TYPES = ("fft", "ntt", "add", "mul", "mac", "fp_mac", "modular", "gather", "compare", "round")
+LINK_OPTICAL_OPS = ("fft", "ntt")                    # the optical transform (charged or not)
+LINK_DIGITAL_OPS = ("add", "mul", "mac", "fp_mac")   # charged against the compute budget
+LINK_FPGA_OPS = ("modular",)                         # the FPGA stage
+PUBLISHED_LINK_OPS = frozenset(LINK_OPTICAL_OPS + LINK_DIGITAL_OPS + LINK_FPGA_OPS + ("gather",))
+
+
+def transform_per_value(n: int) -> float:
+    """FLOPs per value of a length-n transform (n a power of two): 2.5 log2 n, log2 as an integer."""
+    return 2.5 * (n.bit_length() - 1)
+
+
+@dataclass(frozen=True)
+class KernelWork:
+    """What a link kernel is asked to do to a stream: operations per input value by type, the compression ratio
+    (bytes in / bytes out), how many streams it combines at one point, and the FPGA stage's work.
+
+    Counts are per value of one input stream (BF16: 2 bytes), as in the hub's ledger: summing two streams is one
+    add per value, 0.5 per byte (Training_Transit_Sim counts the bytes of both streams: 0.25)."""
+
+    name: str
+    ops: tuple = ()                   # ((operation type, operations per input value), ...)
+    ratio: float = 1.0
+    streams: int = 1                  # more than one: the streams must meet, so a switch, not a pluggable
+    fpga_ops_per_value: float = 0.0   # digital work around the optics: quantise, rescale, recombine (illustrative)
+    bytes_per_value: float = 2.0      # BF16 in
+
+    def __post_init__(self):
+        bad = {k for k, _ in self.ops} - set(LINK_OP_TYPES)
+        if bad:
+            raise ValueError(f"unknown operation types {sorted(bad)}")
+
+    def needs(self) -> frozenset:
+        return frozenset(k for k, _ in self.ops)
+
+    def per_byte(self, kinds) -> float:
+        return sum(v for k, v in self.ops if k in kinds) / self.bytes_per_value
+
+    @property
+    def transform_per_byte(self) -> float:
+        return self.per_byte(LINK_OPTICAL_OPS)
+
+    @property
+    def other_per_byte(self) -> float:
+        """Everything that is neither the transform nor FPGA work (the hub's "other")."""
+        return self.per_byte(set(LINK_OP_TYPES) - set(LINK_OPTICAL_OPS) - set(LINK_FPGA_OPS))
+
+    @property
+    def fpga_per_byte(self) -> float:
+        return self.per_byte(LINK_FPGA_OPS) + self.fpga_ops_per_value / self.bytes_per_value
+
+    @property
+    def optical(self) -> bool:
+        return any(k in LINK_OPTICAL_OPS for k, _ in self.ops)
+
+
+def band_work(n: int, keep: float, planes: int = 8) -> KernelWork:
+    """A length-n transform of each chunk keeping a fixed band (a gather): Training_Transit_Sim's ``band_kernel``.
+    The FPGA stage (illustrative) quantises each value to ``planes`` bits (1 multiply), tracks the full scale (1
+    multiply-accumulate) and recombines the ``planes`` bit-plane outputs of each kept value."""
+    return KernelWork(f"1-D transform, length {n}, keep {keep:g}", (("fft", transform_per_value(n)), ("gather", 0.0)),
+                      ratio=1 / keep, fpga_ops_per_value=2.0 + planes * keep)
+
+
+def kv_work(c: KVCompression, prompt_len: int, planes: int = 8) -> KernelWork:
+    """A KV hand-off compression as link-kernel work. ``freq-keep-k``: a transform along the token axis (length
+    the next power of two) keeping a fixed band. Quantising presets need a block maximum (a comparison) and
+    rounding, which the module lacks (the hub's "Requantise BF16 to FP8": 2 operations per value)."""
+    if c.fft:
+        w = band_work(pow2_at_least(prompt_len), 1 / c.ratio, planes)
+        return replace(w, name=c.name)
+    if c.ratio == 1.0 and not c.ops_per_value:
+        return KernelWork(c.name)
+    return KernelWork(c.name, (("compare", 1.0), ("mul", 1.0), ("round", 0.0)), ratio=c.ratio)
+
+
+# The hub's kernel ledger (``analysis/cit_budget.py``, ``kernels()``), as declared work.
+CIT_LEDGER = (
+    KernelWork("Sum two gradient streams (in-network aggregation)", (("add", 1.0),), streams=2),
+    *(KernelWork(f"1-D FFT, length {n}, keep a fixed band", (("fft", transform_per_value(n)), ("gather", 0.0)))
+      for n in (8, 64, 1024)),
+    *(KernelWork(f"2-D DCT of {c}x{c} chunks, keep a fixed band (DeMo-like)",
+                 (("fft", 2 * transform_per_value(c)), ("gather", 0.0))) for c in (16, 64)),
+    KernelWork("2-D DCT of 64x64 chunks + top-k (DeMo as published)",
+               (("fft", 2 * transform_per_value(64)), ("compare", 2.0))),
+    KernelWork("Requantise BF16 to FP8 (per-block scale)", (("compare", 1.0), ("mul", 1.0), ("round", 0.0)), ratio=2.0),
+    KernelWork("Score a KV key against the query (dot product, head dim 128)", (("mul", 1.0), ("add", 1.0))),
+)
+
+
+@dataclass(frozen=True)
+class LinkKernel:
+    """A compute-in-transit stage as a link kernel: operation set, precision, rates, budget, power, placement.
+
+    A stream of b input bytes takes ``link latency + latency + max(stage times)``: the link (b / ratio on the
+    wire), the module's port (b / port rate), its optics (values x planes / optics bit rate, if the work uses the
+    transform), its compute budget (charged operations / GFLOP/s) and its FPGA stage. The stages are pipelined, so
+    the slowest sets the rate and is reported as the binding stage. Energy while streaming: (static + laser)
+    power x streaming time + dynamic pJ per input bit; idle power between streams is not charged.
+
+    ``placement``: ``"pluggable"`` (in one host's port) or ``"switch"`` (at a switch port, where streams from
+    several hosts meet). Work that combines streams needs a switch."""
+
+    name: str = "photonic link module, pluggable, 10 GFLOP/s (illustrative)"
+    placement: str = "pluggable"
+    port_rate: float = 25 * GB             # QSFP56, bytes/s
+    optics_bits_per_s: float = 4 * 14e9    # 4 modulators x 14 GBaud NRZ (the series' arithmetic: 7 GB/s)
+    planes: int = 8                        # precision through the optics: bits per value, one pass per plane
+    gflops: float = 10e9                   # compute budget, FLOP/s (the series' bracket: 10 to 99)
+    transform_charged: bool = True         # is the optical transform charged against ``gflops``? (not public)
+    fpga_ops_per_s: float = 50e9           # illustrative
+    latency: float = 1e-6                  # illustrative, per stream
+    static_w: float = 9.7                  # the paper
+    laser_w: float = 2.0                   # illustrative
+    pj_per_bit: float = 2.76               # the developer's website (45 nm estimate, excluding the laser)
+    ops: frozenset = PUBLISHED_LINK_OPS
+
+    def __post_init__(self):
+        if self.placement not in ("pluggable", "switch"):
+            raise ValueError(f"unknown placement {self.placement!r}")
+        if self.planes < 1:
+            raise ValueError("planes must be at least 1")
+        bad = set(self.ops) - set(LINK_OP_TYPES)
+        if bad:
+            raise ValueError(f"unknown operation types {sorted(bad)}")
+
+    @property
+    def optics_rate(self) -> float:
+        """The optics' own bit stream in bytes/s (7 GB/s at the defaults)."""
+        return self.optics_bits_per_s / 8
+
+    @property
+    def budget(self) -> float:
+        """Operations per byte at the port's line rate (0.40 at 10 GFLOP/s, 3.96 at 99)."""
+        return self.gflops / self.port_rate
+
+    @property
+    def optics_budget(self) -> float:
+        """Operations per byte at the optics' rate (1.43 at 10 GFLOP/s, 14.14 at 99)."""
+        return self.gflops / self.optics_rate
+
+    def check(self, work: KernelWork) -> None:
+        """Refuse work that needs an operation the kernel lacks, or streams a pluggable cannot see."""
+        missing = work.needs() - self.ops
+        if missing:
+            why = " (no comparisons: top-k and block maxima need them)" if "compare" in missing else ""
+            raise ValueError(f"{work.name!r} needs {sorted(missing)}, which the link kernel {self.name!r} "
+                             f"does not have{why}")
+        if work.streams > 1 and self.placement != "switch":
+            raise ValueError(f"{work.name!r} combines {work.streams} streams: they meet at a switch, "
+                             "not in a pluggable")
+
+    def charged_per_byte(self, work: KernelWork) -> float:
+        """Operations per input byte charged against the compute budget."""
+        return work.other_per_byte + (work.transform_per_byte if self.transform_charged else 0.0)
+
+    def fits(self, work: KernelWork) -> bool:
+        """Does the work fit the budget at the port's line rate?"""
+        return self.charged_per_byte(work) <= self.budget
+
+    def stage_times(self, nbytes: float, work: KernelWork) -> dict:
+        """Seconds each of the module's pipelined stages needs for ``nbytes`` of input (latency excluded)."""
+        values = nbytes / work.bytes_per_value
+        return {
+            "module port": nbytes / self.port_rate,
+            "module optics": values * self.planes / self.optics_bits_per_s if work.optical else 0.0,
+            "module compute": nbytes * self.charged_per_byte(work) / self.gflops,
+            "FPGA": nbytes * work.fpga_per_byte / self.fpga_ops_per_s,
+        }
+
+    def stream(self, nbytes: float, work: KernelWork, link: Link) -> tuple[float, str, dict]:
+        """(seconds, binding stage, every stage's seconds) for one stream through the module onto ``link``."""
+        st = {"link": nbytes / work.ratio / link.bandwidth, **self.stage_times(nbytes, work)}
+        stage = max(st, key=st.get)            # ties go to the link (listed first): not module-bound
+        return link.latency + self.latency + st[stage], stage, st
+
+    def energy(self, nbytes: float, seconds: float) -> dict:
+        """Joules for one stream of ``nbytes`` input that keeps the module busy for ``seconds``."""
+        return {"static": self.static_w * seconds, "laser": self.laser_w * seconds,
+                "dynamic": nbytes * 8 * self.pj_per_bit * 1e-12}
+
+
+def link_kernel(placement: str = "pluggable", gflops: float = 10e9, transform_charged: bool = True,
+                **kw) -> LinkKernel:
+    """A named LinkKernel (illustrative; a photonic link module, Kundu et al., arXiv:2608.21536)."""
+    name = (f"photonic link module, {placement}, {gflops / 1e9:g} GFLOP/s"
+            + ("" if transform_charged else ", transform free") + " (illustrative)")
+    return LinkKernel(name=name, placement=placement, gflops=gflops, transform_charged=transform_charged, **kw)
+
+
+LINK_KERNELS = {
+    "pluggable-10": link_kernel("pluggable", 10e9),
+    "pluggable-99": link_kernel("pluggable", 99e9),
+    "pluggable-10-free": link_kernel("pluggable", 10e9, transform_charged=False),
+    "pluggable-99-free": link_kernel("pluggable", 99e9, transform_charged=False),
+    "switch-10": link_kernel("switch", 10e9),
+    "switch-99": link_kernel("switch", 99e9),
+}
 
 
 # ───────────────────────────────────────────── parallelism (brief 20A2) ──

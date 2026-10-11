@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 import simpy
 
 from .hardware import (H100_SXM, LINKS, LLAMA3_70B, MODELS, QUANT_FORMATS, Accelerator, CostModel, KVTransit,
-                       LeverStepCost, Link, ModelSpec, Parallel, StepCost)
+                       LeverStepCost, Link, ModelSpec, Parallel, StepCost, kv_work)
 from .speculative import Speculative, draw_accepted, seed_state
 from .trace import Tracer
 from .workload import Request
@@ -1229,6 +1229,7 @@ class LinkStats:
     handoff_bytes: float = 0.0       # hand-off bytes before compression
     transit_j: float = 0.0           # in-transit stage energy
     transit_bound: int = 0           # transfers the in-transit stage's compute slowed
+    kernel_stages: dict = field(default_factory=dict)   # link kernel (brief 06C): binding stage -> transfers
 
 
 @dataclass
@@ -1493,6 +1494,14 @@ class Simulation:
         wire = nbytes / tr.compression.ratio
         if tr.where == "endpoint":            # compressed on the GPU already
             return link.transfer_time(wire), wire, wire * 8 * link.pj_per_bit * 1e-12, 0.0, False
+        if tr.kernel is not None:             # brief 06C: a declared link kernel; its slowest stage sets the time
+            k = tr.kernel
+            t, stage, st = k.stream(nbytes, kv_work(tr.compression, r.prompt_len, k.planes), link)
+            e = k.energy(nbytes, st[stage])
+            ks = self.link_stats.kernel_stages
+            ks[stage] = ks.get(stage, 0) + 1
+            return (t, wire, wire * 8 * link.pj_per_bit * 1e-12, e["static"] + e["laser"] + e["dynamic"],
+                    stage != "link")
         # In transit: the stage streams at line rate with a budget of ops_per_byte per line
         # byte; if its work does not fit, its compute time sets the transfer time.
         t_wire = wire / link.bandwidth

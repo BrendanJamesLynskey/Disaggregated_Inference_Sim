@@ -142,6 +142,12 @@ def summarise(res: SimResult) -> dict:
             "handoff_GB": lk.handoff_bytes / 1e9,
             "transit_bound_frac": lk.transit_bound / lk.transfers if lk.transfers else 0.0,
             "transit_J": lk.transit_j}
+        if tr.kernel is not None:             # brief 06C: the declared link kernel
+            k = tr.kernel
+            out["kv_link"]["transit"]["kernel"] = {
+                "name": k.name, "placement": k.placement, "gflops": k.gflops, "planes": k.planes,
+                "transform_charged": k.transform_charged, "ops_per_byte_port": k.budget,
+                "ops_per_byte_optics": k.optics_budget, "binding_stages": dict(lk.kernel_stages)}
     return out
 
 
@@ -314,6 +320,10 @@ def format_report(m: dict) -> str:
         lines.append(f"kv hand-off  {t['preset']} at {t['where']} (ratio {t['ratio']:.2f}): "
                      f"{t['handoff_GB']:.1f} GB -> {m['kv_link']['bytes_GB']:.1f} GB on the link, "
                      f"transit-bound {100 * t['transit_bound_frac']:.0f}% of transfers, stage {t['transit_J']:,.1f} J")
+        if "kernel" in t:
+            k = t["kernel"]
+            lines.append(f"link kernel  {k['name']}: {k['ops_per_byte_port']:.2f} ops/byte at the port, binding "
+                         + ", ".join(f"{s} {n}" for s, n in k["binding_stages"].items()))
     if "scheduler" in m:
         s = m["scheduler"]
         line = (f"scheduler    {s['batch_policy']} (budget {s['token_budget']:,} tokens), KV {s['kv_policy']}"

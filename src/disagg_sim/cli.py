@@ -7,6 +7,7 @@
     disagg-sim --model llama3-8b --devices-per-instance 1 --prefill-device h100 --decode-device a100
     disagg-sim --model llama3-8b-hyena-circ --devices-per-instance 1 --prefill-device optical-fft --decode-device h100
     disagg-sim --model llama3-8b --devices-per-instance 1 --link eth-25g --kv-compress fp8 --kv-compress-at transit
+    disagg-sim --model llama3-8b --devices-per-instance 1 --link ib-ndr --kv-compress freq-keep-k --link-kernel pluggable-99-free
     disagg-sim --model llama3-70b-ced --ced-replay-on decode --prefill-devices-per-instance 2
     disagg-sim --mode colocated --model llama3-8b --devices-per-instance 1 --batch-policy chunked --max-num-batched-tokens 512
     disagg-sim --mode colocated --model opt-13b --device a100-40g --devices-per-instance 1 --kv-policy paged --preemption swap
@@ -22,7 +23,7 @@ import argparse
 import json
 from dataclasses import replace
 
-from .hardware import ACCELERATORS, KV_PRESETS, LINKS, MODELS, QUANT_FORMATS, KVTransit, Parallel
+from .hardware import ACCELERATORS, KV_PRESETS, LINK_KERNELS, LINKS, MODELS, QUANT_FORMATS, KVTransit, Parallel
 from .metrics import format_report, summarise
 from .ppa import ppa_report
 from .sim import SimConfig, simulate
@@ -88,6 +89,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--kv-keep", type=float, help="freq-keep-k: fraction of frequency bins kept (default 0.5)")
     g.add_argument("--transit-ops-per-byte", type=float, help="in-transit compute budget per line byte")
     g.add_argument("--transit-pj-per-bit", type=float, help="in-transit stage energy per input bit")
+    g.add_argument("--link-kernel", choices=LINK_KERNELS,
+                   help="model the in-transit stage as a declared link kernel (illustrative; Python only)")
     g = p.add_argument_group("Causal Encoder-Decoder (DeepSeek-V4.1-Flash, arXiv:2609.19969; *-ced models)")
     g.add_argument("--ced-encoder-layers", type=int, metavar="E",
                    help="make the bottom E layers a causal encoder (0: off; the *-ced models use half)")
@@ -177,6 +180,8 @@ def pick_device(key: str | None, over: dict, fft_eff: float | None = None):
 
 def kv_transit_from_args(a):
     if a.kv_compress is None:
+        if a.link_kernel is not None:
+            raise SystemExit("--link-kernel needs --kv-compress (the work it does to the hand-off)")
         return None
     c = KV_PRESETS[a.kv_compress]
     if a.kv_keep is not None:
@@ -188,7 +193,12 @@ def kv_transit_from_args(a):
         kw["ops_per_byte"] = a.transit_ops_per_byte
     if a.transit_pj_per_bit is not None:
         kw["pj_per_bit"] = a.transit_pj_per_bit
-    return KVTransit(c, where=a.kv_compress_at, **kw)
+    if a.link_kernel is not None:
+        kw["kernel"] = LINK_KERNELS[a.link_kernel]
+    try:
+        return KVTransit(c, where=a.kv_compress_at, **kw)
+    except ValueError as e:
+        raise SystemExit(str(e))
 
 
 def config_from_args(a) -> SimConfig:

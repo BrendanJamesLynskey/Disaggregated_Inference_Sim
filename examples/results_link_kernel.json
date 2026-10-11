@@ -1,0 +1,713 @@
+{
+ "presets": {
+  "pluggable-10": {
+   "name": "photonic link module, pluggable, 10 GFLOP/s (illustrative)",
+   "placement": "pluggable",
+   "gflops": 10000000000.0,
+   "charged": true,
+   "port": 0.4,
+   "optics": 1.4285714285714286,
+   "port_GBps": 25.0,
+   "optics_GBps": 7.0,
+   "planes": 8,
+   "static_w": 9.7,
+   "laser_w": 2.0,
+   "pj": 2.76,
+   "fpga_ops": 50000000000.0,
+   "latency_us": 1.0
+  },
+  "pluggable-99": {
+   "name": "photonic link module, pluggable, 99 GFLOP/s (illustrative)",
+   "placement": "pluggable",
+   "gflops": 99000000000.0,
+   "charged": true,
+   "port": 3.96,
+   "optics": 14.142857142857142,
+   "port_GBps": 25.0,
+   "optics_GBps": 7.0,
+   "planes": 8,
+   "static_w": 9.7,
+   "laser_w": 2.0,
+   "pj": 2.76,
+   "fpga_ops": 50000000000.0,
+   "latency_us": 1.0
+  },
+  "pluggable-10-free": {
+   "name": "photonic link module, pluggable, 10 GFLOP/s, transform free (illustrative)",
+   "placement": "pluggable",
+   "gflops": 10000000000.0,
+   "charged": false,
+   "port": 0.4,
+   "optics": 1.4285714285714286,
+   "port_GBps": 25.0,
+   "optics_GBps": 7.0,
+   "planes": 8,
+   "static_w": 9.7,
+   "laser_w": 2.0,
+   "pj": 2.76,
+   "fpga_ops": 50000000000.0,
+   "latency_us": 1.0
+  },
+  "pluggable-99-free": {
+   "name": "photonic link module, pluggable, 99 GFLOP/s, transform free (illustrative)",
+   "placement": "pluggable",
+   "gflops": 99000000000.0,
+   "charged": false,
+   "port": 3.96,
+   "optics": 14.142857142857142,
+   "port_GBps": 25.0,
+   "optics_GBps": 7.0,
+   "planes": 8,
+   "static_w": 9.7,
+   "laser_w": 2.0,
+   "pj": 2.76,
+   "fpga_ops": 50000000000.0,
+   "latency_us": 1.0
+  },
+  "switch-10": {
+   "name": "photonic link module, switch, 10 GFLOP/s (illustrative)",
+   "placement": "switch",
+   "gflops": 10000000000.0,
+   "charged": true,
+   "port": 0.4,
+   "optics": 1.4285714285714286,
+   "port_GBps": 25.0,
+   "optics_GBps": 7.0,
+   "planes": 8,
+   "static_w": 9.7,
+   "laser_w": 2.0,
+   "pj": 2.76,
+   "fpga_ops": 50000000000.0,
+   "latency_us": 1.0
+  },
+  "switch-99": {
+   "name": "photonic link module, switch, 99 GFLOP/s (illustrative)",
+   "placement": "switch",
+   "gflops": 99000000000.0,
+   "charged": true,
+   "port": 3.96,
+   "optics": 14.142857142857142,
+   "port_GBps": 25.0,
+   "optics_GBps": 7.0,
+   "planes": 8,
+   "static_w": 9.7,
+   "laser_w": 2.0,
+   "pj": 2.76,
+   "fpga_ops": 50000000000.0,
+   "latency_us": 1.0
+  }
+ },
+ "ledger": [
+  {
+   "kernel": "Sum two gradient streams (in-network aggregation)",
+   "transform": 0.0,
+   "other": 0.5,
+   "needs": [
+    "add"
+   ],
+   "streams": 2,
+   "refused": {
+    "pluggable": "'Sum two gradient streams (in-network aggregation)' combines 2 streams: they meet at a switch, not in a pluggable",
+    "switch": null
+   },
+   "fits_low": false,
+   "fits_high": true,
+   "fits_free_low": false
+  },
+  {
+   "kernel": "1-D FFT, length 8, keep a fixed band",
+   "transform": 3.75,
+   "other": 0.0,
+   "needs": [
+    "fft",
+    "gather"
+   ],
+   "streams": 1,
+   "refused": {
+    "pluggable": null,
+    "switch": null
+   },
+   "fits_low": false,
+   "fits_high": true,
+   "fits_free_low": true
+  },
+  {
+   "kernel": "1-D FFT, length 64, keep a fixed band",
+   "transform": 7.5,
+   "other": 0.0,
+   "needs": [
+    "fft",
+    "gather"
+   ],
+   "streams": 1,
+   "refused": {
+    "pluggable": null,
+    "switch": null
+   },
+   "fits_low": false,
+   "fits_high": false,
+   "fits_free_low": true
+  },
+  {
+   "kernel": "1-D FFT, length 1024, keep a fixed band",
+   "transform": 12.5,
+   "other": 0.0,
+   "needs": [
+    "fft",
+    "gather"
+   ],
+   "streams": 1,
+   "refused": {
+    "pluggable": null,
+    "switch": null
+   },
+   "fits_low": false,
+   "fits_high": false,
+   "fits_free_low": true
+  },
+  {
+   "kernel": "2-D DCT of 16x16 chunks, keep a fixed band (DeMo-like)",
+   "transform": 10.0,
+   "other": 0.0,
+   "needs": [
+    "fft",
+    "gather"
+   ],
+   "streams": 1,
+   "refused": {
+    "pluggable": null,
+    "switch": null
+   },
+   "fits_low": false,
+   "fits_high": false,
+   "fits_free_low": true
+  },
+  {
+   "kernel": "2-D DCT of 64x64 chunks, keep a fixed band (DeMo-like)",
+   "transform": 15.0,
+   "other": 0.0,
+   "needs": [
+    "fft",
+    "gather"
+   ],
+   "streams": 1,
+   "refused": {
+    "pluggable": null,
+    "switch": null
+   },
+   "fits_low": false,
+   "fits_high": false,
+   "fits_free_low": true
+  },
+  {
+   "kernel": "2-D DCT of 64x64 chunks + top-k (DeMo as published)",
+   "transform": 15.0,
+   "other": 1.0,
+   "needs": [
+    "compare",
+    "fft"
+   ],
+   "streams": 1,
+   "refused": {
+    "pluggable": "'2-D DCT of 64x64 chunks + top-k (DeMo as published)' needs ['compare'], which the link kernel 'photonic link module, pluggable, 10 GFLOP/s (illustrative)' does not have (no comparisons: top-k and block maxima need them)",
+    "switch": "'2-D DCT of 64x64 chunks + top-k (DeMo as published)' needs ['compare'], which the link kernel 'photonic link module, switch, 10 GFLOP/s (illustrative)' does not have (no comparisons: top-k and block maxima need them)"
+   },
+   "fits_low": false,
+   "fits_high": false,
+   "fits_free_low": false
+  },
+  {
+   "kernel": "Requantise BF16 to FP8 (per-block scale)",
+   "transform": 0.0,
+   "other": 1.0,
+   "needs": [
+    "compare",
+    "mul",
+    "round"
+   ],
+   "streams": 1,
+   "refused": {
+    "pluggable": "'Requantise BF16 to FP8 (per-block scale)' needs ['compare', 'round'], which the link kernel 'photonic link module, pluggable, 10 GFLOP/s (illustrative)' does not have (no comparisons: top-k and block maxima need them)",
+    "switch": "'Requantise BF16 to FP8 (per-block scale)' needs ['compare', 'round'], which the link kernel 'photonic link module, switch, 10 GFLOP/s (illustrative)' does not have (no comparisons: top-k and block maxima need them)"
+   },
+   "fits_low": false,
+   "fits_high": true,
+   "fits_free_low": false
+  },
+  {
+   "kernel": "Score a KV key against the query (dot product, head dim 128)",
+   "transform": 0.0,
+   "other": 1.0,
+   "needs": [
+    "add",
+    "mul"
+   ],
+   "streams": 1,
+   "refused": {
+    "pluggable": null,
+    "switch": null
+   },
+   "fits_low": false,
+   "fits_high": true,
+   "fits_free_low": false
+  }
+ ],
+ "refused_kv": {
+  "fp8": "'fp8' needs ['compare', 'round'], which the link kernel 'photonic link module, pluggable, 10 GFLOP/s (illustrative)' does not have (no comparisons: top-k and block maxima need them)",
+  "fp4-block": "'fp4-block' needs ['compare', 'round'], which the link kernel 'photonic link module, pluggable, 10 GFLOP/s (illustrative)' does not have (no comparisons: top-k and block maxima need them)"
+ },
+ "stream": {
+  "eth-25g|legacy": {
+   "t": 0.04297067296,
+   "stages": {
+    "link": 0.04294967296,
+    "section 15 stage": 0.0268435456
+   },
+   "binding": "link",
+   "energy": {
+    "dynamic": 0.002147483648
+   }
+  },
+  "eth-25g|pluggable-10": {
+   "t": 0.36911975199999997,
+   "stages": {
+    "link": 0.04294967296,
+    "module port": 0.01073741824,
+    "module optics": 0.019173961142857143,
+    "module compute": 0.369098752,
+    "FPGA": 0.01610612736
+   },
+   "binding": "module compute",
+   "energy": {
+    "static": 3.5802578943999994,
+    "laser": 0.738197504,
+    "dynamic": 0.005927054868479999
+   }
+  },
+  "eth-25g|pluggable-99": {
+   "t": 0.04297067296,
+   "stages": {
+    "link": 0.04294967296,
+    "module port": 0.01073741824,
+    "module optics": 0.019173961142857143,
+    "module compute": 0.03728270222222222,
+    "FPGA": 0.01610612736
+   },
+   "binding": "link",
+   "energy": {
+    "static": 0.41661182771199995,
+    "laser": 0.08589934592,
+    "dynamic": 0.005927054868479999
+   }
+  },
+  "eth-25g|pluggable-10-free": {
+   "t": 0.04297067296,
+   "stages": {
+    "link": 0.04294967296,
+    "module port": 0.01073741824,
+    "module optics": 0.019173961142857143,
+    "module compute": 0.0,
+    "FPGA": 0.01610612736
+   },
+   "binding": "link",
+   "energy": {
+    "static": 0.41661182771199995,
+    "laser": 0.08589934592,
+    "dynamic": 0.005927054868479999
+   }
+  },
+  "eth-25g|pluggable-99-free": {
+   "t": 0.04297067296,
+   "stages": {
+    "link": 0.04294967296,
+    "module port": 0.01073741824,
+    "module optics": 0.019173961142857143,
+    "module compute": 0.0,
+    "FPGA": 0.01610612736
+   },
+   "binding": "link",
+   "energy": {
+    "static": 0.41661182771199995,
+    "laser": 0.08589934592,
+    "dynamic": 0.005927054868479999
+   }
+  },
+  "eth-100g|legacy": {
+   "t": 0.01075841824,
+   "stages": {
+    "link": 0.01073741824,
+    "section 15 stage": 0.0067108864
+   },
+   "binding": "link",
+   "energy": {
+    "dynamic": 0.002147483648
+   }
+  },
+  "eth-100g|pluggable-10": {
+   "t": 0.36911975199999997,
+   "stages": {
+    "link": 0.01073741824,
+    "module port": 0.01073741824,
+    "module optics": 0.019173961142857143,
+    "module compute": 0.369098752,
+    "FPGA": 0.01610612736
+   },
+   "binding": "module compute",
+   "energy": {
+    "static": 3.5802578943999994,
+    "laser": 0.738197504,
+    "dynamic": 0.005927054868479999
+   }
+  },
+  "eth-100g|pluggable-99": {
+   "t": 0.03730370222222222,
+   "stages": {
+    "link": 0.01073741824,
+    "module port": 0.01073741824,
+    "module optics": 0.019173961142857143,
+    "module compute": 0.03728270222222222,
+    "FPGA": 0.01610612736
+   },
+   "binding": "module compute",
+   "energy": {
+    "static": 0.36164221155555554,
+    "laser": 0.07456540444444444,
+    "dynamic": 0.005927054868479999
+   }
+  },
+  "eth-100g|pluggable-10-free": {
+   "t": 0.019194961142857143,
+   "stages": {
+    "link": 0.01073741824,
+    "module port": 0.01073741824,
+    "module optics": 0.019173961142857143,
+    "module compute": 0.0,
+    "FPGA": 0.01610612736
+   },
+   "binding": "module optics",
+   "energy": {
+    "static": 0.18598742308571428,
+    "laser": 0.038347922285714285,
+    "dynamic": 0.005927054868479999
+   }
+  },
+  "eth-100g|pluggable-99-free": {
+   "t": 0.019194961142857143,
+   "stages": {
+    "link": 0.01073741824,
+    "module port": 0.01073741824,
+    "module optics": 0.019173961142857143,
+    "module compute": 0.0,
+    "FPGA": 0.01610612736
+   },
+   "binding": "module optics",
+   "energy": {
+    "static": 0.18598742308571428,
+    "laser": 0.038347922285714285,
+    "dynamic": 0.005927054868479999
+   }
+  },
+  "ib-ndr|legacy": {
+   "t": 0.00269535456,
+   "stages": {
+    "link": 0.00268435456,
+    "section 15 stage": 0.0016777216
+   },
+   "binding": "link",
+   "energy": {
+    "dynamic": 0.002147483648
+   }
+  },
+  "ib-ndr|pluggable-10": {
+   "t": 0.36910975199999996,
+   "stages": {
+    "link": 0.00268435456,
+    "module port": 0.01073741824,
+    "module optics": 0.019173961142857143,
+    "module compute": 0.369098752,
+    "FPGA": 0.01610612736
+   },
+   "binding": "module compute",
+   "energy": {
+    "static": 3.5802578943999994,
+    "laser": 0.738197504,
+    "dynamic": 0.005927054868479999
+   }
+  },
+  "ib-ndr|pluggable-99": {
+   "t": 0.03729370222222222,
+   "stages": {
+    "link": 0.00268435456,
+    "module port": 0.01073741824,
+    "module optics": 0.019173961142857143,
+    "module compute": 0.03728270222222222,
+    "FPGA": 0.01610612736
+   },
+   "binding": "module compute",
+   "energy": {
+    "static": 0.36164221155555554,
+    "laser": 0.07456540444444444,
+    "dynamic": 0.005927054868479999
+   }
+  },
+  "ib-ndr|pluggable-10-free": {
+   "t": 0.019184961142857143,
+   "stages": {
+    "link": 0.00268435456,
+    "module port": 0.01073741824,
+    "module optics": 0.019173961142857143,
+    "module compute": 0.0,
+    "FPGA": 0.01610612736
+   },
+   "binding": "module optics",
+   "energy": {
+    "static": 0.18598742308571428,
+    "laser": 0.038347922285714285,
+    "dynamic": 0.005927054868479999
+   }
+  },
+  "ib-ndr|pluggable-99-free": {
+   "t": 0.019184961142857143,
+   "stages": {
+    "link": 0.00268435456,
+    "module port": 0.01073741824,
+    "module optics": 0.019173961142857143,
+    "module compute": 0.0,
+    "FPGA": 0.01610612736
+   },
+   "binding": "module optics",
+   "energy": {
+    "static": 0.18598742308571428,
+    "laser": 0.038347922285714285,
+    "dynamic": 0.005927054868479999
+   }
+  }
+ },
+ "runs": {
+  "eth-25g|none": {
+   "ttft_p99": 0.3536255769527793,
+   "tpot_p99": 0.01156226322860324,
+   "slo": 1.0,
+   "j_tok": 0.32606879102094083,
+   "link_util": 0.6438583629251369,
+   "handoff_p99": 0.4719423627574439,
+   "transit_j_req": 0.0,
+   "transit_bound": 0.0,
+   "binding": {}
+  },
+  "eth-25g|legacy": {
+   "ttft_p99": 0.3536255769527793,
+   "tpot_p99": 0.00954803584137241,
+   "slo": 1.0,
+   "j_tok": 0.32568090674341627,
+   "link_util": 0.322641487523472,
+   "handoff_p99": 0.15702373265248007,
+   "transit_j_req": 0.00215223762944,
+   "transit_bound": 0.0,
+   "binding": {}
+  },
+  "eth-25g|pluggable-10": {
+   "ttft_p99": 0.3536255769527793,
+   "tpot_p99": 1.629806429167217,
+   "slo": 0.0,
+   "j_tok": 0.6967890764523107,
+   "link_util": 0.9903888093535699,
+   "handoff_p99": 208.2972953314749,
+   "transit_j_req": 4.600820186097255,
+   "transit_bound": 1.0,
+   "binding": {
+    "module compute": 800
+   }
+  },
+  "eth-25g|pluggable-99": {
+   "ttft_p99": 0.3536255769527793,
+   "tpot_p99": 0.009555035117692394,
+   "slo": 1.0,
+   "j_tok": 0.32766713486557475,
+   "link_util": 0.323887522828775,
+   "handoff_p99": 0.1604864759898222,
+   "transit_j_req": 0.51153861198956,
+   "transit_bound": 0.0525,
+   "binding": {
+    "link": 758,
+    "module compute": 42
+   }
+  },
+  "eth-25g|pluggable-10-free": {
+   "ttft_p99": 0.3536255769527793,
+   "tpot_p99": 0.00954803584137241,
+   "slo": 1.0,
+   "j_tok": 0.32764919163595835,
+   "link_util": 0.322641487523472,
+   "handoff_p99": 0.15702373265248007,
+   "transit_j_req": 0.5095637811462145,
+   "transit_bound": 0.0,
+   "binding": {
+    "link": 800
+   }
+  },
+  "eth-25g|pluggable-99-free": {
+   "ttft_p99": 0.3536255769527793,
+   "tpot_p99": 0.00954803584137241,
+   "slo": 1.0,
+   "j_tok": 0.32764919163595835,
+   "link_util": 0.322641487523472,
+   "handoff_p99": 0.15702373265248007,
+   "transit_j_req": 0.5095637811462145,
+   "transit_bound": 0.0,
+   "binding": {
+    "link": 800
+   }
+  },
+  "eth-100g|none": {
+   "ttft_p99": 0.3536255769527793,
+   "tpot_p99": 0.008990562191040972,
+   "slo": 1.0,
+   "j_tok": 0.3256403418418183,
+   "link_util": 0.161485322453722,
+   "handoff_p99": 0.07624261155839003,
+   "transit_j_req": 0.0,
+   "transit_bound": 0.0,
+   "binding": {}
+  },
+  "eth-100g|legacy": {
+   "ttft_p99": 0.3536255769527793,
+   "tpot_p99": 0.00887777127520597,
+   "slo": 1.0,
+   "j_tok": 0.32555922665681264,
+   "link_util": 0.08083926898703667,
+   "handoff_p99": 0.038154305779203965,
+   "transit_j_req": 0.00215223762944,
+   "transit_bound": 0.0,
+   "binding": {}
+  },
+  "eth-100g|pluggable-10": {
+   "ttft_p99": 0.3536255769527793,
+   "tpot_p99": 1.629806429167217,
+   "slo": 0.0,
+   "j_tok": 0.6967890764523107,
+   "link_util": 0.9903888093535699,
+   "handoff_p99": 208.2972953314749,
+   "transit_j_req": 4.600820186097255,
+   "transit_bound": 1.0,
+   "binding": {
+    "module compute": 800
+   }
+  },
+  "eth-100g|pluggable-99": {
+   "ttft_p99": 0.3536255769527793,
+   "tpot_p99": 0.009527820187841827,
+   "slo": 1.0,
+   "j_tok": 0.32750295645350974,
+   "link_util": 0.29734472115185395,
+   "handoff_p99": 0.15494543307879205,
+   "transit_j_req": 0.470069469820891,
+   "transit_bound": 1.0,
+   "binding": {
+    "module compute": 800
+   }
+  },
+  "eth-100g|pluggable-10-free": {
+   "ttft_p99": 0.3536255769527793,
+   "tpot_p99": 0.008984922222722297,
+   "slo": 1.0,
+   "j_tok": 0.3264715623688047,
+   "link_util": 0.14420875804890654,
+   "handoff_p99": 0.06808318889142677,
+   "transit_j_req": 0.23077214250411124,
+   "transit_bound": 1.0,
+   "binding": {
+    "module optics": 800
+   }
+  },
+  "eth-100g|pluggable-99-free": {
+   "ttft_p99": 0.3536255769527793,
+   "tpot_p99": 0.008984922222722297,
+   "slo": 1.0,
+   "j_tok": 0.3264715623688047,
+   "link_util": 0.14420875804890654,
+   "handoff_p99": 0.06808318889142677,
+   "transit_j_req": 0.23077214250411124,
+   "transit_bound": 1.0,
+   "binding": {
+    "module optics": 800
+   }
+  },
+  "ib-ndr|none": {
+   "ttft_p99": 0.3536255769527793,
+   "tpot_p99": 0.008836510168191468,
+   "slo": 1.0,
+   "j_tok": 0.3256000575459429,
+   "link_util": 0.04041942818124964,
+   "handoff_p99": 0.019075652889591656,
+   "transit_j_req": 0.0,
+   "transit_bound": 0.0,
+   "binding": {}
+  },
+  "ib-ndr|legacy": {
+   "ttft_p99": 0.3536255769527793,
+   "tpot_p99": 0.008826875760645983,
+   "slo": 1.0,
+   "j_tok": 0.3255442210213129,
+   "link_util": 0.020255010295966252,
+   "handoff_p99": 0.009555826444800084,
+   "transit_j_req": 0.00215223762944,
+   "transit_bound": 0.0,
+   "binding": {}
+  },
+  "ib-ndr|pluggable-10": {
+   "ttft_p99": 0.3536255769527793,
+   "tpot_p99": 1.6297608365816887,
+   "slo": 0.0,
+   "j_tok": 0.6967777565550483,
+   "link_util": 0.9903859758007634,
+   "handoff_p99": 208.28938523147428,
+   "transit_j_req": 4.600820186097255,
+   "transit_bound": 1.0,
+   "binding": {
+    "module compute": 800
+   }
+  },
+  "ib-ndr|pluggable-99": {
+   "ttft_p99": 0.3536255769527793,
+   "tpot_p99": 0.009527764392386865,
+   "slo": 1.0,
+   "j_tok": 0.3275029467558345,
+   "link_util": 0.2972698325261678,
+   "handoff_p99": 0.1549253330787858,
+   "transit_j_req": 0.470069469820891,
+   "transit_bound": 1.0,
+   "binding": {
+    "module compute": 800
+   }
+  },
+  "ib-ndr|pluggable-10-free": {
+   "ttft_p99": 0.3536255769527793,
+   "tpot_p99": 0.008984867286269894,
+   "slo": 1.0,
+   "j_tok": 0.32647155267112976,
+   "link_util": 0.144133808876541,
+   "handoff_p99": 0.0680531888914314,
+   "transit_j_req": 0.23077214250411124,
+   "transit_bound": 1.0,
+   "binding": {
+    "module optics": 800
+   }
+  },
+  "ib-ndr|pluggable-99-free": {
+   "ttft_p99": 0.3536255769527793,
+   "tpot_p99": 0.008984867286269894,
+   "slo": 1.0,
+   "j_tok": 0.32647155267112976,
+   "link_util": 0.144133808876541,
+   "handoff_p99": 0.0680531888914314,
+   "transit_j_req": 0.23077214250411124,
+   "transit_bound": 1.0,
+   "binding": {
+    "module optics": 800
+   }
+  }
+ },
+ "handoff_MB": 268.435456,
+ "fft_per_byte": 13.75
+}

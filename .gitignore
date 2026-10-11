@@ -11,3 +11,4 @@ __pycache__/
 !examples/results_levers.json
 !examples/results_levers2.json
 !examples/tradeoffs.json
+!examples/results_link_kernel.json

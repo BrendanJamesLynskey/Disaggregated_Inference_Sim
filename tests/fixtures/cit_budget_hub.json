@@ -1,0 +1,174 @@
+{
+ "source": "LLM_Hub_Compute_in_Transit analysis/results.json at de8f33b (written by analysis/cit_budget.py against Disaggregated_Inference_Sim 69ffd2b; floats rounded to 6 significant figures)",
+ "budget": [
+  {
+   "link": "QSFP56 200G",
+   "rate": 25000000000.0,
+   "claim": "low (10 GFLOP/s)",
+   "ops_per_byte": 0.4
+  },
+  {
+   "link": "QSFP56 200G",
+   "rate": 25000000000.0,
+   "claim": "high (99 GFLOP/s)",
+   "ops_per_byte": 3.96
+  },
+  {
+   "link": "400G",
+   "rate": 50000000000.0,
+   "claim": "low (10 GFLOP/s)",
+   "ops_per_byte": 0.2
+  },
+  {
+   "link": "400G",
+   "rate": 50000000000.0,
+   "claim": "high (99 GFLOP/s)",
+   "ops_per_byte": 1.98
+  },
+  {
+   "link": "800G",
+   "rate": 100000000000.0,
+   "claim": "low (10 GFLOP/s)",
+   "ops_per_byte": 0.1
+  },
+  {
+   "link": "800G",
+   "rate": 100000000000.0,
+   "claim": "high (99 GFLOP/s)",
+   "ops_per_byte": 0.99
+  },
+  {
+   "link": "Prototype optics (4 x 14 Gb/s NRZ)",
+   "rate": 7000000000.0,
+   "claim": "low (10 GFLOP/s)",
+   "ops_per_byte": 1.42857
+  },
+  {
+   "link": "Prototype optics (4 x 14 Gb/s NRZ)",
+   "rate": 7000000000.0,
+   "claim": "high (99 GFLOP/s)",
+   "ops_per_byte": 14.1429
+  }
+ ],
+ "qsfp56_range": [
+  0.4,
+  3.96
+ ],
+ "largest_fft_bf16": {
+  "low": null,
+  "high": 8
+ },
+ "prototype_optics": {
+  "rate": 7000000000.0,
+  "range": [
+   1.42857,
+   14.1429
+  ],
+  "share_of_qsfp56": 0.28,
+  "largest_fft_bf16": {
+   "low": 2,
+   "high": 2048
+  }
+ },
+ "kernels": [
+  {
+   "kernel": "Sum two gradient streams (in-network aggregation)",
+   "phase": "training",
+   "transform_per_byte": 0.0,
+   "other_per_byte": 0.5,
+   "in_set": true,
+   "note": "1 add per value; needs both streams at one point, so a switch, not a pluggable",
+   "fits_low": false,
+   "fits_high": true,
+   "fits_free_low": false
+  },
+  {
+   "kernel": "1-D FFT, length 8, keep a fixed band",
+   "phase": "training / inference",
+   "transform_per_byte": 3.75,
+   "other_per_byte": 0.0,
+   "in_set": true,
+   "note": "selection of a fixed band is a gather, no arithmetic",
+   "fits_low": false,
+   "fits_high": true,
+   "fits_free_low": true
+  },
+  {
+   "kernel": "1-D FFT, length 64, keep a fixed band",
+   "phase": "training / inference",
+   "transform_per_byte": 7.5,
+   "other_per_byte": 0.0,
+   "in_set": true,
+   "note": "selection of a fixed band is a gather, no arithmetic",
+   "fits_low": false,
+   "fits_high": false,
+   "fits_free_low": true
+  },
+  {
+   "kernel": "1-D FFT, length 1024, keep a fixed band",
+   "phase": "training / inference",
+   "transform_per_byte": 12.5,
+   "other_per_byte": 0.0,
+   "in_set": true,
+   "note": "selection of a fixed band is a gather, no arithmetic",
+   "fits_low": false,
+   "fits_high": false,
+   "fits_free_low": true
+  },
+  {
+   "kernel": "2-D DCT of 16x16 chunks, keep a fixed band (DeMo-like)",
+   "phase": "training",
+   "transform_per_byte": 10.0,
+   "other_per_byte": 0.0,
+   "in_set": true,
+   "note": "DeMo itself uses top-k, which needs comparisons",
+   "fits_low": false,
+   "fits_high": false,
+   "fits_free_low": true
+  },
+  {
+   "kernel": "2-D DCT of 64x64 chunks, keep a fixed band (DeMo-like)",
+   "phase": "training",
+   "transform_per_byte": 15.0,
+   "other_per_byte": 0.0,
+   "in_set": true,
+   "note": "DeMo itself uses top-k, which needs comparisons",
+   "fits_low": false,
+   "fits_high": false,
+   "fits_free_low": true
+  },
+  {
+   "kernel": "2-D DCT of 64x64 chunks + top-k (DeMo as published)",
+   "phase": "training",
+   "transform_per_byte": 15.0,
+   "other_per_byte": 1.0,
+   "in_set": false,
+   "note": "top-k: about 2 comparisons per value (illustrative)",
+   "fits_low": false,
+   "fits_high": false,
+   "fits_free_low": false
+  },
+  {
+   "kernel": "Requantise BF16 to FP8 (per-block scale)",
+   "phase": "training / inference",
+   "transform_per_byte": 0.0,
+   "other_per_byte": 1.0,
+   "in_set": false,
+   "note": "absmax, scale, round: rounding and comparison are not in the published set",
+   "fits_low": false,
+   "fits_high": true,
+   "fits_free_low": false
+  },
+  {
+   "kernel": "Score a KV key against the query (dot product, head dim 128)",
+   "phase": "inference",
+   "transform_per_byte": 0.0,
+   "other_per_byte": 1.0,
+   "in_set": true,
+   "note": "2 FLOPs per value; selecting the top blocks afterwards needs comparisons",
+   "fits_low": false,
+   "fits_high": true,
+   "fits_free_low": false
+  }
+ ]
+}

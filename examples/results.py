@@ -29,6 +29,10 @@ Sections 23-25 (added 2026-10-06, brief 20A2): the levers in disaggregated pools
 and speculative decoding against Leviathan et al. (arXiv:2211.17192); ``--levers2-from-json`` re-renders them from
 examples/results_levers2.json. Section 26 is rendered from examples/tradeoffs.json (written by examples/tradeoffs.py,
 the trade-off sweep), never rerun here.
+
+Section 27 (added 2026-10-11, Compute in Transit brief 06C): the link kernel, a declared in-transit stage, off by default
+and calibrated illustratively to a photonic link module (arXiv:2608.21536); ``--link-kernel-from-json`` re-renders it
+from examples/results_link_kernel.json.
 """
 
 from __future__ import annotations
@@ -1829,6 +1833,214 @@ def render_tradeoffs(t: dict) -> str:
     return "\n".join(L) + "\n"
 
 
+# ───────────────────────── section 27: the link kernel (Compute in Transit brief 06C) ──
+# A declared in-transit stage (``LinkKernel``), calibrated illustratively to a photonic link module (Kundu et al.,
+# arXiv:2608.21536) with the Compute in Transit hub's definitions (analysis/cit_budget.py). Off by default: nothing
+# in sections 1-26 uses it.
+LK_RATE, LK_N = 8.0, 800             # section 15's workload: Llama-3-8B shape, 1 device per instance, 1P1D
+LK_PRESETS = ["pluggable-10", "pluggable-99", "pluggable-10-free", "pluggable-99-free"]
+LK_LINKS = ["eth-25g", "eth-100g", "ib-ndr"]
+LK_PROMPT = 2048
+
+
+def collect_link_kernel() -> dict:
+    from disagg_sim.hardware import (CIT_LEDGER, KV_PRESETS, LINK_KERNELS, LINKS, MODELS, KVTransit, kv_work)
+    from disagg_sim.metrics import percentile, summarise
+    from disagg_sim.sim import SimConfig, simulate
+    from disagg_sim.workload import LengthDist, poisson_workload
+
+    out: dict = {"presets": {}, "ledger": [], "refused_kv": {}, "stream": {}, "runs": {}}
+    for key, k in LINK_KERNELS.items():
+        out["presets"][key] = {"name": k.name, "placement": k.placement, "gflops": k.gflops,
+                               "charged": k.transform_charged, "port": k.budget, "optics": k.optics_budget,
+                               "port_GBps": k.port_rate / 1e9, "optics_GBps": k.optics_rate / 1e9, "planes": k.planes,
+                               "static_w": k.static_w, "laser_w": k.laser_w, "pj": k.pj_per_bit,
+                               "fpga_ops": k.fpga_ops_per_s, "latency_us": k.latency * 1e6}
+    low, high, sw = LINK_KERNELS["pluggable-10"], LINK_KERNELS["pluggable-99"], LINK_KERNELS["switch-10"]
+    free = LINK_KERNELS["pluggable-10-free"]
+    for w in CIT_LEDGER:
+        refusal = {}
+        for k in (low, sw):
+            try:
+                k.check(w)
+                refusal[k.placement] = None
+            except ValueError as e:
+                refusal[k.placement] = str(e)
+        out["ledger"].append({"kernel": w.name, "transform": w.transform_per_byte, "other": w.other_per_byte,
+                              "needs": sorted(w.needs()), "streams": w.streams, "refused": refusal,
+                              "fits_low": low.fits(w), "fits_high": high.fits(w), "fits_free_low": free.fits(w)})
+    for pr in ("fp8", "fp4-block"):
+        try:
+            KVTransit(KV_PRESETS[pr], kernel=low)
+            out["refused_kv"][pr] = None
+        except ValueError as e:
+            out["refused_kv"][pr] = str(e)
+
+    # one 2,048-token GQA hand-off, stage by stage
+    m = MODELS["llama3-8b"]
+    nb = m.handoff_bytes(LK_PROMPT)
+    c = KV_PRESETS["freq-keep-k"]
+    out["handoff_MB"] = nb / 1e6
+    out["fft_per_byte"] = kv_work(c, LK_PROMPT).transform_per_byte
+    legacy = KVTransit(c)
+    for lk in LK_LINKS:
+        link = LINKS[lk]
+        wire = nb / c.ratio
+        t_wire = wire / link.bandwidth
+        t_ops = legacy.ops(nb, LK_PROMPT, m.kv_bytes, False) / (legacy.ops_per_byte * link.bandwidth)
+        out["stream"][f"{lk}|legacy"] = {"t": link.latency + legacy.latency + max(t_wire, t_ops),
+                                         "stages": {"link": t_wire, "section 15 stage": t_ops},
+                                         "binding": "link" if t_ops <= t_wire else "section 15 stage",
+                                         "energy": {"dynamic": nb * 8 * legacy.pj_per_bit * 1e-12}}
+        for key in LK_PRESETS:
+            k = LINK_KERNELS[key]
+            t, stage, st = k.stream(nb, kv_work(c, LK_PROMPT, k.planes), link)
+            out["stream"][f"{lk}|{key}"] = {"t": t, "stages": st, "binding": stage, "energy": k.energy(nb, st[stage])}
+
+    def go(tr, lk):
+        wl = poisson_workload(LK_RATE, LK_N, LengthDist(2048, 0.5), LengthDist(256, 0.5), seed=1)
+        cfg = SimConfig(model=m, devices_per_instance=1, link=LINKS[lk], kv_transit=tr, fast_forward=True)
+        res = simulate(cfg, wl)
+        s = summarise(res)
+        t = s["kv_link"].get("transit", {})
+        return {"ttft_p99": s["latency_s"]["ttft"]["p99"], "tpot_p99": s["latency_s"]["tpot"]["p99"],
+                "slo": s["throughput"]["slo_attainment"], "j_tok": s["energy"]["J_per_output_token"],
+                "link_util": s["utilisation"].get("kv-link", 0.0),
+                "handoff_p99": percentile([r.kv_ready - r.first_token for r in res.requests
+                                           if r.kv_ready is not None], 99),
+                "transit_j_req": res.link.transit_j / max(1, res.link.transfers),
+                "transit_bound": t.get("transit_bound_frac", 0.0),
+                "binding": t.get("kernel", {}).get("binding_stages", {})}
+
+    for lk in LK_LINKS:
+        out["runs"][f"{lk}|none"] = go(None, lk)
+        out["runs"][f"{lk}|legacy"] = go(KVTransit(c), lk)
+        for key in LK_PRESETS:
+            out["runs"][f"{lk}|{key}"] = go(KVTransit(c, kernel=LINK_KERNELS[key]), lk)
+    return out
+
+
+def render_link_kernel(v: dict) -> str:
+    L: list[str] = []
+    p = L.append
+    pr = v["presets"]
+    d = pr["pluggable-10"]
+    p("## 27. A general link kernel: compute in transit as a declared stage (illustrative)")
+    p("")
+    p("Brief 06C (Compute in Transit). `LinkKernel` (`disagg_sim.hardware`) generalises section 15's in-transit stage:"
+      " it declares an operation set, a precision (bits per value through the optics, one pass per bit plane), the"
+      " work's compression ratio, a placement (`pluggable` in a host's port, or `switch`) and pipelined stages: the"
+      " link, the module's port, its optics, its compute budget and an FPGA stage. The slowest stage sets the"
+      " transfer time and is reported as the *binding* stage. Energy while streaming is (static + laser) power x"
+      " streaming time + dynamic pJ per input bit. It is off by default (`KVTransit.kernel = None`): sections 1-26"
+      " do not use it, and it is Python only (the JavaScript port does not model it; the Rust port rejects any"
+      " KV hand-off compression).")
+    p("")
+    p(f"Calibration, a photonic link module (Kundu et al., arXiv:2608.21536) with the Compute in Transit hub's"
+      f" definitions (`analysis/cit_budget.py`): port {d['port_GBps']:g} GB/s (QSFP56); optics {d['optics_GBps']:g} GB/s"
+      f" (4 modulators x 14 GBaud NRZ, the series' arithmetic); compute budget 10 or 99 GFLOP/s (the series' reading of"
+      f" the paper's \"tens of GFLOPs\", not a measurement); operations FFT/NTT, add, multiply, MAC, floating-point MAC,"
+      f" modular arithmetic in the FPGA stage, and gathers: no comparisons and no rounding; static {d['static_w']:g} W"
+      f" (the paper); dynamic {d['pj']:g} pJ/bit (the developer's website, a 45 nm estimate excluding the laser)."
+      f" **Illustrative:** laser {d['laser_w']:g} W, FPGA {d['fpga_ops'] / 1e9:g} G operations/s, latency"
+      f" {d['latency_us']:g} us, the FPGA work per value, and the mapping onto a KV hand-off. The transform costs"
+      f" 2.5 log2 n FLOPs per value (FFTW's convention); whether the optics' transform is charged against the budget"
+      f" is not public, so the `-free` presets do not charge it.")
+    p("")
+    p("| Preset | Placement | GFLOP/s | Transform charged | Ops per byte at the port | Ops per byte at the optics |")
+    p("|---|---|---|---|---|---|")
+    for key, x in pr.items():
+        p(f"| `{key}` | {x['placement']} | {x['gflops'] / 1e9:g} | {'yes' if x['charged'] else 'no'} |"
+          f" {x['port']:.2f} | {x['optics']:.2f} |")
+    p("")
+    p("The budget reproduces the hub's results.md section 1 (0.40-3.96 operations per byte at the QSFP56 port,"
+      " 1.43-14.14 at the prototype optics); `tests/test_link_kernel.py` checks every row against the hub's"
+      " results.json.")
+    p("")
+    p("**The hub's kernel ledger as declared work.** Work per input byte (BF16); *refused* = the kernel lacks an"
+      " operation, or (pluggable only) the work combines streams that meet only at a switch. *Fits* = the charged"
+      " work per byte is within the budget at the port.")
+    p("")
+    p("| Kernel | Transform / byte | Other / byte | Pluggable | Switch | Fits 10 GFLOP/s | Fits 99 GFLOP/s |"
+      " Fits 10 GFLOP/s, transform free |")
+    p("|---|---|---|---|---|---|---|---|")
+    yn = lambda b: "yes" if b else "no"
+
+    def why(msg):
+        if msg is None:
+            return "accepted"
+        return "refused: comparisons" if "compare" in msg else ("refused: needs a switch" if "switch" in msg
+                                                                 else "refused")
+    for r in v["ledger"]:
+        p(f"| {r['kernel']} | {r['transform']:.2f} | {r['other']:.2f} | {why(r['refused']['pluggable'])} |"
+          f" {why(r['refused']['switch'])} | {yn(r['fits_low'])} | {yn(r['fits_high'])} | {yn(r['fits_free_low'])} |")
+    p("")
+    p("KV hand-off presets: " + "; ".join(f"`{k}` {'accepted' if m is None else 'refused'}"
+                                           + ("" if m is None else " (needs a block maximum and rounding)")
+                                           for k, m in v["refused_kv"].items())
+      + ". `freq-keep-k` (a transform along the token axis keeping a fixed band, a gather) is the only compressing"
+      " preset the kernel can run.")
+    p("")
+    p(f"**One hand-off, stage by stage.** A {LK_PROMPT:,}-token Llama-3-8B GQA hand-off ({v['handoff_MB']:,.1f} MB),"
+      " `freq-keep-k` (ratio 2), milliseconds per stage, link latency included in the total. *Section 15 stage* = the"
+      " existing in-transit stage (1.6 operations per line byte, passive FFT). Energy in millijoules.")
+    p("")
+    stages = ["link", "module port", "module optics", "module compute", "FPGA"]
+    p("| Link | Stage model | Link | Port | Optics | Compute | FPGA | Binding | Transfer (ms) | Static + laser (mJ) |"
+      " Dynamic (mJ) |")
+    p("|---|---|---|---|---|---|---|---|---|---|---|")
+    for lk in LK_LINKS:
+        for key in ["legacy"] + LK_PRESETS:
+            s = v["stream"][f"{lk}|{key}"]
+            st, e = s["stages"], s["energy"]
+            if key == "legacy":
+                cells = [f"{st['link'] * 1e3:.2f}", "-", "-", f"{st['section 15 stage'] * 1e3:.2f}", "-"]
+                stat = "-"
+            else:
+                cells = [f"{st[x] * 1e3:.2f}" for x in stages]
+                stat = f"{(e['static'] + e['laser']) * 1e3:.1f}"
+            name = "section 15 stage" if key == "legacy" else f"`{key}`"
+            p(f"| {lk} | {name} | " + " | ".join(cells) + f" | {s['binding']} | {s['t'] * 1e3:.2f} | {stat} |"
+              f" {e['dynamic'] * 1e3:.1f} |")
+    p("")
+    p(f"**In the simulator.** Section 15's workload: Llama-3-8B shape, 1 H100 per instance, 1P1D, {LK_N} Poisson"
+      f" requests at {LK_RATE:g}/s, prompts 2,048 (CV 0.5), outputs 256 (CV 0.5), seed 1. Hand-off p99 = first token to"
+      " the KV landing on the decode pool. *Binding* = transfers per binding stage.")
+    p("")
+    p("| Link | Hand-off | Hand-off p99 | TPOT p99 | SLO met | Link busy | Module-bound | Binding | In-transit J /"
+      " request | J / token |")
+    p("|---|---|---|---|---|---|---|---|---|---|")
+    for lk in LK_LINKS:
+        for key in ["none", "legacy"] + LK_PRESETS:
+            r = v["runs"][f"{lk}|{key}"]
+            name = {"none": "uncompressed", "legacy": "section 15 stage"}.get(key, f"`{key}`")
+            bind = ", ".join(f"{s} {n}" for s, n in r["binding"].items()) or "-"
+            p(f"| {lk} | {name} | {ms(r['handoff_p99'])} | {ms(r['tpot_p99'])} | {pct(r['slo'])} |"
+              f" {pct(r['link_util'])} | {pct(r['transit_bound'])} | {bind} | {r['transit_j_req']:.3f} |"
+              f" {r['j_tok']:.3f} |")
+    p("")
+    x = v["fft_per_byte"]
+    p(f"* A transform along a {LK_PROMPT:,}-token axis costs {x:.2f} FLOPs per BF16 byte: {x / pr['pluggable-10']['port']:.1f}x"
+      f" the 10 GFLOP/s budget at the port and {x / pr['pluggable-99']['port']:.1f}x the 99 GFLOP/s one. Charged, the"
+      " module's compute is its slowest stage, and binds unless the link is slower still; free, the optics (one pass"
+      " per bit plane) or the link binds.")
+    faster, slower = [], []
+    for lk in LK_LINKS:
+        base = v["runs"][f"{lk}|none"]["handoff_p99"]
+        key = min(LK_PRESETS, key=lambda k: v["runs"][f"{lk}|{k}"]["handoff_p99"])
+        best = v["runs"][f"{lk}|{key}"]["handoff_p99"]
+        (faster if best < base else slower).append(f"{lk} ({ms(base)} uncompressed, {ms(best)} with `{key}`)")
+    if faster:
+        p("* Hand-off p99 with the best kernel preset is lower than sending uncompressed on " + "; ".join(faster) + ".")
+    if slower:
+        p("* It is higher on " + "; ".join(slower) + ": there the module's own stages are slower than the link it"
+          " would relieve.")
+    p("* Every number in this section comes from the declared model above; the coefficients marked illustrative"
+      " set where each stage binds. *Link busy* includes time the module holds the link. Accuracy is not modelled.")
+    p("")
+    return "\n".join(L)
+
+
 def cpu_name() -> str:
     try:
         for line in Path("/proc/cpuinfo").read_text().splitlines():
@@ -1856,6 +2068,8 @@ def main():
                     help="render sections 19-21 from examples/results_levers.json instead of rerunning them")
     ap.add_argument("--levers2-from-json", action="store_true",
                     help="render sections 23-25 from examples/results_levers2.json instead of rerunning them")
+    ap.add_argument("--link-kernel-from-json", action="store_true",
+                    help="render section 27 from examples/results_link_kernel.json instead of rerunning it")
     a = ap.parse_args()
     sys.path.insert(0, str(ROOT / "src"))
     new = json.loads(json.dumps(collect()))          # same key types as the legacy side
@@ -1895,6 +2109,13 @@ def main():
     tj = ROOT / "examples" / "tradeoffs.json"
     if tj.exists():
         tail += "\n" + render_tradeoffs(json.loads(tj.read_text()))
+    kj = ROOT / "examples" / "results_link_kernel.json"
+    if a.link_kernel_from_json:
+        link_kernel = json.loads(kj.read_text())
+    else:
+        link_kernel = json.loads(json.dumps(collect_link_kernel()))
+        kj.write_text(json.dumps(link_kernel, indent=1))
+    tail += render_link_kernel(link_kernel)
     OUT.write_text(render(new, old, timings) + render_optical(optical) + "\n" + render_ced(ced) + "\n"
                    + render_levers(levers) + tail)
     print(f"wrote {OUT}")

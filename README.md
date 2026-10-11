@@ -63,11 +63,21 @@ queueing theory.
   - named workloads (`--workload chat|coding-agent|offline-batch|long-rag|voice`, with their SLOs) and
     `examples/tradeoffs.py`, a sweep of levers × workloads × hardware that writes `examples/tradeoffs.json`: every
     metric, Pareto flags and each lever's effect, the number source of the trade-offs site.
+* **A general link kernel** (added 2026-10-11, Compute in Transit brief 06C; off by default, Python only): `LinkKernel`
+  declares an in-transit stage's operation set (FFT/NTT, add, multiply, MAC, floating-point MAC, modular arithmetic in
+  an FPGA stage, gathers; **no comparisons**), its precision (bit planes through the optics), the work's compression
+  ratio and its placement (`pluggable` or `switch`); pipelined port / optics / compute-budget / FPGA stages, the slowest
+  binding; static + laser + dynamic energy. Work it cannot do (top-k, requantisation) is refused with a clear error.
+  Calibrated, **illustratively**, to a photonic link module (Kundu et al., [arXiv:2608.21536](https://arxiv.org/abs/2608.21536))
+  with the definitions of the
+  [Compute in Transit hub](https://github.com/BrendanJamesLynskey/LLM_Hub_Compute_in_Transit)'s `analysis/cit_budget.py`:
+  0.40–3.96 operations per byte at the QSFP56 port, 1.43–14.14 at the prototype optics. `--link-kernel PRESET` with
+  `--kv-compress freq-keep-k`.
 * A JavaScript port (`web/sim_engine.js`) that runs live in
   [deck 05](https://brendanjameslynskey.github.io/InfSim_05_Disaggregated_Inference/) and
   [FOptInf deck 03](https://brendanjameslynskey.github.io/FOptInf_03_Optical_Prefill_Pools/),
   and is tested to match the Python exactly, every new feature included.
-* 267 tests: unit, invariant, analytic (M/D/1, Little's law), behavioural,
+* 321 tests: unit, invariant, analytic (M/D/1, Little's law), behavioural,
   property-based (Hypothesis), power and energy, differential (fast path vs
   baseline, JS vs Python), the cost model pinned against an operator trace
   of the real Llama-3-8B, and (94, added 2026-10-04) the new features: identical pools
@@ -85,7 +95,7 @@ queueing theory.
   bit-identical to the old ones, memory never over-committed in either pool, the hand-off waiting for decode blocks,
   the prefill pool's cache, every unsupported combination raising, Leviathan et al.'s closed forms (their Table 1 to
   the printed digits, the acceptance draws converging, a verify step's FLOPs), the all-reduce, pipeline and
-  all-to-all costs, per-GPU memory, the MoE expert count, the formats, and JS parity on 22 configurations.
+  all-to-all costs, per-GPU memory, the MoE expert count, the formats, and JS parity on 22 configurations; and (54, added 2026-10-11, `tests/test_link_kernel.py`) the link kernel: hand formulas for every stage and the energy, the budget and kernel ledger against the Compute in Transit hub's results, refusals (top-k, requantisation, streams in a pluggable), KV hand-off runs without a kernel identical to commit `69ffd2b`, and the binding-stage counts.
 * Every number below comes from [`examples/results.md`](examples/results.md),
   written by `examples/results.py`.
 
@@ -144,6 +154,9 @@ disagg-sim --mode colocated --model llama3-70b --tp 4 --weight-format fp8 --comp
 disagg-sim --mode colocated --model llama3-8b --devices-per-instance 1 --speculative mtp --gamma 3 --alpha 0.7 --rate 1
 disagg-sim --mode colocated --model mixtral-8x7b --devices-per-instance 2 --tp 2 --ep 2 --expert-imbalance 1.25
 
+# a declared link kernel compressing the KV hand-off in transit (brief 06C; illustrative)
+disagg-sim --model llama3-8b --devices-per-instance 1 --link ib-ndr --kv-compress freq-keep-k --link-kernel pluggable-99-free
+
 python examples/benchmark_acceleration.py   # measure every acceleration technique
 python examples/results.py               # regenerate examples/results.md (every quoted number)
 python examples/tradeoffs.py             # the trade-off sweep -> examples/tradeoffs.json (about an hour, 2 workers)
@@ -163,7 +176,7 @@ hot-spot     stage=kv_wait -> kv-link (busy 96%)   busy>90%: decode-0, kv-link
 
 | Module | Role |
 |--------|------|
-| `src/disagg_sim/hardware.py` | `ModelSpec`, `Accelerator`, `Link`, `Parallel`, storage formats, and the roofline `CostModel` (the only place that knows about time) |
+| `src/disagg_sim/hardware.py` | `ModelSpec`, `Accelerator`, `Link`, `Parallel`, storage formats, the link kernel (`LinkKernel`, `KernelWork`), and the roofline `CostModel` (the only place that knows about time) |
 | `src/disagg_sim/workload.py` | `Request` and all its timestamps; lognormal lengths; Poisson arrivals; sessions with shared prefixes (`chat_sessions`); named workloads (`WORKLOADS`); JSON replay |
 | `src/disagg_sim/sim.py` | SimPy processes for prefill, decode and colocated instances; the KV link as a `simpy.Resource`; routers; `FastDecodeInstance`; `ScheduledInstance` (batching policy, paged KV, preemption, speculative decoding), its pool versions `ScheduledPrefillInstance` / `ScheduledDecodeInstance`, and `PrefixCache` |
 | `src/disagg_sim/speculative.py` | Speculative decoding: Leviathan et al.'s closed forms and the acceptance draws (bit-identical in JS) |
@@ -289,7 +302,31 @@ and traces, so only orderings and ranges are compared.
   TPOT SLO that prefill stalls break) but -33% on offline batch. A 512-token chunk budget helps chat (+28%) and hurts
   the coding agent (-24%). Prices per GPU-hour and α are illustrative parameters.
 
-**Ports.** JavaScript: everything, bit-exact. Rust
+### A general link kernel (results.md section 27)
+
+`LinkKernel` generalises section 15's in-transit stage into a declared kernel (CiT_03 slide 12's link kernel).
+Every coefficient not cited below is **illustrative** (laser 2 W, FPGA 50 G operations/s, 1 µs, the FPGA work per
+value, and the mapping onto a KV hand-off). Port 25 GB/s (QSFP56); optics 7 GB/s (4 × 14 GBaud NRZ, the series'
+arithmetic); budget 10 or 99 GFLOP/s, the series' reading of the paper's "tens of GFLOPs"; static 9.7 W (the paper);
+2.76 pJ/bit (the developer's website, excluding the laser). `tests/test_link_kernel.py` checks the budget rows, the
+longest charged FFT and the whole kernel ledger against the hub's `results.json` (vendored from the hub at `de8f33b`),
+and that KV hand-off runs without a kernel are identical to commit `69ffd2b`.
+
+Llama-3-8B shape, one H100 per instance, 1P1D, 8 req/s, 800 requests (section 15's workload), `freq-keep-k`
+(a token-axis transform keeping a fixed band; the quantising presets are refused: no comparisons). Hand-off p99:
+
+| Link | Uncompressed | Section 15 stage | `pluggable-10` | `pluggable-99` | `pluggable-10-free` |
+|---|---|---|---|---|---|
+| eth-25g | 471.9 ms | 157.0 ms | 208,297 ms (compute-bound) | 160.5 ms | 157.0 ms (link-bound) |
+| eth-100g | 76.2 ms | 38.2 ms | 208,297 ms (compute-bound) | 154.9 ms (compute-bound) | 68.1 ms (optics-bound) |
+| ib-ndr | 19.1 ms | 9.6 ms | 208,289 ms (compute-bound) | 154.9 ms (compute-bound) | 68.1 ms (optics-bound) |
+
+A 2,048-token transform costs 13.75 FLOPs per byte, 34.4× the 10 GFLOP/s budget at the port: if the transform is
+charged, the module's compute binds; if it is free, the optics bind on any link faster than 7 GB/s (derived: 56 Gb/s ÷ 8 bit planes = 7 G values/s =
+14 GB/s of BF16 input, which at ratio 2 is 7 GB/s on the wire), so on InfiniBand the module is slower than sending the
+KV uncompressed.
+
+**Ports.** JavaScript: everything, bit-exact, except the link kernel (Python only). Rust
 ([Rust_DES_Kernel](https://github.com/BrendanJamesLynskey/Rust_DES_Kernel)): heterogeneous pools only,
 bit-exact; the FFT-mixing models, the optical transform engine, KV hand-off compression and the CED option
 are **Python and JS only, not in the Rust port**; the Rust side rejects the first three by name and the
@@ -298,13 +335,15 @@ only**: the JS port is bit-exact on every one of them, and Rust_DES_Kernel rejec
 them on ("... are Python and JS only, not in the Rust port"), closed-loop sessions and the validation presets
 included. So are the brief-20A2 levers (the levers in disaggregated pools, parallelism, formats, speculative
 decoding, `mixtral-8x7b`, `llama3.2-1b`, `h200`, `b200`): bit-exact in JS (22 more parity configurations), rejected
-by Rust through `SimConfig.lever_summary`.
+by Rust through `SimConfig.lever_summary`. The link kernel rides on `KVTransit`, so Rust rejects it with the rest of
+KV hand-off compression (`kv_transit ...: KV hand-off compression is Python and JS only`).
 
 `examples/results.py --keep-timings` regenerates sections 1–8 and 10–22 and keeps section 9 (wall
 clock) from the previous run; `--optical-from-json` re-renders 10–15 from `examples/results_optical.json`,
 `--ced-from-json` re-renders 16–18 from `examples/results_ced.json`, `--levers-from-json` re-renders 19–22
 from `examples/results_levers.json` and `--levers2-from-json` re-renders 23–25 from `examples/results_levers2.json`.
 Section 26 is always rendered from `examples/tradeoffs.json`, which only `examples/tradeoffs.py` writes.
+Section 27 (the link kernel) writes `examples/results_link_kernel.json`; `--link-kernel-from-json` re-renders it.
 
 ---
 
