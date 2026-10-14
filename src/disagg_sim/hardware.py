@@ -57,6 +57,10 @@ Added 2026-10-06 (brief 20A2), all off by default:
 * Presets: H200 and B200 (datasheet figures; B200's power coefficients illustrative), NVLink 3 and 5 links,
   Mixtral-8x7B, and Llama-3.2-1B as a draft for the Llama-3 family (same 128,256-token vocabulary).
 
+Added 2026-10-14 (brief 34): a GB200 preset (``gb200``), one Blackwell GPU of a GB200 superchip in an NVL72 rack
+(NVIDIA's GB200 NVL72 page: 186 GB at 8 TB/s, 2.5 PFLOPS dense BF16, FP8 and FP4 at 2x and 4x; up to 1,200 W;
+power coefficients illustrative, as for B200). The rack's 72-GPU NVLink domain is not modelled.
+
 Added 2026-10-11 (Compute in Transit brief 06C), off by default: ``LinkKernel``, the in-transit stage as a declared
 link kernel (operation set with no comparisons, precision in bit planes, compression ratio, placement in a pluggable
 or a switch; port / optics / compute budget / FPGA stages, the slowest binding; static + laser + dynamic energy),
@@ -672,9 +676,18 @@ A100_40G = replace(A100_SXM, name="A100-SXM-40GB", mem_bw=1.555 * TB, mem_capaci
 H200_SXM = replace(H100_SXM, name="H200-SXM", mem_bw=4.8 * TB, mem_capacity=141 * GB)
 B200 = Accelerator("B200", peak_flops=2250 * TB, mem_bw=8 * TB, mem_capacity=180 * GB, tdp_w=1000.0, idle_w=140.0,
                    pj_per_flop=0.6, pj_per_byte=45.0, native_formats=(("fp8", 2.0), ("fp4", 4.0)), scale_up="nvlink5")
+# Brief 34. GB200 (NVIDIA GB200 NVL72 page, superchip column halved: one Blackwell GPU of a GB200 superchip in an NVL72
+# rack): 186 GB HBM3e (372 GB per superchip) at 8 TB/s (16 TB/s); dense FP4 10 PFLOPS (20), FP8 5 PFLOPS and BF16
+# 2.5 PFLOPS (the page states FP8 and BF16 sparse only, 20 and 10 PFLOPS per superchip: halved for dense, then halved
+# again per GPU; BF16 is half of FP8, as for B200); NVLink 5 at 900 GB/s each way (3.6 TB/s per superchip, both
+# directions). Board limit: Blackwell's "up to 1,200 W" TGP (NVIDIA's Blackwell Ultra blog, Table 2). Power coefficients
+# are illustrative, B200's. The NVL72's 72-GPU NVLink domain is not modelled: no width in ``Parallel`` is limited by
+# a scale-up domain, on any device (see results.md section 28).
+GB200 = replace(B200, name="GB200", peak_flops=2500 * TB, mem_capacity=186 * GB, tdp_w=1200.0)
 
 ACCELERATORS = {"h100": H100_SXM, "a100": A100_SXM, "a100-40g": A100_40G, "optical": HYPOTHETICAL_OPTICAL,
-                "optical-fft": OPTICAL_FFT, "optical-fft-small": OPTICAL_FFT_SMALL, "h200": H200_SXM, "b200": B200}
+                "optical-fft": OPTICAL_FFT, "optical-fft-small": OPTICAL_FFT_SMALL, "h200": H200_SXM, "b200": B200,
+                "gb200": GB200}
 
 
 @dataclass(frozen=True)

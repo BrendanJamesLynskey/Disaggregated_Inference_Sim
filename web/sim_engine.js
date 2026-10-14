@@ -15,6 +15,7 @@
 // ScheduledDecodeInstance: the decode pool pulls a hand-off once it has room), speculative decoding (draft passes,
 // a verify pass, per-request acceptance draws), tensor / pipeline / expert parallelism inside an instance, weight and
 // KV storage formats and native compute formats, mixture-of-experts shapes, H200 / B200 presets. Bit-exact (tested).
+// Brief 34 (2026-10-14): a GB200 preset (one GPU of a GB200 superchip).
 (function (root) {
     // mixer: 'attention' | 'hyena' | 'hybrid'; see hardware.ModelSpec for the fields
     const MODELS = {
@@ -66,6 +67,9 @@
         h200:    { name: 'H200-SXM', F: 989e12, B: 4.8 * 1e12, M: 141 * 1e9, fe: 0.55, be: 0.8, tdp: 700, idle: 100, pjF: 1.0, pjB: 60,
                    native: { fp8: 2.0, int8: 2.0 }, scaleUp: 'nvlink4' },
         b200:    { name: 'B200', F: 2250 * 1e12, B: 8 * 1e12, M: 180 * 1e9, fe: 0.55, be: 0.8, tdp: 1000, idle: 140, pjF: 0.6, pjB: 45,
+                   native: { fp8: 2.0, fp4: 4.0 }, scaleUp: 'nvlink5' },
+        // brief 34: one GPU of a GB200 superchip (NVL72 page; 1,200 W TGP; power coefficients illustrative, as B200's)
+        gb200:   { name: 'GB200', F: 2500 * 1e12, B: 8 * 1e12, M: 186 * 1e9, fe: 0.55, be: 0.8, tdp: 1200, idle: 140, pjF: 0.6, pjB: 45,
                    native: { fp8: 2.0, fp4: 4.0 }, scaleUp: 'nvlink5' },
     };
     const LINKS = {

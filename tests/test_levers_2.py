@@ -435,6 +435,12 @@ JS_CASES = {
     "8B fp4 w4a4 on b200 + spec": (dict(model="llama3-8b", device="b200", devicesPerInstance=1, mode="colocated", nColocated=1,
                                         weightFormat="fp4", computeFormat="fp4", kvFormat="int4",
                                         speculative=dict(draft="mtp", gamma=3, alpha=0.75, seed=2)), "poisson"),
+    # brief 34: the GB200 preset (186 GB, 2.5 PFLOPS BF16, 1,200 W), tensor-parallel over NVLink 5 and under a cap
+    "70B tp4 disagg on gb200, paged": (dict(model="llama3-70b", device="gb200", mode="disagg", nPrefill=1, nDecode=1,
+                                            kvPolicy="paged", parallel=dict(tp=4, pp=1)), "poisson"),
+    "8B fp8 w8a8 on gb200, power cap": (dict(model="llama3-8b", device="gb200", devicesPerInstance=1, mode="colocated",
+                                             nColocated=1, weightFormat="fp8", computeFormat="fp8", powerCap=800.0,
+                                             dvfs=True), "poisson"),
     "a100 int8 w8a8 kv int8, disagg paged": (dict(model="llama3-8b", device="a100", devicesPerInstance=1, mode="disagg", nPrefill=1,
                                                   nDecode=1, weightFormat="int8", computeFormat="int8", kvFormat="int8",
                                                   kvPolicy="paged"), "poisson"),

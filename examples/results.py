@@ -33,6 +33,9 @@ the trade-off sweep), never rerun here.
 Section 27 (added 2026-10-11, Compute in Transit brief 06C): the link kernel, a declared in-transit stage, off by default
 and calibrated illustratively to a photonic link module (arXiv:2608.21536); ``--link-kernel-from-json`` re-renders it
 from examples/results_link_kernel.json.
+
+Section 28 (added 2026-10-14, brief 34): the device presets (H100, H200, B200 and the new GB200) on the standard
+workload of sections 3-8. It is always rerun (twelve short runs).
 """
 
 from __future__ import annotations
@@ -2056,6 +2059,88 @@ def get(d, r):
     return d[r] if r in d else d[str(r)]
 
 
+# ───────────────────────── section 28: the GB200 preset against H100 / H200 / B200 (brief 34) ──
+# The standard workload of sections 3-8 (the CLI defaults: Llama-3-70B, 4 GPUs per instance, 1 prefill + 1 decode,
+# InfiniBand NDR hand-off, 800 requests, prompts 2,048 / outputs 256 with CV 0.5, seed 0), on each device preset.
+DEV_KEYS = ["h100", "h200", "b200", "gb200"]
+DEV_RUNS = [("1P1D, 4 req/s", [], 4), ("1P1D, 8 req/s", [], 8), ("2P1D, 8 req/s", ["--prefill", "2"], 8)]
+
+
+def collect_devices() -> dict:
+    from disagg_sim.cli import build_parser, config_from_args
+    from disagg_sim.hardware import ACCELERATORS, LLAMA3_70B, CostModel
+    from disagg_sim.metrics import summarise
+    from disagg_sim.search import Workload, analytic_capacity
+    from disagg_sim.sim import simulate
+    from disagg_sim.workload import LengthDist, poisson_workload
+
+    out: dict = {}
+    for key in DEV_KEYS:
+        d = ACCELERATORS[key]
+        cm = CostModel(LLAMA3_70B, d, 4)
+        pre, dec = cm.prefill([2048]), cm.decode([2300] * 16)
+        r = {"name": d.name, "bf16_pf": d.peak_flops / 1e15, "hbm_gb": d.mem_capacity / 1e9, "hbm_tb_s": d.mem_bw / 1e12,
+             "tdp_w": d.tdp_w, "fp4": d.format_speedup("fp4") is not None, "scale_up": d.scale_up,
+             "kv_tokens": cm.kv_capacity_tokens, "prefill_2048": pre.time, "prefill_bound": pre.bound,
+             "decode_b16": dec.time, "decode_bound": dec.bound, "runs": {}}
+        for label, flags, rate in DEV_RUNS:
+            a = build_parser().parse_args(["--device", key, "--rate", str(rate)] + flags)
+            cfg = config_from_args(a)
+            wl = poisson_workload(a.rate, a.requests, LengthDist(a.prompt, a.prompt_cv), LengthDist(a.output, a.output_cv),
+                                  seed=a.seed)
+            m = summarise(simulate(cfg, wl))
+            cap = analytic_capacity(cfg, Workload(LengthDist(2048, 0.5), LengthDist(256, 0.5), n=800))
+            r["runs"][label] = {"ttft_p99": m["latency_s"]["ttft"]["p99"], "tpot_p99": m["latency_s"]["tpot"]["p99"],
+                                "slo": m["throughput"]["slo_attainment"], "goodput": m["throughput"]["goodput_req_per_s"],
+                                "avg_w": m["energy"]["avg_power_W"], "j_tok": m["energy"]["J_per_output_token"],
+                                "cap": {k: v for k, v in cap.items()}}
+        out[key] = r
+    return out
+
+
+def render_devices(v: dict) -> str:
+    L: list[str] = []
+    p = L.append
+    p("## 28. Device presets: H100, H200, B200 and GB200 on the standard workload")
+    p("")
+    p("Brief 34 (2026-10-14) added `gb200`: one Blackwell GPU of a GB200 superchip in an NVL72 rack, from NVIDIA's GB200"
+      " NVL72 page (the superchip column halved; FP8 and BF16 are stated only as sparse there, so they are halved for"
+      " dense) and Blackwell's \"up to 1,200 W\" TGP (NVIDIA's Blackwell Ultra blog, Table 2). Its power coefficients"
+      " are B200's and illustrative. The workload is that of sections 3-8: Llama-3-70B, 4 GPUs per instance,"
+      " InfiniBand NDR hand-off, 800 requests, 2,048-token prompts and 256-token outputs (CV 0.5), TTFT SLO 1 s,"
+      " TPOT SLO 25 ms. The H100 rows reproduce sections 3, 4 and 8.")
+    p("")
+    rows = [[v[k]["name"], f"{v[k]['bf16_pf']:.3g} PF", f"{v[k]['hbm_gb']:.0f} GB", f"{v[k]['hbm_tb_s']:.3g} TB/s",
+             f"{v[k]['tdp_w']:,.0f} W", "yes" if v[k]["fp4"] else "no", v[k]["scale_up"], f"{v[k]['kv_tokens']:,}",
+             ms(v[k]["prefill_2048"]), ms(v[k]["decode_b16"])] for k in DEV_KEYS]
+    table(L, ["Device", "Dense BF16", "HBM", "HBM bandwidth", "Board limit", "FP4 units", "Scale-up link",
+              "KV tokens per 4-GPU instance", "Prefill 2,048 (4 GPUs)", "Decode b=16 ctx 2,300"], rows)
+    for label, _, _ in DEV_RUNS:
+        p(f"**{label}:**")
+        p("")
+        rows = []
+        for k in DEV_KEYS:
+            r = v[k]["runs"][label]
+            c = r["cap"]
+            rows.append([v[k]["name"], ms(r["ttft_p99"]), ms(r["tpot_p99"]), pct(r["slo"]), f"{r['goodput']:.2f}",
+                         f"{r['avg_w']:,.0f} W", f"{r['j_tok']:.2f}",
+                         f"{c['prefill']:.2f} / {c['decode']:.1f} / {c['kv-link']:.1f} ({c['bottleneck']})"])
+        table(L, ["Device", "TTFT p99", "TPOT p99", "SLO met", "Goodput req/s", "Avg power", "J / token",
+                  "Capacity bounds req/s: prefill / decode / KV link"], rows)
+    g, b = v["gb200"], v["b200"]
+    p(f"* GB200 against B200: {g['bf16_pf'] / b['bf16_pf']:.3f}x the dense compute and {g['hbm_gb'] / b['hbm_gb']:.3f}x"
+      f" the HBM at the same bandwidth. A 2,048-token prefill on 4 GPUs takes {ms(g['prefill_2048'])} against"
+      f" {ms(b['prefill_2048'])}; a bandwidth-bound decode step is the same ({ms(g['decode_b16'])}). The 4-GPU"
+      f" instance holds {g['kv_tokens']:,} KV tokens against {b['kv_tokens']:,}.")
+    p("* **Not modelled: the scale-up domain.** NVL72 puts 72 GPUs on one NVLink fabric, against 8 in an HGX or DGX"
+      " B200. The simulator does not model a domain's size on any device: `Parallel` does not limit tensor-,"
+      " pipeline- or expert-parallel width by it, and the KV hand-off link is chosen separately (`--link`). So on this"
+      " workload GB200 differs from B200 only in its compute, memory and board limit. A rack-level"
+      " configuration that uses the 72-GPU domain (for example an NVLink hand-off between pools) must pick that link"
+      " itself, as the AI Racks Explained site's chapter 8 does.")
+    return "\n".join(L) + "\n"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-timings", action="store_true")
@@ -2116,6 +2201,7 @@ def main():
         link_kernel = json.loads(json.dumps(collect_link_kernel()))
         kj.write_text(json.dumps(link_kernel, indent=1))
     tail += render_link_kernel(link_kernel)
+    tail += "\n" + render_devices(json.loads(json.dumps(collect_devices())))
     OUT.write_text(render(new, old, timings) + render_optical(optical) + "\n" + render_ced(ced) + "\n"
                    + render_levers(levers) + tail)
     print(f"wrote {OUT}")
