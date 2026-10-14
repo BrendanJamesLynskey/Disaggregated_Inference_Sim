@@ -63,6 +63,14 @@ queueing theory.
   - named workloads (`--workload chat|coding-agent|offline-batch|long-rag|voice`, with their SLOs) and
     `examples/tradeoffs.py`, a sweep of levers × workloads × hardware that writes `examples/tradeoffs.json`: every
     metric, Pareto flags and each lever's effect, the number source of the trade-offs site.
+* **A GB200 preset** (added 2026-10-14, brief 34): `gb200`, one Blackwell GPU of a GB200 superchip in an NVL72 rack,
+  from [NVIDIA's GB200 NVL72 page](https://www.nvidia.com/en-us/data-center/gb200-nvl72/) (the superchip column
+  halved): 186 GB of HBM3e at 8 TB/s, 2.5 PFLOPS dense BF16 (the page states BF16 and FP8 sparse only; halved for
+  dense), FP8 and FP4 units at 2× and 4×, NVLink 5; a 1,200 W board limit (Blackwell's "up to 1,200 W" TGP,
+  [NVIDIA's Blackwell Ultra blog](https://developer.nvidia.com/blog/inside-nvidia-blackwell-ultra-the-chip-powering-the-ai-factory-era/),
+  Table 2). Its power coefficients are **illustrative**, B200's. Device presets: `h100`, `a100`, `a100-40g`, `h200`,
+  `b200`, `gb200` and the hypothetical `optical`, `optical-fft`, `optical-fft-small`. The NVL72's 72-GPU NVLink domain
+  is **not modelled**: no parallel width is limited by a scale-up domain on any device (results.md section 28).
 * **A general link kernel** (added 2026-10-11, Compute in Transit brief 06C; off by default, Python only): `LinkKernel`
   declares an in-transit stage's operation set (FFT/NTT, add, multiply, MAC, floating-point MAC, modular arithmetic in
   an FPGA stage, gathers; **no comparisons**), its precision (bit planes through the optics), the work's compression
@@ -77,7 +85,7 @@ queueing theory.
   [deck 05](https://brendanjameslynskey.github.io/InfSim_05_Disaggregated_Inference/) and
   [FOptInf deck 03](https://brendanjameslynskey.github.io/FOptInf_03_Optical_Prefill_Pools/),
   and is tested to match the Python exactly, every new feature included.
-* 321 tests: unit, invariant, analytic (M/D/1, Little's law), behavioural,
+* 324 tests: unit, invariant, analytic (M/D/1, Little's law), behavioural,
   property-based (Hypothesis), power and energy, differential (fast path vs
   baseline, JS vs Python), the cost model pinned against an operator trace
   of the real Llama-3-8B, and (94, added 2026-10-04) the new features: identical pools
@@ -95,7 +103,7 @@ queueing theory.
   bit-identical to the old ones, memory never over-committed in either pool, the hand-off waiting for decode blocks,
   the prefill pool's cache, every unsupported combination raising, Leviathan et al.'s closed forms (their Table 1 to
   the printed digits, the acceptance draws converging, a verify step's FLOPs), the all-reduce, pipeline and
-  all-to-all costs, per-GPU memory, the MoE expert count, the formats, and JS parity on 22 configurations; and (54, added 2026-10-11, `tests/test_link_kernel.py`) the link kernel: hand formulas for every stage and the energy, the budget and kernel ledger against the Compute in Transit hub's results, refusals (top-k, requantisation, streams in a pluggable), KV hand-off runs without a kernel identical to commit `69ffd2b`, and the binding-stage counts.
+  all-to-all costs, per-GPU memory, the MoE expert count, the formats, and JS parity on 22 configurations (24 since brief 34); and (54, added 2026-10-11, `tests/test_link_kernel.py`) the link kernel: hand formulas for every stage and the energy, the budget and kernel ledger against the Compute in Transit hub's results, refusals (top-k, requantisation, streams in a pluggable), KV hand-off runs without a kernel identical to commit `69ffd2b`, and the binding-stage counts; and (3, added 2026-10-14, `tests/test_gb200.py`) the GB200 preset: its figures, the JS device table equal to the Python presets field for field (every preset), and JS run parity on 2 GB200 configurations in `tests/test_levers_2.py`.
 * Every number below comes from [`examples/results.md`](examples/results.md),
   written by `examples/results.py`.
 
@@ -326,6 +334,20 @@ charged, the module's compute binds; if it is free, the optics bind on any link 
 14 GB/s of BF16 input, which at ratio 2 is 7 GB/s on the wire), so on InfiniBand the module is slower than sending the
 KV uncompressed.
 
+### Device presets on the standard workload (results.md section 28)
+
+Llama-3-70B, 4 GPUs per instance, 1P1D, InfiniBand NDR hand-off, 800 requests (the workload of sections 3–8):
+
+| Device | Dense BF16 | HBM | Prefill 2,048 | TTFT p99 at 4 req/s | TPOT p99 at 4 req/s | SLO met at 8 req/s | Prefill bound |
+|---|---|---|---|---|---|---|---|
+| H100-SXM | 0.989 PF | 80 GB | 133.9 ms | 854.2 ms | 15.2 ms | 21.0% | 7.49 req/s |
+| H200-SXM | 0.989 PF | 141 GB | 133.9 ms | 854.2 ms | 10.6 ms | 21.0% | 7.49 req/s |
+| B200 | 2.25 PF | 180 GB | 59.1 ms | 258.4 ms | 6.5 ms | 100.0% | 17.02 req/s |
+| GB200 | 2.5 PF | 186 GB | 53.3 ms | 212.3 ms | 6.5 ms | 100.0% | 18.91 req/s |
+
+GB200 differs from B200 here only in compute (1.111×), memory (186 GB against 180 GB) and board limit: decode, which
+is bandwidth-bound, is unchanged. Its 72-GPU NVLink domain is not modelled.
+
 **Ports.** JavaScript: everything, bit-exact, except the link kernel (Python only). Rust
 ([Rust_DES_Kernel](https://github.com/BrendanJamesLynskey/Rust_DES_Kernel)): heterogeneous pools only,
 bit-exact; the FFT-mixing models, the optical transform engine, KV hand-off compression and the CED option
@@ -335,7 +357,8 @@ only**: the JS port is bit-exact on every one of them, and Rust_DES_Kernel rejec
 them on ("... are Python and JS only, not in the Rust port"), closed-loop sessions and the validation presets
 included. So are the brief-20A2 levers (the levers in disaggregated pools, parallelism, formats, speculative
 decoding, `mixtral-8x7b`, `llama3.2-1b`, `h200`, `b200`): bit-exact in JS (22 more parity configurations), rejected
-by Rust through `SimConfig.lever_summary`. The link kernel rides on `KVTransit`, so Rust rejects it with the rest of
+by Rust through `SimConfig.lever_summary`. The `gb200` preset (2 more parity configurations) is not in the Rust port,
+which rejects it as an unknown device. The link kernel rides on `KVTransit`, so Rust rejects it with the rest of
 KV hand-off compression (`kv_transit ...: KV hand-off compression is Python and JS only`).
 
 `examples/results.py --keep-timings` regenerates sections 1–8 and 10–22 and keeps section 9 (wall
@@ -344,6 +367,7 @@ clock) from the previous run; `--optical-from-json` re-renders 10–15 from `exa
 from `examples/results_levers.json` and `--levers2-from-json` re-renders 23–25 from `examples/results_levers2.json`.
 Section 26 is always rendered from `examples/tradeoffs.json`, which only `examples/tradeoffs.py` writes.
 Section 27 (the link kernel) writes `examples/results_link_kernel.json`; `--link-kernel-from-json` re-renders it.
+Section 28 (the device presets) is always rerun.
 
 ---
 
