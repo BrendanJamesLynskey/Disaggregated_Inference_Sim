@@ -185,6 +185,15 @@ def test_more_prefill_instances_cut_ttft():
     assert two["latency_s"]["ttft"]["p99"] < one["latency_s"]["ttft"]["p99"]
 
 
+def test_prefill_dispatch_counts_the_batch_in_flight():
+    """A prompt arriving while every other instance is idle starts at once: the busy instance's load includes the
+    batch it is prefilling, not just its (empty) queue. Before 2026-10-28 all four went to prefill-0 and queued."""
+    from disagg_sim.workload import Request
+    wl = [Request(i, 0.001 * i, 2048, 4) for i in range(4)]
+    res = simulate(SimConfig(n_prefill=4, n_decode=1), wl)
+    assert [r.prefill_start for r in res.requests] == [r.arrival for r in res.requests]
+
+
 def test_trace_export_is_chrome_trace_format():
     _, res = small_run(n=30, trace=True)
     ev = res.trace["traceEvents"]
