@@ -280,9 +280,12 @@ class Instance:
 
 class PrefillInstance(Instance):
     role = "prefill"
+    prefilling: list[Request] = []          # the batch in the step under way
 
     def load(self) -> float:
-        return sum(r.prompt_len for r in self.queue)
+        """Prompt tokens not yet prefilled: queued, plus the batch being prefilled now (left out before 2026-10-28,
+        which sent new prompts to a busy instance whose queue had just emptied while idle ones waited)."""
+        return sum(r.prompt_len for r in self.queue) + sum(r.prompt_len for r in self.prefilling)
 
     def run(self):
         budget = self.sim.cfg.max_prefill_tokens
@@ -301,8 +304,10 @@ class PrefillInstance(Instance):
             tr = self.sim.cfg.kv_transit
             if tr is not None and tr.where == "endpoint":
                 cost = self.sim.endpoint_compress(self.cost, cost, batch)
+            self.prefilling = batch
             yield from self.step("prefill", cost, f"prefill n={len(batch)} tok={tokens}",
                                  len(batch))
+            self.prefilling = []
             if self.cost.encoder_only:
                 # CED, replay on decode: the decode instance emits the first token, so every
                 # request is handed off, single-token ones included
@@ -1112,7 +1117,8 @@ class ScheduledPrefillInstance(ScheduledInstance):
         self.held: dict[int, tuple] = {}       # rid -> (units, pinned segments) until the hand-off lands
 
     def load(self) -> float:
-        return sum(r.prompt_len for r in self.queue)     # as PrefillInstance
+        # as PrefillInstance: queued prompts plus those admitted and not yet finished
+        return sum(r.prompt_len for r in self.queue) + sum(r.prompt_len for r in self.running)
 
     def full_need(self, r: Request) -> int:
         return self.units(r.prompt_len)

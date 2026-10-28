@@ -651,7 +651,10 @@
 
         const kvNeed = r => model.units(r.prompt, r.output);
         const load = i => {
-            if (i.role === 'prefill') return i.queue.reduce((s, r) => s + r.prompt, 0);
+            // PrefillInstance.load: prompt tokens queued plus those being prefilled (the batch in the step under way, or
+            // the scheduled instance's unfinished rows), since 2026-10-28
+            if (i.role === 'prefill') return [i.queue, i.cap === undefined ? i.prefilling || [] : i.running]
+                .reduce((s, q) => q.reduce((t, r) => t + r.prompt, s), 0);
             if (i.cap === undefined) return i.queue.length + i.running.length;
             let n = i.queue.length + i.swapped.length;            // queued + decoding (ScheduledInstance.load)
             for (const r of i.running) if (r.done >= r.target) n++;
@@ -1060,7 +1063,9 @@
                         o += transitOps(tr, hb, r.prompt, 2.0, true); nb += hb + hb / tr.preset.ratio; }
                     if (nb) cost = inst.cm.compress(cost, o, nb);
                 }
+                inst.prefilling = batch;
                 step(inst, cost, batch.length, () => {
+                    inst.prefilling = [];
                     // CED, replay on decode: the decode instance emits the first token; every request is handed off
                     if (inst.cm.encoderOnly) { for (const r of batch) { r.prefillDone = now; kvRequest(r); } return; }
                     for (const r of batch) { firstToken(r); if (r.output <= 1) finish(r); else kvRequest(r); }
