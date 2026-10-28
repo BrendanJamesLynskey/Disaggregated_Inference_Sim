@@ -929,11 +929,11 @@ def render_ced(c: dict) -> str:
     p("Prefill instances on 2 H100s (decode instances keep 4), every split that uses all 24 GPUs; otherwise as"
       f" section 17 (TTFT SLO {ms(sp['ttft_slo'])}). A whole Llama-3-70B shape only just fits on two H100s (section 16:"
       " KV room for one 8,192-token batch); the CED encoder fits with 25x the room. The roofline charges no extra"
-      " cost for a tight fit, so this compares capacity, not feasibility. The decoder-only row is limited by the"
-      " prefill router, not by compute: the router (unchanged) sends each request to the instance with the fewest"
-      " queued prompt tokens and ignores the batch in flight, so with 1.1-second steps it piles work onto busy"
-      " instances while others idle. The same router applies in section 17, where it slightly favours the model with"
-      " the shorter prefill steps.")
+      " cost for a tight fit, so this compares capacity, not feasibility. Corrected on 2026-10-28: the prefill router"
+      " sends each request to the instance with the fewest prompt tokens still to prefill, and before then it counted"
+      " only queued prompts, not the batch in flight. With 1.1-second steps that piled work onto busy instances while"
+      " others idled, and held the decoder-only row to 0.82 req/s at best (CED: 12.95 and 13.09). The figures in sections 3, 7,"
+      " 10, 17 and 28 moved by up to 23 %.")
     p("")
     rows = []
     for name, rates in sp["rates"].items():

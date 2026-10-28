@@ -85,7 +85,7 @@ queueing theory.
   [deck 05](https://brendanjameslynskey.github.io/InfSim_05_Disaggregated_Inference/) and
   [FOptInf deck 03](https://brendanjameslynskey.github.io/FOptInf_03_Optical_Prefill_Pools/),
   and is tested to match the Python exactly, every new feature included.
-* 324 tests: unit, invariant, analytic (M/D/1, Little's law), behavioural,
+* 325 tests: unit, invariant, analytic (M/D/1, Little's law), behavioural,
   property-based (Hypothesis), power and energy, differential (fast path vs
   baseline, JS vs Python), the cost model pinned against an operator trace
   of the real Llama-3-8B, and (94, added 2026-10-04) the new features: identical pools
@@ -118,6 +118,20 @@ queueing theory.
 > SLO verdict, power-bound flag or J/token ranking changed. `examples/results.md` has the
 > before/after figures, rerun on the pre-fix commit.
 
+> **Prefill routing corrected on 2026-10-28.** A cross-check from the
+> [Hardware System Design Explorer](https://github.com/BrendanJamesLynskey/HW_System_Design_Explorer) found that the
+> prefill router measured an instance's load by its queued prompts alone, not the batch it was prefilling. A prompt
+> arriving just after an instance had taken its whole queue saw that instance as empty and joined it while other
+> instances sat idle: in one four-instance design they were 99 %, 99 %, 62 % and 0 % busy. Load is now the prompt
+> tokens still to prefill, queued or in flight, in Python, the JavaScript port and the Rust port; runs with one
+> prefill instance are unchanged. Every affected table was regenerated. Most moved by under a quarter (the
+> `--prefill 2` report's mean TTFT 185.8 → 155.7 ms; the two-prefill device presets' TTFT 10–18 % shorter).
+> The exception is section 18, where two-GPU prefill instances with 1.1-second steps had starved the decoder-only
+> model: its best rate rises from 0.82 to 5.98 req/s, so CED's advantage there falls from 16× to 2.2×.
+> In section 26's trade-off sweep the "2P (TP2) + 1D (TP4)" lever on real-time voice goes from 47 % less goodput
+> per GPU than the baseline to 60 % more (on long-context RAG from 0 % to +3 %), and its TTFT p99 penalty shrinks on
+> every workload (coding agent +89 % → +48 %, voice +85 % → +35 %).
+
 ---
 
 ## Quick start
@@ -126,7 +140,7 @@ queueing theory.
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .[dev]
-pytest                                   # 267 tests, about a minute
+pytest                                   # 325 tests, about a minute
 
 disagg-sim                               # one disaggregated run (70B, 4xH100 per instance)
 disagg-sim --compare                     # colocated vs disaggregated, same request stream
@@ -173,7 +187,7 @@ python examples/tradeoffs.py             # the trade-off sweep -> examples/trade
 Example report (`disagg-sim --prefill 2 --rate 6 --link eth-25g`):
 
 ```
-utilisation  prefill-0 47%  prefill-1 13%  decode-0 100%  kv-link 96%
+utilisation  prefill-0 37%  prefill-1 23%  decode-0 100%  kv-link 96%
 where time goes  prefill 1%  kv_wait 81%  kv_transfer 1%  decode 18%
 hot-spot     stage=kv_wait -> kv-link (busy 96%)   busy>90%: decode-0, kv-link
 ```
@@ -257,9 +271,9 @@ prefill; TPOT 25 ms; the prompt:output ratios are illustrative stand-ins for age
 | Prompt : output | Decoder-only req/s | CED, replay on prefill | gain | CED, replay on decode | gain |
 |---|---|---|---|---|---|
 | 2,048 : 512 | 25.72 (4P2D) | 39.20 (3P3D) | 1.52× | 41.07 (3P3D) | 1.60× |
-| 4,096 : 256 | 13.10 (4P2D) | 27.01 (4P2D) | 2.06× | 27.90 (4P2D) | 2.13× |
-| 8,192 : 128 | 7.89 (5P1D) | 13.23 (4P2D) | 1.68× | 13.23 (4P2D) | 1.68× |
-| 16,384 : 64 | 3.81 (5P1D) | 6.89 (5P1D) | 1.81× | 8.17 (5P1D) | 2.14× |
+| 4,096 : 256 | 13.33 (4P2D) | 27.01 (4P2D) | 2.03× | 27.90 (4P2D) | 2.09× |
+| 8,192 : 128 | 8.03 (5P1D) | 13.23 (4P2D) | 1.65× | 13.44 (4P2D) | 1.67× |
+| 16,384 : 64 | 3.81 (5P1D) | 6.89 (5P1D) | 1.81× | 8.29 (5P1D) | 2.18× |
 
 With the replay on decode a prefill instance holds 71.9 GB of weights instead of 141.1 GB: on two H100s that leaves
 KV room for 220,048 tokens instead of 8,835. Gains above 2× are queueing (a fixed TTFT SLO), not FLOPs.
