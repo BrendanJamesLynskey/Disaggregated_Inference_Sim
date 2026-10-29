@@ -18,8 +18,8 @@ from pathlib import Path
 import pytest
 
 from disagg_sim.cli import build_parser, config_from_args
-from disagg_sim.hardware import (A100_SXM, H100_SXM, LINKS, LLAMA3_8B, LLAMA3_8B_CED, LLAMA3_8B_HYENA,
-                                 LLAMA3_70B, LLAMA3_70B_CED, MODELS, KV_PRESETS, CostModel, KVTransit, ModelSpec)
+from disagg_sim.hardware import (A100_SXM, H100_SXM, LINKS, LLAMA3_8B, LLAMA3_8B_CED,
+                                 LLAMA3_70B, LLAMA3_70B_CED, MODELS, KV_PRESETS, CostModel, ModelSpec)
 from disagg_sim.metrics import summarise
 from disagg_sim.sim import SimConfig, simulate
 from disagg_sim.workload import LengthDist, poisson_workload
@@ -56,7 +56,7 @@ def test_replay_settings_are_ignored_when_ced_is_off(mode):
 
 
 def test_prefill_only_flag_changes_nothing_for_other_models():
-    for m in (LLAMA3_70B, LLAMA3_8B_HYENA, LLAMA3_70B_CED):
+    for m in (LLAMA3_70B, LLAMA3_8B, LLAMA3_70B_CED):
         n = 4 if m.n_layers == 80 else 1
         x, y = CostModel(m, H100_SXM, n), CostModel(m, H100_SXM, n, prefill_only=True)
         assert x.kv_capacity_tokens == y.kv_capacity_tokens
@@ -144,8 +144,6 @@ def test_decode_is_unchanged_by_ced():
 def test_invalid_ced_models_are_rejected():
     with pytest.raises(ValueError):
         replace(LLAMA3_8B, ced_encoder_layers=32)
-    with pytest.raises(ValueError):
-        replace(LLAMA3_8B_HYENA, ced_encoder_layers=16)
     with pytest.raises(ValueError):
         replace(LLAMA3_8B_CED, ced_replay=0)
     with pytest.raises(ValueError):
@@ -236,8 +234,8 @@ JS_CASES = {
                                                                decodeDevice="a100"),
     "colocated, replay on prefill": dict(model="llama3-70b-ced", mode="colocated"),
     "replay on decode, fp8 at the GPU, 25 GbE": dict(model="llama3-70b-ced", cedReplayOn="decode", link="eth-25g",
-                                                     kvCompress="fp8", kvCompressAt="endpoint"),
-    "replay on decode, fp4 in transit": dict(model="llama3-70b-ced", cedReplayOn="decode", link="eth-25g",
+                                                     kvCompress="fp8"),
+    "replay on decode, fp4 at the GPU": dict(model="llama3-70b-ced", cedReplayOn="decode", link="eth-25g",
                                              kvCompress="fp4-block"),
     "replay on decode, power cap + DVFS": dict(model="llama3-70b-ced", cedReplayOn="decode", powerCap=350.0, dvfs=True),
     "decoder-only baseline (unchanged path)": dict(model="llama3-70b"),
@@ -250,15 +248,13 @@ def py_config(c: dict) -> SimConfig:
                                     ("cedReplayOn", "ced_replay_on"), ("lmHead", "prefill_lm_head")) if k1 in c}
     if kw:
         model = replace(model, **kw)
-    tr = None
-    if "kvCompress" in c:
-        tr = KVTransit(KV_PRESETS[c["kvCompress"]], where=c.get("kvCompressAt", "transit"))
     dev = {"h100": H100_SXM, "a100": A100_SXM}
     return SimConfig(model=model, device=H100_SXM, devices_per_instance=c.get("devicesPerInstance", 4),
                      mode=c.get("mode", "disagg"), n_prefill=c.get("nPrefill", 1), n_decode=c.get("nDecode", 1),
                      n_colocated=2, link=LINKS[c.get("link", "ib-ndr")], power_cap_w=c.get("powerCap"),
                      dvfs=c.get("dvfs", False), prefill_devices_per_instance=c.get("prefillDevicesPerInstance"),
-                     decode_device=dev.get(c.get("decodeDevice")), kv_transit=tr)
+                     decode_device=dev.get(c.get("decodeDevice")),
+                     kv_compression=KV_PRESETS[c["kvCompress"]] if "kvCompress" in c else None)
 
 
 def test_javascript_port_matches_python_for_ced():
@@ -283,7 +279,7 @@ def test_javascript_port_matches_python_for_ced():
                       "stamps": [[r.prefill_start, r.first_token, r.prefill_done, r.kv_start, r.kv_ready, r.decode_start,
                                   r.finish] for r in reqs],
                       "inst": [[i.compute_j, i.memory_j, i.busy, i.peak_power, i.steps, i.batch_sum] for i in res.instances],
-                      "link": [res.link.energy, res.link.bytes, res.link.wait, res.link.transit_j],
+                      "link": [res.link.energy, res.link.bytes, res.link.wait, res.link.handoff_bytes],
                       "total": m["energy"]["total_J"], "stages": [m["stage_breakdown_s"][k] for k in sorted(m["stage_breakdown_s"])],
                       "capped": any(i.power_bound_time > 0 for i in res.instances)})
     script = (f"require({json.dumps(str(engine))});"
@@ -291,7 +287,7 @@ def test_javascript_port_matches_python_for_ced():
               "console.log(JSON.stringify(cases.map(c=>{const r=S.simulate(c.cfg,c.rows), m=S.summarise(r);"
               "return {stamps:r.reqs.map(q=>[q.prefillStart,q.firstToken,q.prefillDone,q.kvStart,q.kvReady,q.decodeStart,q.finish]),"
               "inst:r.insts.map(i=>[i.ec,i.em,i.busy,i.peakW,i.steps,i.batchSum]),"
-              "link:[r.link.energy,r.link.bytes,r.link.wait,r.link.transitJ],"
+              "link:[r.link.energy,r.link.bytes,r.link.wait,r.link.handoff],"
               "total:m.energy.totalJ, stages:Object.keys(m.stages).sort().map(k=>m.stages[k])};})));")
     out = subprocess.run([node, "-e", script], input=json.dumps(cases), capture_output=True, text=True, check=True)
     # prompts well above the ridge point keep most steps off the power roof, so most cases are bit-exact

@@ -5,9 +5,7 @@
     disagg-sim --sweep-rate 2 4 8 16             # load sweep: where does goodput collapse?
     disagg-sim --trace run.json                  # Perfetto / chrome://tracing timeline
     disagg-sim --model llama3-8b --devices-per-instance 1 --prefill-device h100 --decode-device a100
-    disagg-sim --model llama3-8b-hyena-circ --devices-per-instance 1 --prefill-device optical-fft --decode-device h100
-    disagg-sim --model llama3-8b --devices-per-instance 1 --link eth-25g --kv-compress fp8 --kv-compress-at transit
-    disagg-sim --model llama3-8b --devices-per-instance 1 --link ib-ndr --kv-compress freq-keep-k --link-kernel pluggable-99-free
+    disagg-sim --model llama3-8b --devices-per-instance 1 --link eth-25g --kv-compress fp8
     disagg-sim --model llama3-70b-ced --ced-replay-on decode --prefill-devices-per-instance 2
     disagg-sim --mode colocated --model llama3-8b --devices-per-instance 1 --batch-policy chunked --max-num-batched-tokens 512
     disagg-sim --mode colocated --model opt-13b --device a100-40g --devices-per-instance 1 --kv-policy paged --preemption swap
@@ -23,7 +21,7 @@ import argparse
 import json
 from dataclasses import replace
 
-from .hardware import ACCELERATORS, KV_PRESETS, LINK_KERNELS, LINKS, MODELS, QUANT_FORMATS, KVTransit, Parallel
+from .hardware import ACCELERATORS, KV_PRESETS, LINKS, MODELS, QUANT_FORMATS, Parallel
 from .metrics import format_report, summarise
 from .ppa import ppa_report
 from .sim import SimConfig, simulate
@@ -74,23 +72,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--decode-devices-per-instance", type=int)
     g.add_argument("--prefill-lm-head", choices=["all", "last"],
                    help="LM head on every prompt token (default) or the last one only")
-    g = p.add_argument_group("optical transform engine (devices optical-fft*; illustrative)")
-    g.add_argument("--ft-enob", type=int, help="effective bits (passes = 4^(required - ENOB))")
-    g.add_argument("--ft-static-w", type=float, help="lasers + thermal tuning, W per device (split evenly)")
-    g.add_argument("--ft-mask-rate", type=float, help="Fourier-plane mask rewrites per second")
-    g.add_argument("--ft-samples-per-s", type=float, help="converter samples per second")
-    g.add_argument("--ft-detection", choices=["coherent", "intensity"])
-    g.add_argument("--ft-overlap", action="store_true", help="overlap optical and digital time")
-    g.add_argument("--fft-efficiency", type=float,
-                   help="fraction of the matmul rate digital devices reach on FFT work (default 1.0)")
-    g = p.add_argument_group("KV hand-off compression (illustrative; speculative in-transit stage)")
+    g = p.add_argument_group("KV hand-off compression (on the prefill GPU before the hand-off; illustrative)")
     g.add_argument("--kv-compress", choices=KV_PRESETS)
-    g.add_argument("--kv-compress-at", choices=["transit", "endpoint"], default="transit")
-    g.add_argument("--kv-keep", type=float, help="freq-keep-k: fraction of frequency bins kept (default 0.5)")
-    g.add_argument("--transit-ops-per-byte", type=float, help="in-transit compute budget per line byte")
-    g.add_argument("--transit-pj-per-bit", type=float, help="in-transit stage energy per input bit")
-    g.add_argument("--link-kernel", choices=LINK_KERNELS,
-                   help="model the in-transit stage as a declared link kernel (illustrative; Python only)")
     g = p.add_argument_group("Causal Encoder-Decoder (DeepSeek-V4.1-Flash, arXiv:2609.19969; *-ced models)")
     g.add_argument("--ced-encoder-layers", type=int, metavar="E",
                    help="make the bottom E layers a causal encoder (0: off; the *-ced models use half)")
@@ -150,60 +133,8 @@ def parallel_from_args(a, tp, pp):
                     link=a.scale_up_link if a is not None else None)
 
 
-def engine_overrides(a) -> dict:
-    over = {}
-    if a.ft_enob is not None:
-        over["enob"] = a.ft_enob
-    if a.ft_static_w is not None:
-        over["laser_w"] = over["tuning_w"] = a.ft_static_w / 2
-    if a.ft_mask_rate is not None:
-        over["mask_rate_hz"] = a.ft_mask_rate
-    if a.ft_samples_per_s is not None:
-        over["samples_per_s"] = a.ft_samples_per_s
-    if a.ft_detection is not None:
-        over["detection"] = a.ft_detection
-    if a.ft_overlap:
-        over["overlap"] = True
-    return over
-
-
-def pick_device(key: str | None, over: dict, fft_eff: float | None = None):
-    if key is None:
-        return None
-    dev = ACCELERATORS[key]
-    if over and dev.transform is not None:
-        dev = replace(dev, transform=replace(dev.transform, **over))
-    if fft_eff is not None:
-        dev = replace(dev, fft_efficiency=fft_eff)
-    return dev
-
-
-def kv_transit_from_args(a):
-    if a.kv_compress is None:
-        if a.link_kernel is not None:
-            raise SystemExit("--link-kernel needs --kv-compress (the work it does to the hand-off)")
-        return None
-    c = KV_PRESETS[a.kv_compress]
-    if a.kv_keep is not None:
-        if not c.fft:
-            raise SystemExit("--kv-keep applies to freq-keep-k only")
-        c = replace(c, ratio=1 / a.kv_keep)
-    kw = {}
-    if a.transit_ops_per_byte is not None:
-        kw["ops_per_byte"] = a.transit_ops_per_byte
-    if a.transit_pj_per_bit is not None:
-        kw["pj_per_bit"] = a.transit_pj_per_bit
-    if a.link_kernel is not None:
-        kw["kernel"] = LINK_KERNELS[a.link_kernel]
-    try:
-        return KVTransit(c, where=a.kv_compress_at, **kw)
-    except ValueError as e:
-        raise SystemExit(str(e))
-
-
 def config_from_args(a) -> SimConfig:
     link = replace(LINKS[a.link], channels=a.link_channels)
-    over = engine_overrides(a)
     model = MODELS[a.model]
     if a.prefill_lm_head is not None:
         model = replace(model, prefill_lm_head=a.prefill_lm_head)
@@ -211,7 +142,6 @@ def config_from_args(a) -> SimConfig:
                              ("ced_replay_on", a.ced_replay_on)) if v is not None}
     if ced:
         model = replace(model, **ced)
-    fe = a.fft_efficiency
     wp = WORKLOADS[a.workload] if getattr(a, "workload", None) else None
     ttft = a.ttft_slo if a.ttft_slo is not None else (wp.ttft_slo if wp else 1.0)
     tpot = a.tpot_slo if a.tpot_slo is not None else (wp.tpot_slo if wp else 0.025)
@@ -223,12 +153,12 @@ def config_from_args(a) -> SimConfig:
             pools[f"{pool}_parallel"] = Parallel(tp=t or 1, pp=q or 1, ep=a.ep or 1, microbatches=a.microbatches,
                                                  expert_imbalance=a.expert_imbalance or 1.0, link=a.scale_up_link)
     spec = Speculative(a.speculative, a.gamma, a.alpha, a.spec_seed) if a.speculative else None
-    return SimConfig(model=model, device=pick_device(a.device, over, fe),
-                     prefill_device=pick_device(a.prefill_device, over, fe),
-                     decode_device=pick_device(a.decode_device, over, fe),
+    return SimConfig(model=model, device=ACCELERATORS[a.device],
+                     prefill_device=ACCELERATORS[a.prefill_device] if a.prefill_device else None,
+                     decode_device=ACCELERATORS[a.decode_device] if a.decode_device else None,
                      prefill_devices_per_instance=a.prefill_devices_per_instance,
                      decode_devices_per_instance=a.decode_devices_per_instance,
-                     kv_transit=kv_transit_from_args(a),
+                     kv_compression=KV_PRESETS[a.kv_compress] if a.kv_compress else None,
                      devices_per_instance=a.devices_per_instance, mode=a.mode,
                      n_prefill=a.prefill, n_decode=a.decode,
                      n_colocated=a.prefill + a.decode, link=link,

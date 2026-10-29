@@ -20,8 +20,8 @@ import pytest
 
 from disagg_sim.cli import build_parser, config_from_args, workload_from_args
 from disagg_sim.hardware import (A100_40G, A100_SXM, ACCELERATORS, B200, H100_SXM, H200_SXM, KV_PRESETS, LINKS,
-                                 LLAMA32_1B, LLAMA3_70B, LLAMA3_70B_CED, LLAMA3_8B, LLAMA3_8B_HYENA, MIXTRAL_8X7B, MODELS,
-                                 OPT_13B, OPTICAL_FFT, QUANT_FORMATS, CostModel, KVTransit, Parallel, ipow)
+                                 LLAMA32_1B, LLAMA3_70B, LLAMA3_70B_CED, LLAMA3_8B, MIXTRAL_8X7B, MODELS,
+                                 OPT_13B, QUANT_FORMATS, CostModel, Parallel, ipow)
 from disagg_sim.metrics import format_report, summarise
 from disagg_sim.sim import (ScheduledDecodeInstance, ScheduledPrefillInstance, SimConfig, Simulation, simulate)
 from disagg_sim.speculative import (Speculative, draw_accepted, expected_operations, expected_speedup, expected_tokens,
@@ -161,27 +161,24 @@ def test_chunked_prefill_pool_runs_budgeted_steps():
 
 
 def test_levers_with_heterogeneous_pools_and_hand_off_compression():
-    """Supported combinations: other devices per pool, and compressing the hand-off in transit or at the GPU."""
+    """Supported combinations: other devices per pool, and compressing the hand-off on the prefill GPU."""
     het = replace(D8, prefill_device=H100_SXM, decode_device=A100_SXM, kv_policy="paged")
     _, m = run(het, wl(n=150))
     assert m["requests"]["completed"] == 150 and m["pools"]["decode"] == "1x A100-SXM"
-    for where in ("transit", "endpoint"):
-        cfg = replace(D8, link=LINKS["eth-25g"], kv_policy="paged", kv_transit=KVTransit(KV_PRESETS["fp8"], where=where))
-        _, m = run(cfg, wl(n=150, rate=2.0))
-        assert m["kv_link"]["transit"]["ratio"] == 2.0 and m["requests"]["completed"] == 150
+    cfg = replace(D8, link=LINKS["eth-25g"], kv_policy="paged", kv_compression=KV_PRESETS["fp8"])
+    _, m = run(cfg, wl(n=150, rate=2.0))
+    assert m["kv_link"]["compression"]["ratio"] == 2.0 and m["requests"]["completed"] == 150
 
 
 @pytest.mark.parametrize("kw, msg", [
     (dict(model=LLAMA3_70B_CED, kv_policy="paged"), "without CED"),
-    (dict(model=LLAMA3_8B_HYENA, prefill_device=OPTICAL_FFT, kv_policy="paged"), "without CED"),
     (dict(kv_policy="paged", fast_forward=True), "fast_forward"),
-    (dict(speculative=Speculative(), kv_transit=KVTransit(KV_PRESETS["fp8"])), "compression"),
+    (dict(speculative=Speculative(), kv_compression=KV_PRESETS["fp8"]), "compression"),
     (dict(prefix_caching=True, kv_policy="paged", preemption="swap"), "swap"),
-    (dict(kv_format="fp8", kv_transit=KVTransit(KV_PRESETS["fp8"])), "BF16 KV"),
+    (dict(kv_format="fp8", kv_compression=KV_PRESETS["fp8"]), "BF16 KV"),
     (dict(weight_format="fp6"), "weight_format"),
     (dict(weight_format="int4", compute_format="fp8"), "compute_format"),
     (dict(device=A100_SXM, weight_format="fp8", compute_format="fp8"), "no fp8 units"),
-    (dict(model=LLAMA3_8B_HYENA, weight_format="fp8"), "attention models"),
     (dict(speculative=Speculative(gamma=0)), "gamma"),
     (dict(speculative=Speculative(draft="llama3.2-1b"), model=OPT_13B, device=A100_40G), "vocabulary"),
     (dict(speculative=Speculative(draft="gpt-9")), "draft model"),
@@ -409,8 +406,8 @@ JS_CASES = {
                                                   decodeDevice="a100", prefillDevice="h100"), "chat"),
     "disagg prefix cache evicting, OPT, 25 GbE": (dict(OPT_JS, mode="disagg", nPrefill=1, nDecode=1, prefixCaching=True,
                                                      kvPolicy="paged", link="eth-25g"), "chat-long"),
-    "disagg endpoint fp8, paged": (dict(D8_JS, link="eth-25g", kvCompress="fp8", kvCompressAt="endpoint", kvPolicy="paged"), "poisson"),
-    "disagg transit fp4, max": (dict(D8_JS, link="eth-25g", kvCompress="fp4-block", kvPolicy="max"), "poisson"),
+    "disagg endpoint fp8, paged": (dict(D8_JS, link="eth-25g", kvCompress="fp8", kvPolicy="paged"), "poisson"),
+    "disagg GPU fp4, max": (dict(D8_JS, link="eth-25g", kvCompress="fp4-block", kvPolicy="max"), "poisson"),
     "colocated spec mtp": (dict(model="llama3-8b", devicesPerInstance=1, mode="colocated", nColocated=2,
                                 speculative=dict(draft="mtp", gamma=3, alpha=0.7, seed=0)), "poisson"),
     "colocated spec 1B draft, chunked, paged": (dict(model="llama3-8b", devicesPerInstance=1, mode="colocated", nColocated=1,
@@ -454,9 +451,6 @@ def py_config(c: dict) -> SimConfig:
         return Parallel(tp=x["tp"], pp=x.get("pp", 1), ep=x.get("ep", 1), microbatches=x.get("microbatches"),
                         expert_imbalance=x.get("expertImbalance", 1.0), link=x.get("link"))
     sp = c.get("speculative")
-    tr = None
-    if "kvCompress" in c:
-        tr = KVTransit(KV_PRESETS[c["kvCompress"]], where=c.get("kvCompressAt", "transit"))
     dev = ACCELERATORS
     return SimConfig(model=MODELS[c["model"]], device=dev[c.get("device", "h100")],
                      devices_per_instance=c.get("devicesPerInstance", 4), mode=c.get("mode", "disagg"),
@@ -465,7 +459,8 @@ def py_config(c: dict) -> SimConfig:
                      prefill_device=dev[c["prefillDevice"]] if "prefillDevice" in c else None,
                      decode_device=dev[c["decodeDevice"]] if "decodeDevice" in c else None,
                      prefill_devices_per_instance=c.get("prefillDevicesPerInstance"),
-                     decode_devices_per_instance=c.get("decodeDevicesPerInstance"), kv_transit=tr,
+                     decode_devices_per_instance=c.get("decodeDevicesPerInstance"),
+                     kv_compression=KV_PRESETS[c["kvCompress"]] if "kvCompress" in c else None,
                      batch_policy=c.get("batchPolicy", "prefill-priority"),
                      max_num_batched_tokens=c.get("maxNumBatchedTokens"), kv_policy=c.get("kvPolicy", "oracle"),
                      kv_block_size=c.get("kvBlockSize", 16), preemption=c.get("preemption", "recompute"),

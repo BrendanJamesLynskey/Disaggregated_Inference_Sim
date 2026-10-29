@@ -11,8 +11,8 @@ model, a discrete-event engine, passive probes, metrics with hot-spot attributio
 Chrome traces, an exact accelerated path, and a test ladder from unit tests to
 queueing theory.
 
-* Roofline cost model for prefill and decode (Llama-3-8B/70B; H100, A100 and a
-  hypothetical optical-MAC part; NVLink, PCIe, InfiniBand and Ethernet links).
+* Roofline cost model for prefill and decode (Llama-3-8B/70B; H100, A100 and later
+  parts; NVLink, PCIe, InfiniBand and Ethernet links).
 * Prefill pool → shared KV-transfer link → decode pool with continuous batching
   and KV-capacity admission; a colocated (vLLM-v0 style) baseline on the same GPUs.
 * TTFT / TPOT / ITL / E2E percentiles, goodput and SLO attainment, utilisation,
@@ -25,12 +25,9 @@ queueing theory.
   accelerators: analytic capacity bounds, bisection search, and parallel sweeps.
 * **Heterogeneous pools** (added 2026-10-04): a device and device count per pool
   (`--prefill-device h100 --decode-device a100`), the Splitwise idea.
-* **FFT-mixing models, an optical transform engine and KV hand-off compression**
-  (added 2026-10-04, for the [Fourier Optics for Inference](https://github.com/BrendanJamesLynskey/LLM_Hub_Fourier_Optics_Inference)
-  series): Hyena-2, a 1:3 hybrid, block-circulant weights and distilled decode;
-  `optical-fft`, a Fourier-optical transform engine co-packaged with a digital part;
-  fp8 / fp4 / frequency-domain compression of the KV hand-off, in the link or on the GPU;
-  PPA (area, silicon cost, perf/W, perf/mm², perf/$) with FHE_Accelerator_Sim's method.
+* **KV hand-off compression and PPA** (added 2026-10-04): fp8 / fp4 compression of the KV hand-off on the
+  prefill GPU (`--kv-compress`), an elementwise pass with its own roofline time and energy; PPA (area, silicon cost,
+  perf/W, perf/mm², perf/$) with FHE_Accelerator_Sim's method.
 * **Causal Encoder-Decoder (CED)** (added 2026-10-05, for
   [Modern Architectures 06](https://brendanjameslynskey.github.io/Arch_06_Asymmetric_Causal_Encoder_Decoder/)):
   the encoder-only prefill of DeepSeek-V4.1-Flash ([arXiv:2609.19969](https://arxiv.org/abs/2609.19969), section 2.2).
@@ -69,41 +66,29 @@ queueing theory.
   dense), FP8 and FP4 units at 2× and 4×, NVLink 5; a 1,200 W board limit (Blackwell's "up to 1,200 W" TGP,
   [NVIDIA's Blackwell Ultra blog](https://developer.nvidia.com/blog/inside-nvidia-blackwell-ultra-the-chip-powering-the-ai-factory-era/),
   Table 2). Its power coefficients are **illustrative**, B200's. Device presets: `h100`, `a100`, `a100-40g`, `h200`,
-  `b200`, `gb200` and the hypothetical `optical`, `optical-fft`, `optical-fft-small`. The NVL72's 72-GPU NVLink domain
+  `b200` and `gb200`. The NVL72's 72-GPU NVLink domain
   is **not modelled**: no parallel width is limited by a scale-up domain on any device (results.md section 28).
-* **A general link kernel** (added 2026-10-11, Compute in Transit brief 06C; off by default, Python only): `LinkKernel`
-  declares an in-transit stage's operation set (FFT/NTT, add, multiply, MAC, floating-point MAC, modular arithmetic in
-  an FPGA stage, gathers; **no comparisons**), its precision (bit planes through the optics), the work's compression
-  ratio and its placement (`pluggable` or `switch`); pipelined port / optics / compute-budget / FPGA stages, the slowest
-  binding; static + laser + dynamic energy. Work it cannot do (top-k, requantisation) is refused with a clear error.
-  Calibrated, **illustratively**, to a photonic link module (Kundu et al., [arXiv:2608.21536](https://arxiv.org/abs/2608.21536))
-  with the definitions of the
-  [Compute in Transit hub](https://github.com/BrendanJamesLynskey/LLM_Hub_Compute_in_Transit)'s `analysis/cit_budget.py`:
-  0.40–3.96 operations per byte at the QSFP56 port, 1.43–14.14 at the prototype optics. `--link-kernel PRESET` with
-  `--kv-compress freq-keep-k`.
 * A JavaScript port (`web/sim_engine.js`) that runs live in
-  [deck 05](https://brendanjameslynskey.github.io/InfSim_05_Disaggregated_Inference/) and
-  [FOptInf deck 03](https://brendanjameslynskey.github.io/FOptInf_03_Optical_Prefill_Pools/),
+  [deck 05](https://brendanjameslynskey.github.io/InfSim_05_Disaggregated_Inference/)
   and is tested to match the Python exactly, every new feature included.
-* 325 tests: unit, invariant, analytic (M/D/1, Little's law), behavioural,
+* 187 tests: unit, invariant, analytic (M/D/1, Little's law), behavioural,
   property-based (Hypothesis), power and energy, differential (fast path vs
   baseline, JS vs Python), the cost model pinned against an operator trace
-  of the real Llama-3-8B, and (94, added 2026-10-04) the new features: identical pools
-  reproduce the homogeneous run bit-exactly, the FFT-mixing op ledger equals the FOptInf
-  analysis to the FLOP, a transformer on the transform device equals its digital part,
-  the averaging-pass rule, monotone energy in static power, and JS parity on 21 new
+  of the real Llama-3-8B, and (13, added 2026-10-04, `tests/test_hetero_pools.py`) heterogeneous pools, hand-off
+  compression and PPA: identical pools reproduce the homogeneous run bit-exactly, compression shrinks the link bytes
+  by its ratio and costs prefill-GPU time, the area model against FHE_Accelerator_Sim, and JS parity on 8
   configurations; and (24, added 2026-10-05, `tests/test_ced.py`) the CED option: closed-form prefill FLOPs, the
   encoder-only residency, replay settings inert when CED is off (bit-identical runs), every request's stages and
-  timestamps in both replay placements, the fast path exact, and JS parity on 10 configurations; and (49, added
-  2026-10-06, `tests/test_levers.py`) the scheduling and KV-memory levers: inert settings and the new scheduler at
+  timestamps in both replay placements, the fast path exact, and JS parity on 10 configurations; and (48, added
+  2026-10-06, `tests/test_levers.py`; 48 since 2026-10-29) the scheduling and KV-memory levers: inert settings and the new scheduler at
   default levers bit-identical to the old colocated instance, the mixed step's closed forms (chunks sum to the whole
   prompt plus KV re-reads), memory never over-committed, each paper's ordering, LRU eviction, closed-loop sessions,
-  and JS parity on 15 configurations (preemption, swap, prefix hits, evictions and LRU ties all exercised); and (64,
+  and JS parity on 15 configurations (preemption, swap, prefix hits, evictions and LRU ties all exercised); and (62,
   added 2026-10-06, `tests/test_levers_2.py`) the second set: the scheduled disaggregated pools at default levers
   bit-identical to the old ones, memory never over-committed in either pool, the hand-off waiting for decode blocks,
   the prefill pool's cache, every unsupported combination raising, Leviathan et al.'s closed forms (their Table 1 to
   the printed digits, the acceptance draws converging, a verify step's FLOPs), the all-reduce, pipeline and
-  all-to-all costs, per-GPU memory, the MoE expert count, the formats, and JS parity on 22 configurations (24 since brief 34); and (54, added 2026-10-11, `tests/test_link_kernel.py`) the link kernel: hand formulas for every stage and the energy, the budget and kernel ledger against the Compute in Transit hub's results, refusals (top-k, requantisation, streams in a pluggable), KV hand-off runs without a kernel identical to commit `69ffd2b`, and the binding-stage counts; and (3, added 2026-10-14, `tests/test_gb200.py`) the GB200 preset: its figures, the JS device table equal to the Python presets field for field (every preset), and JS run parity on 2 GB200 configurations in `tests/test_levers_2.py`.
+  all-to-all costs, per-GPU memory, the MoE expert count, the formats, and JS parity on 22 configurations (24 since brief 34); and (3, added 2026-10-14, `tests/test_gb200.py`) the GB200 preset: its figures, the JS device table equal to the Python presets field for field (every preset), and JS run parity on 2 GB200 configurations in `tests/test_levers_2.py`.
 * Every number below comes from [`examples/results.md`](examples/results.md),
   written by `examples/results.py`.
 
@@ -140,7 +125,7 @@ queueing theory.
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .[dev]
-pytest                                   # 325 tests, about a minute
+pytest                                   # 187 tests, about a minute
 
 disagg-sim                               # one disaggregated run (70B, 4xH100 per instance)
 disagg-sim --compare                     # colocated vs disaggregated, same request stream
@@ -151,11 +136,9 @@ disagg-sim --fast                        # exact accelerated decode path
 disagg-sim --dvfs --decode-power-cap 250 # energy savings that cost (almost) no latency
 disagg-sim --power-cap 400 --dvfs        # cap everything: watch TTFT pay for it
 
-# heterogeneous pools, FFT-mixing models, the optical transform engine, KV compression
+# heterogeneous pools; compressing the KV hand-off on the prefill GPU
 disagg-sim --model llama3-8b --devices-per-instance 1 --prefill-device h100 --decode-device a100 --ppa
-disagg-sim --model llama3-8b-hyena-circ --prefill-lm-head last --devices-per-instance 1 \
-           --prefill-device optical-fft --ft-enob 11 --ft-mask-rate 20000 --ft-overlap --fft-efficiency 0.0625
-disagg-sim --model llama3-8b --devices-per-instance 1 --link eth-25g --rate 14 --kv-compress fp8 --kv-compress-at transit
+disagg-sim --model llama3-8b --devices-per-instance 1 --link eth-25g --rate 14 --kv-compress fp8
 
 # Causal Encoder-Decoder: prefill runs the encoder only; replay on prefill (the paper) or on decode (SGLang RFC)
 disagg-sim --model llama3-70b-ced --prompt 8192 --output 128 --rate 3
@@ -176,8 +159,6 @@ disagg-sim --mode colocated --model llama3-70b --tp 4 --weight-format fp8 --comp
 disagg-sim --mode colocated --model llama3-8b --devices-per-instance 1 --speculative mtp --gamma 3 --alpha 0.7 --rate 1
 disagg-sim --mode colocated --model mixtral-8x7b --devices-per-instance 2 --tp 2 --ep 2 --expert-imbalance 1.25
 
-# a declared link kernel compressing the KV hand-off in transit (brief 06C; illustrative)
-disagg-sim --model llama3-8b --devices-per-instance 1 --link ib-ndr --kv-compress freq-keep-k --link-kernel pluggable-99-free
 
 python examples/benchmark_acceleration.py   # measure every acceleration technique
 python examples/results.py               # regenerate examples/results.md (every quoted number)
@@ -198,7 +179,7 @@ hot-spot     stage=kv_wait -> kv-link (busy 96%)   busy>90%: decode-0, kv-link
 
 | Module | Role |
 |--------|------|
-| `src/disagg_sim/hardware.py` | `ModelSpec`, `Accelerator`, `Link`, `Parallel`, storage formats, the link kernel (`LinkKernel`, `KernelWork`), and the roofline `CostModel` (the only place that knows about time) |
+| `src/disagg_sim/hardware.py` | `ModelSpec`, `Accelerator`, `Link`, `Parallel`, storage formats, KV hand-off compression (`KVCompression`), and the roofline `CostModel` (the only place that knows about time) |
 | `src/disagg_sim/workload.py` | `Request` and all its timestamps; lognormal lengths; Poisson arrivals; sessions with shared prefixes (`chat_sessions`); named workloads (`WORKLOADS`); JSON replay |
 | `src/disagg_sim/sim.py` | SimPy processes for prefill, decode and colocated instances; the KV link as a `simpy.Resource`; routers; `FastDecodeInstance`; `ScheduledInstance` (batching policy, paged KV, preemption, speculative decoding), its pool versions `ScheduledPrefillInstance` / `ScheduledDecodeInstance`, and `PrefixCache` |
 | `src/disagg_sim/speculative.py` | Speculative decoding: Leviathan et al.'s closed forms and the acceptance draws (bit-identical in JS) |
@@ -238,27 +219,18 @@ The power coefficients in `hardware.py` are **illustrative**, chosen so prefill 
 near the H100's 700 W TDP and decode near 300 W. Calibrate them for real hardware by
 regressing measured power (DCGM) on FLOP and byte rates.
 
-### Optical prefill pools and heterogeneous pools (results.md sections 10–15)
+### Heterogeneous pools and hand-off compression (results.md sections 10, 14 and 15)
 
-Llama-3-8B shape, one device per instance, 1P1D, 8 req/s, 800 requests. Every coefficient of the
-optical engine is **illustrative**, and the block-circulant model is **speculative**:
+Llama-3-8B shape, one device per instance, 1P1D, 8 req/s, 800 requests:
 
 | Configuration | TTFT p99 | TPOT p99 | SLO met | J / token |
 |---------------|----------|----------|---------|-----------|
 | H100 prefill + H100 decode | 353.6 ms | 8.8 ms | 100.0% | 0.326 |
 | H100 prefill + A100 decode | 353.6 ms | 16.8 ms | 100.0% | 0.299 |
-| Hyena-2 on H100s | 374.9 ms | 114.4 ms | 0.0% | 0.371 |
-| Hyena-2, `optical-fft` prefill (defaults: ENOB 8, 1,031 Hz mask) | 172.0 s | 12.5 ms | 0.0% | 0.660 |
-| Circulant, last-token head, on H100s | 5.4 ms | 13.5 ms | 100.0% | 0.185 |
-| … same, GPU FFTs at 1/16 of the matmul rate | 40.0 ms | 13.5 ms | 100.0% | 0.210 |
-| … `optical-fft` prefill (optimistic: ENOB 11, 20 kHz, overlapped) | 90.5 ms | 13.5 ms | 100.0% | 0.194 |
 
-An optical transform engine does not pay for attention or Hyena models; for the circulant variant the
-optimistic engine wins TTFT only if GPU FFTs run below 1/30.9 of the matmul rate (or, at 1/16, with a
-mask rewriting at 47,942 Hz). Compressing the KV hand-off helps only where the link is the bottleneck
-(GQA KV over 25 GbE at 14 req/s: hand-off p99 9,657.8 ms → 166.6 ms with fp8, SLO 41.0% → 100.0%), and
-there the GPU does the same compression nearly free. Explained in
-[FOptInf 03](https://brendanjameslynskey.github.io/FOptInf_03_Optical_Prefill_Pools/).
+Compressing the KV hand-off on the prefill GPU helps only where the link is the bottleneck (GQA KV over 25 GbE at
+14 req/s: hand-off p99 9,657.8 ms → 166.6 ms with fp8, SLO 41.0% → 100.0%); the extra pass on the GPU costs almost
+nothing. Sections 11–13 and 27 were retired on 2026-10-29; the other sections keep their numbers.
 
 ### Causal Encoder-Decoder (results.md sections 16–18)
 
@@ -324,30 +296,6 @@ and traces, so only orderings and ranges are compared.
   TPOT SLO that prefill stalls break) but -33% on offline batch. A 512-token chunk budget helps chat (+28%) and hurts
   the coding agent (-24%). Prices per GPU-hour and α are illustrative parameters.
 
-### A general link kernel (results.md section 27)
-
-`LinkKernel` generalises section 15's in-transit stage into a declared kernel (CiT_03 slide 12's link kernel).
-Every coefficient not cited below is **illustrative** (laser 2 W, FPGA 50 G operations/s, 1 µs, the FPGA work per
-value, and the mapping onto a KV hand-off). Port 25 GB/s (QSFP56); optics 7 GB/s (4 × 14 GBaud NRZ, the series'
-arithmetic); budget 10 or 99 GFLOP/s, the series' reading of the paper's "tens of GFLOPs"; static 9.7 W (the paper);
-2.76 pJ/bit (the developer's website, excluding the laser). `tests/test_link_kernel.py` checks the budget rows, the
-longest charged FFT and the whole kernel ledger against the hub's `results.json` (vendored from the hub at `de8f33b`),
-and that KV hand-off runs without a kernel are identical to commit `69ffd2b`.
-
-Llama-3-8B shape, one H100 per instance, 1P1D, 8 req/s, 800 requests (section 15's workload), `freq-keep-k`
-(a token-axis transform keeping a fixed band; the quantising presets are refused: no comparisons). Hand-off p99:
-
-| Link | Uncompressed | Section 15 stage | `pluggable-10` | `pluggable-99` | `pluggable-10-free` |
-|---|---|---|---|---|---|
-| eth-25g | 471.9 ms | 157.0 ms | 208,297 ms (compute-bound) | 160.5 ms | 157.0 ms (link-bound) |
-| eth-100g | 76.2 ms | 38.2 ms | 208,297 ms (compute-bound) | 154.9 ms (compute-bound) | 68.1 ms (optics-bound) |
-| ib-ndr | 19.1 ms | 9.6 ms | 208,289 ms (compute-bound) | 154.9 ms (compute-bound) | 68.1 ms (optics-bound) |
-
-A 2,048-token transform costs 13.75 FLOPs per byte, 34.4× the 10 GFLOP/s budget at the port: if the transform is
-charged, the module's compute binds; if it is free, the optics bind on any link faster than 7 GB/s (derived: 56 Gb/s ÷ 8 bit planes = 7 G values/s =
-14 GB/s of BF16 input, which at ratio 2 is 7 GB/s on the wire), so on InfiniBand the module is slower than sending the
-KV uncompressed.
-
 ### Device presets on the standard workload (results.md section 28)
 
 Llama-3-70B, 4 GPUs per instance, 1P1D, InfiniBand NDR hand-off, 800 requests (the workload of sections 3–8):
@@ -362,25 +310,22 @@ Llama-3-70B, 4 GPUs per instance, 1P1D, InfiniBand NDR hand-off, 800 requests (t
 GB200 differs from B200 here only in compute (1.111×), memory (186 GB against 180 GB) and board limit: decode, which
 is bandwidth-bound, is unchanged. Its 72-GPU NVLink domain is not modelled.
 
-**Ports.** JavaScript: everything, bit-exact, except the link kernel (Python only). Rust
+**Ports.** JavaScript: everything, bit-exact. Rust
 ([Rust_DES_Kernel](https://github.com/BrendanJamesLynskey/Rust_DES_Kernel)): heterogeneous pools only,
-bit-exact; the FFT-mixing models, the optical transform engine, KV hand-off compression and the CED option
-are **Python and JS only, not in the Rust port**; the Rust side rejects the first three by name and the
-`*-ced` models as unknown models. The scheduling and KV-memory levers (sections 19–21) are also **Python and JS
+bit-exact; KV hand-off compression and the CED option are **Python and JS only, not in the Rust port**; the Rust
+side rejects hand-off compression by name and the `*-ced` models as unknown models. The scheduling and KV-memory levers (sections 19–21) are also **Python and JS
 only**: the JS port is bit-exact on every one of them, and Rust_DES_Kernel rejects a configuration that turns any of
 them on ("... are Python and JS only, not in the Rust port"), closed-loop sessions and the validation presets
 included. So are the brief-20A2 levers (the levers in disaggregated pools, parallelism, formats, speculative
 decoding, `mixtral-8x7b`, `llama3.2-1b`, `h200`, `b200`): bit-exact in JS (22 more parity configurations), rejected
 by Rust through `SimConfig.lever_summary`. The `gb200` preset (2 more parity configurations) is not in the Rust port,
-which rejects it as an unknown device. The link kernel rides on `KVTransit`, so Rust rejects it with the rest of
-KV hand-off compression (`kv_transit ...: KV hand-off compression is Python and JS only`).
+which rejects it as an unknown device.
 
 `examples/results.py --keep-timings` regenerates sections 1–8 and 10–22 and keeps section 9 (wall
-clock) from the previous run; `--optical-from-json` re-renders 10–15 from `examples/results_optical.json`,
+clock) from the previous run; `--pools-from-json` re-renders 10, 14 and 15 from `examples/results_pools.json`,
 `--ced-from-json` re-renders 16–18 from `examples/results_ced.json`, `--levers-from-json` re-renders 19–22
 from `examples/results_levers.json` and `--levers2-from-json` re-renders 23–25 from `examples/results_levers2.json`.
 Section 26 is always rendered from `examples/tradeoffs.json`, which only `examples/tradeoffs.py` writes.
-Section 27 (the link kernel) writes `examples/results_link_kernel.json`; `--link-kernel-from-json` re-renders it.
 Section 28 (the device presets) is always rerun.
 
 ---
@@ -417,9 +362,7 @@ Section 28 (the device presets) is always rerun.
   compressed sparse attention). A replayed token is charged a whole decoder layer (its local K/V
   included, standing in for the paper's sliding-window branch), and CED does not change the KV size:
   the paper's KV savings come from cross-layer sharing and FP4, which are not modelled.
-* The optical transform engine is first-order: noise as ENOB with ideal gain control, passes
-  `4^(required − ENOB)`, integer mask rewrites, static lasers and tuning; no crosstalk or drift.
-  Relaxed-tiling decode (FFTs at decode) and the accuracy of compressed KV are not modelled.
+* The accuracy of compressed KV is not modelled.
 * DVFS is continuous (compute clock fraction `s ≥ s_min`, energy per op ∝ s²); real parts
   have discrete operating points, voltage floors and transition latency. Static power is
   charged for the whole run (no power gating).

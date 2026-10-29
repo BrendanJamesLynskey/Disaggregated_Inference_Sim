@@ -38,8 +38,8 @@ from dataclasses import dataclass, field
 
 import simpy
 
-from .hardware import (H100_SXM, LINKS, LLAMA3_70B, MODELS, QUANT_FORMATS, Accelerator, CostModel, KVTransit,
-                       LeverStepCost, Link, ModelSpec, Parallel, StepCost, kv_work)
+from .hardware import (H100_SXM, LINKS, LLAMA3_70B, MODELS, QUANT_FORMATS, Accelerator, CostModel, KVCompression,
+                       LeverStepCost, Link, ModelSpec, Parallel, StepCost)
 from .speculative import Speculative, draw_accepted, seed_state
 from .trace import Tracer
 from .workload import Request
@@ -74,7 +74,7 @@ class SimConfig:
     decode_device: Accelerator | None = None
     prefill_devices_per_instance: int | None = None
     decode_devices_per_instance: int | None = None
-    kv_transit: KVTransit | None = None   # compress the KV hand-off in the link or at the GPU
+    kv_compression: KVCompression | None = None   # compress the KV hand-off on the prefill GPU
     # Brief 20A1 levers (colocated mode; every default reproduces the behaviour above exactly).
     batch_policy: str = "prefill-priority"   # | "decode-priority" | "chunked" (Sarathi-Serve)
     max_num_batched_tokens: int | None = None   # token budget of one step (None: max_prefill_tokens)
@@ -163,8 +163,6 @@ class Instance:
             self.kv_cap = self.cost.kv_capacity_tokens
         except ValueError as e:
             raise ValueError(f"{self.role} pool: {e}") from None
-        if not sim.cfg.model.kv_bytes_per_token:     # a distilled-state model reserves one state
-            self.kv_need = lambda r: 1
         self.busy = 0.0
         self.steps = 0
         self.compute_bound_time = 0.0
@@ -175,9 +173,6 @@ class Instance:
         self.memory_j = 0.0
         self.peak_power = 0.0       # highest average power over any single step, W
         self.power_bound_time = 0.0
-        self.optical_j = 0.0        # transform engine: conversion energy
-        self.optical_flops = 0.0    # transform engine: FLOPs it took
-        self.optical_bound_time = 0.0
         self.comm_time = 0.0        # brief 20A2: scale-up link seconds (parallelism) ...
         self.comm_j = 0.0           # ... and joules
         self.draft_time = 0.0       # speculative decoding: seconds of draft passes
@@ -205,10 +200,7 @@ class Instance:
         self.flops += cost.flops
         self.bytes += cost.bytes
         self.batch_sum += batch
-        if cost.optical_j or cost.bound == "optical":
-            self.account_optical(cost)
-        else:
-            self.account_power(cost.time, cost.compute_j, cost.memory_j, cost.bound)
+        self.account_power(cost.time, cost.compute_j, cost.memory_j, cost.bound)
         if cost.lever:
             self.comm_time += cost.comm_time
             self.comm_j += cost.comm_j
@@ -225,21 +217,6 @@ class Instance:
             self.peak_power = p
         if bound == "power":
             self.power_bound_time += dt
-
-    def account_optical(self, cost) -> None:
-        """A step with transform-engine work: conversion energy and the optical bound."""
-        self.compute_j += cost.compute_j
-        self.memory_j += cost.memory_j
-        self.optical_j += cost.optical_j
-        self.optical_flops += cost.optical_flops
-        dt = cost.time
-        p = self.cost.idle_w + self.cost.optical_static_w + (cost.compute_j + cost.memory_j + cost.optical_j) / dt
-        if p > self.peak_power:
-            self.peak_power = p
-        if cost.bound == "power":
-            self.power_bound_time += dt
-        elif cost.bound == "optical":
-            self.optical_bound_time += dt
 
     # Token bookkeeping shared by decode and colocated instances.
     def kv_need(self, r: Request) -> int:
@@ -301,8 +278,7 @@ class PrefillInstance(Instance):
             for r in batch:
                 r.prefill_start = self.env.now
             cost = self.cost.prefill([r.prompt_len for r in batch])
-            tr = self.sim.cfg.kv_transit
-            if tr is not None and tr.where == "endpoint":
+            if self.sim.cfg.kv_compression is not None:
                 cost = self.sim.endpoint_compress(self.cost, cost, batch)
             self.prefilling = batch
             yield from self.step("prefill", cost, f"prefill n={len(batch)} tok={tokens}",
@@ -432,7 +408,6 @@ class FastDecodeInstance(DecodeInstance):
         fa, fb = 2 * m.matmul_params, 4 * m.n_layers * m.d_model
         w, er, kv = m.weight_bytes_streamed, m.embedding_row_bytes, m.kv_bytes_per_token
         step_time, overhead = cm.step_time_raw, cm.step_overhead
-        generic = not m.is_transformer        # FFT-mixing variants: the cost model's own ledger
         horizon = 16                         # adaptive look-ahead, in steps
         while True:
             self.admit_decode()
@@ -445,13 +420,9 @@ class FastDecodeInstance(DecodeInstance):
             k = min(self.finish_heap[0][0] - len(self.step_end) + 1, horizon)
             t, ctx, ends, steps = self.env.now, self.ctx_sum, [], []
             for _ in range(k):
-                if generic:
-                    c = cm.decode_sum(ctx, b)
-                    flops, nbytes, dt, ec, em, bound = c.flops, c.bytes, c.time, c.compute_j, c.memory_j, c.bound
-                else:
-                    flops, nbytes = fa * b + fb * (ctx + b), w + b * er + (ctx + b) * kv
-                    dt, ec, em, bound = step_time(flops, nbytes)
-                    dt = dt + overhead
+                flops, nbytes = fa * b + fb * (ctx + b), w + b * er + (ctx + b) * kv
+                dt, ec, em, bound = step_time(flops, nbytes)
+                dt = dt + overhead
                 t += dt
                 ends.append(t)
                 steps.append((dt, flops, nbytes, bound, ec, em))
@@ -1127,8 +1098,7 @@ class ScheduledPrefillInstance(ScheduledInstance):
         return self.units(r.target - hit)
 
     def finish_cost(self, cost, finishing: list[Request]):
-        tr = self.sim.cfg.kv_transit
-        if tr is not None and tr.where == "endpoint" and finishing:
+        if self.sim.cfg.kv_compression is not None and finishing:
             return self.sim.endpoint_compress(self.cost, cost, finishing)
         return cost
 
@@ -1233,9 +1203,6 @@ class LinkStats:
     wait: float = 0.0
     energy: float = 0.0              # the link's own energy
     handoff_bytes: float = 0.0       # hand-off bytes before compression
-    transit_j: float = 0.0           # in-transit stage energy
-    transit_bound: int = 0           # transfers the in-transit stage's compute slowed
-    kernel_stages: dict = field(default_factory=dict)   # link kernel (brief 06C): binding stage -> transfers
 
 
 @dataclass
@@ -1277,8 +1244,8 @@ class Simulation:
         if self.successor and cfg.fast_forward:
             raise ValueError("closed-loop sessions (Request.after) need exact finish times: not with fast_forward")
 
-        if cfg.kv_transit is not None and cfg.mode != "disagg":
-            raise ValueError("kv_transit compresses the prefill-to-decode hand-off: mode='disagg' only")
+        if cfg.kv_compression is not None and cfg.mode != "disagg":
+            raise ValueError("kv_compression compresses the prefill-to-decode hand-off: mode='disagg' only")
         ced_on_decode = cfg.model.is_ced and cfg.model.ced_replay_on == "decode"
         if ced_on_decode and cfg.mode != "disagg":
             raise ValueError("ced_replay_on='decode' splits prefill across the two pools: mode='disagg' only")
@@ -1311,7 +1278,7 @@ class Simulation:
 
     @staticmethod
     def check_levers(cfg: SimConfig) -> None:
-        """The scheduled levers: attention models only (no CED), valid names, no cache with swap; in disaggregated
+        """The scheduled levers: models without CED only, valid names, no cache with swap; in disaggregated
         mode not on the fast path, and no speculative draft KV through hand-off compression."""
         if cfg.batch_policy not in BATCH_POLICIES:
             raise ValueError(f"unknown batch_policy {cfg.batch_policy!r}")
@@ -1319,12 +1286,12 @@ class Simulation:
             raise ValueError(f"unknown kv_policy {cfg.kv_policy!r}")
         if cfg.preemption not in ("recompute", "swap"):
             raise ValueError(f"unknown preemption {cfg.preemption!r}")
-        if not cfg.model.is_transformer or cfg.model.is_ced:
+        if cfg.model.is_ced:
             raise ValueError("the scheduling levers (batch_policy, max_num_batched_tokens, kv_policy, prefix_caching, "
-                             "speculative) are modelled for attention models without CED only")
+                             "speculative) are modelled for models without CED only")
         if cfg.fast_forward and cfg.mode == "disagg":
             raise ValueError("fast_forward is the plain decode instance's fast path: not with the scheduling levers")
-        if cfg.mode == "disagg" and cfg.speculative is not None and cfg.kv_transit is not None:
+        if cfg.mode == "disagg" and cfg.speculative is not None and cfg.kv_compression is not None:
             raise ValueError("speculative decoding with KV hand-off compression is not modelled (the draft's KV "
                              "would cross uncompressed)")
         if cfg.kv_block_size < 1 or (cfg.max_num_batched_tokens is not None and cfg.max_num_batched_tokens < 1):
@@ -1342,9 +1309,9 @@ class Simulation:
         if cfg.compute_format not in ("bf16", cfg.weight_format):
             raise ValueError("compute_format is 'bf16' (weight-only: dequantised before the multiply) or the weight "
                              "format itself (W8A8, W4A4)")
-        if cfg.quantised and (not m.is_transformer or m.is_ced):
-            raise ValueError("weight and KV formats are modelled for attention models without CED only")
-        if cfg.kv_format != "bf16" and cfg.kv_transit is not None:
+        if cfg.quantised and m.is_ced:
+            raise ValueError("weight and KV formats are modelled for models without CED only")
+        if cfg.kv_format != "bf16" and cfg.kv_compression is not None:
             raise ValueError("KV hand-off compression assumes a BF16 KV cache: not with kv_format != 'bf16'")
         if cfg.fast_forward and cfg.mode == "disagg":
             raise ValueError("fast_forward is the plain decode instance's fast path: not with parallelism, "
@@ -1409,16 +1376,16 @@ class Simulation:
 
     def endpoint_compress(self, cm: CostModel, cost, batch: list[Request]):
         """Compress each request's hand-off on the prefill GPU after the step."""
-        tr, m = self.cfg.kv_transit, self.cfg.model
-        if tr.compression.ratio == 1.0 and not tr.compression.ops_per_value:
+        c, m = self.cfg.kv_compression, self.cfg.model
+        if c.ratio == 1.0 and not c.ops_per_value:
             return cost                       # "none": nothing to do
         ops = nbytes = 0.0
         for r in batch:
             if r.output_len <= 1 and not cm.encoder_only:
                 continue                      # finished at prefill: nothing to hand off
             hb = m.handoff_bytes(r.prompt_len)
-            ops += tr.ops(hb, r.prompt_len, m.kv_bytes, True)
-            nbytes += hb + hb / tr.compression.ratio      # read the KV, write the compressed copy
+            ops += c.ops(hb, m.kv_bytes)
+            nbytes += hb + hb / c.ratio      # read the KV, write the compressed copy
         return cm.compress_pass(cost, ops, nbytes) if nbytes else cost
 
     # ── population accounting (exact time-average for Little's law) ──────
@@ -1462,7 +1429,7 @@ class Simulation:
                 return
             min(self.colocated, key=lambda i: i.load()).submit(r)
             return
-        units = self.cfg.model.cache_units(r.prompt_len, r.output_len)
+        units = r.prompt_len + r.output_len
         if self.cfg.mode == "disagg":
             if units > self.decode[0].kv_cap:
                 self._reject(r)
@@ -1489,32 +1456,15 @@ class Simulation:
         if self.n_done + len(self.rejected) == len(self.requests):
             self.done.succeed()
 
-    def transfer(self, r: Request) -> tuple[float, float, float, float, bool]:
-        """(seconds, bytes on the link, link joules, in-transit joules, transit-bound)."""
-        link, tr, m = self.cfg.link, self.cfg.kv_transit, self.cfg.model
+    def transfer(self, r: Request) -> tuple[float, float, float]:
+        """(seconds, bytes on the link, link joules)."""
+        link, c, m = self.cfg.link, self.cfg.kv_compression, self.cfg.model
         nbytes = m.handoff_bytes(r.prompt_len)
         if self.draft_model is not None:      # speculative decoding: the draft's KV crosses too
             nbytes = nbytes + r.prompt_len * self.draft_model.kv_bytes_per_token
-        if tr is None:
-            return link.transfer_time(nbytes), nbytes, nbytes * 8 * link.pj_per_bit * 1e-12, 0.0, False
-        wire = nbytes / tr.compression.ratio
-        if tr.where == "endpoint":            # compressed on the GPU already
-            return link.transfer_time(wire), wire, wire * 8 * link.pj_per_bit * 1e-12, 0.0, False
-        if tr.kernel is not None:             # brief 06C: a declared link kernel; its slowest stage sets the time
-            k = tr.kernel
-            t, stage, st = k.stream(nbytes, kv_work(tr.compression, r.prompt_len, k.planes), link)
-            e = k.energy(nbytes, st[stage])
-            ks = self.link_stats.kernel_stages
-            ks[stage] = ks.get(stage, 0) + 1
-            return (t, wire, wire * 8 * link.pj_per_bit * 1e-12, e["static"] + e["laser"] + e["dynamic"],
-                    stage != "link")
-        # In transit: the stage streams at line rate with a budget of ops_per_byte per line
-        # byte; if its work does not fit, its compute time sets the transfer time.
-        t_wire = wire / link.bandwidth
-        t_ops = tr.ops(nbytes, r.prompt_len, m.kv_bytes, False) / (tr.ops_per_byte * link.bandwidth)
-        t = link.latency + tr.latency + max(t_wire, t_ops)
-        return (t, wire, wire * 8 * link.pj_per_bit * 1e-12, nbytes * 8 * tr.pj_per_bit * 1e-12,
-                t_ops > t_wire)
+        if c is not None:                     # compressed on the GPU already
+            nbytes = nbytes / c.ratio
+        return link.transfer_time(nbytes), nbytes, nbytes * 8 * link.pj_per_bit * 1e-12
 
     def handoff(self, r: Request, src: "ScheduledPrefillInstance") -> None:
         """Brief 20A2: a prefilled request goes to the least-loaded decode instance, which pulls its KV when it
@@ -1527,16 +1477,14 @@ class Simulation:
             yield grant
             r.kv_start = self.env.now
             stats.wait += r.kv_start - r.handoff_start
-            t, nbytes, joules, transit_j, transit_bound = self.transfer(r)
+            t, nbytes, joules = self.transfer(r)
             yield self.env.timeout(t)
         stats.busy += t
         stats.bytes += nbytes
         stats.transfers += 1
         stats.energy += joules
-        if self.cfg.kv_transit is not None:
+        if self.cfg.kv_compression is not None:
             stats.handoff_bytes += self.cfg.model.handoff_bytes(r.prompt_len)
-            stats.transit_j += transit_j
-            stats.transit_bound += transit_bound
         r.kv_ready = self.env.now
         self.tracer.span("kv-link", "kv", f"kv r{r.rid} {nbytes / 1e6:.0f} MB", r.kv_start, t)
         if dst is not None:                   # scheduled pools: the decode instance reserved room before the pull

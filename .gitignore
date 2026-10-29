@@ -6,9 +6,8 @@ __pycache__/
 !web/*.json
 !tests/fixtures/*.json
 .venv/
-!examples/results_optical.json
+!examples/results_pools.json
 !examples/results_ced.json
 !examples/results_levers.json
 !examples/results_levers2.json
 !examples/tradeoffs.json
-!examples/results_link_kernel.json
