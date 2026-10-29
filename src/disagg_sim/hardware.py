@@ -11,17 +11,8 @@ important structural decision in any architecture simulator: it lets you swap
 a 10-line roofline for a calibrated table, a cycle-level model, or real
 silicon measurements without touching the scheduling logic.
 
-Added 2026-10-04 (Fourier-optics follow-up, all illustrative or speculative where marked):
-
-* FFT-mixing model variants (``ModelSpec.mixer``): Hyena-style long convolutions, a 1:3
-  attention:Hyena hybrid, and block-circulant weights. Their prefill FLOPs come from an op
-  ledger (``Ops``) that reproduces the FOptInf phase-A analysis (``flop_share.py``) exactly.
-* ``TransformEngine``: a Fourier-optical **transform** engine co-packaged with a digital part.
-  It takes only FFT and Fourier-plane work (with conversion, precision-pass and mask-rewrite
-  costs); everything else runs on the digital part. This is different from
-  ``HYPOTHETICAL_OPTICAL``, an optical **MAC** that speeds up every matmul.
-* ``KVCompression`` / ``KVTransit``: compressing the KV hand-off either in the link
-  ("compute in transit") or on the prefill GPU, for comparison.
+Added 2026-10-04: ``KVCompression``, compressing the KV hand-off on the prefill GPU before it is
+sent (an elementwise pass over the KV: HBM read + write, plus the FLOPs). Illustrative.
 
 Added 2026-10-05 (brief 11): the Causal Encoder-Decoder (CED) option of DeepSeek-V4.1-Flash
 (arXiv:2609.19969, section 2.2). ``ModelSpec.ced_encoder_layers = E > 0`` makes the bottom E
@@ -61,10 +52,6 @@ Added 2026-10-14 (brief 34): a GB200 preset (``gb200``), one Blackwell GPU of a 
 (NVIDIA's GB200 NVL72 page: 186 GB at 8 TB/s, 2.5 PFLOPS dense BF16, FP8 and FP4 at 2x and 4x; up to 1,200 W;
 power coefficients illustrative, as for B200). The rack's 72-GPU NVLink domain is not modelled.
 
-Added 2026-10-11 (Compute in Transit brief 06C), off by default: ``LinkKernel``, the in-transit stage as a declared
-link kernel (operation set with no comparisons, precision in bit planes, compression ratio, placement in a pluggable
-or a switch; port / optics / compute budget / FPGA stages, the slowest binding; static + laser + dynamic energy),
-calibrated illustratively to a photonic link module (Kundu et al., arXiv:2608.21536). ``KVTransit.kernel`` selects it.
 """
 
 from __future__ import annotations
@@ -75,22 +62,6 @@ from functools import cached_property
 
 GB = 1e9
 TB = 1e12
-
-# ENOB a transform engine's analogue output needs to match each format's own rounding
-# (FOptInf A§6: 10.3, 8.0 and 6.3, rounded up so the pass count is an exact integer).
-ENOB_REQUIRED = {"bf16": 11, "int8": 8, "fp8": 7}
-
-
-# ─────────────────────────────────────────────────────────── op ledger ──
-def rfft_flops(n: int) -> float:
-    """Real FFT of length n (a power of two): 2.5 n log2 n, FFTW's convention. log2 is taken
-    as an integer, so every language computes the same float."""
-    return 2.5 * n * (n.bit_length() - 1)
-
-
-def pow2_at_least(n: int) -> int:
-    return 1 << (n - 1).bit_length()
-
 
 def ipow(x: float, n: int) -> float:
     """x ** n for an integer n >= 0 by binary exponentiation: the same multiplications in every language
@@ -111,58 +82,10 @@ def ipow(x: float, n: int) -> float:
 QUANT_FORMATS = {"bf16": 2.0, "fp8": 1.0, "int8": 1.0, "int4": 0.5 + 2 / 128, "fp4": 0.5 + 1 / 32}
 
 
-@dataclass
-class Ops:
-    """FLOPs by class (the FOptInf analysis's ledger). ``transform`` = FFT/IFFT work and
-    ``spectral`` = pointwise work in the Fourier domain: what a 4f optical system could take.
-    ``dense`` = matmuls, ``attention`` = QK^T and AV, ``other`` = short convs, gating, sums."""
-
-    dense: float = 0.0
-    attention: float = 0.0
-    transform: float = 0.0
-    spectral: float = 0.0
-    other: float = 0.0
-
-    def __iadd__(self, o: "Ops") -> "Ops":
-        self.dense += o.dense
-        self.attention += o.attention
-        self.transform += o.transform
-        self.spectral += o.spectral
-        self.other += o.other
-        return self
-
-    @property
-    def total(self) -> float:
-        # left to right, never sum(): Python's float sum() is compensated, which would break
-        # bit-exact parity with the JavaScript port
-        return self.dense + self.attention + self.transform + self.spectral + self.other
-
-    @property
-    def optical(self) -> float:
-        return self.transform + self.spectral
-
-    @property
-    def digital(self) -> float:
-        """Everything a transform engine cannot take."""
-        return self.dense + self.attention + self.other
-
-
 # ─────────────────────────────────────────────────────────────── model ──
-MIXERS = ("attention", "hyena", "hybrid")
-
-
 @dataclass(frozen=True)
 class ModelSpec:
-    """A decoder-only model, described by its shape alone.
-
-    The default is a transformer (``mixer="attention"``). The other mixers keep the same
-    shape and swap the token mixer (Hyena order-N long convolutions; ``hybrid`` keeps
-    attention in every ``attn_every``-th layer) and optionally the weights
-    (``circulant_block`` > 0: block-circulant projections and MLP, speculative at LLM
-    scale). Hyena decode is ``"direct"`` (cache past projection inputs; O(context) dot
-    product, no transform) or ``"distilled"`` (a recurrence with a constant state per
-    sequence; Laughing Hyena). The FOptInf phase-A analysis derives all of this.
-    """
+    """A decoder-only transformer, described by its shape alone."""
 
     name: str
     n_layers: int
@@ -173,14 +96,6 @@ class ModelSpec:
     vocab: int
     weight_bytes: float = 2.0   # BF16 weights
     kv_bytes: float = 2.0       # BF16 KV cache
-    mixer: str = "attention"    # "attention" | "hyena" | "hybrid"
-    attn_every: int = 4         # hybrid: layer i is attention when i % attn_every == 0
-    hyena_order: int = 2        # N long convolutions per Hyena layer (N + 1 projections)
-    short_taps: int = 3         # Hyena short depthwise convolution
-    circulant_block: int = 0    # 0: dense weights; k > 0: block-circulant (Hyena only)
-    decode_style: str = "direct"  # Hyena decode: "direct" (cached inputs) | "distilled"
-    distill_state: int = 16     # state size per channel for "distilled" (illustrative)
-    act_format: str = "bf16"    # format a transform engine's output must match: bf16 | int8 | fp8
     prefill_lm_head: str = "all"  # "all": every prompt token (as now) | "last": last token only
     # Causal Encoder-Decoder (DeepSeek-V4.1-Flash, arXiv:2609.19969 section 2.2). 0 = off.
     ced_encoder_layers: int = 0   # E: the bottom E layers are the causal encoder (the paper: 20 of 40)
@@ -193,21 +108,9 @@ class ModelSpec:
     n_shared_experts: int = 0
 
     def __post_init__(self):
-        if self.mixer not in MIXERS:
-            raise ValueError(f"unknown mixer {self.mixer!r}")
-        if self.circulant_block and self.mixer != "hyena":
-            raise ValueError("block-circulant weights are modelled for mixer='hyena' only")
-        if self.decode_style not in ("direct", "distilled"):
-            raise ValueError(f"unknown decode_style {self.decode_style!r}")
-        if self.decode_style == "distilled" and self.mixer != "hyena":
-            raise ValueError("decode_style='distilled' needs mixer='hyena' (no attention KV)")
         if self.prefill_lm_head not in ("all", "last"):
             raise ValueError(f"unknown prefill_lm_head {self.prefill_lm_head!r}")
-        if self.act_format not in ENOB_REQUIRED:
-            raise ValueError(f"unknown act_format {self.act_format!r}")
         if self.ced_encoder_layers:
-            if self.mixer != "attention":
-                raise ValueError("ced_encoder_layers is modelled for mixer='attention' only")
             if not 0 < self.ced_encoder_layers < self.n_layers:
                 raise ValueError("ced_encoder_layers must leave at least one decoder layer")
             if self.ced_replay < 1:
@@ -215,8 +118,8 @@ class ModelSpec:
             if self.ced_replay_on not in ("prefill", "decode"):
                 raise ValueError(f"unknown ced_replay_on {self.ced_replay_on!r}")
         if self.n_experts:
-            if self.mixer != "attention" or self.ced_encoder_layers:
-                raise ValueError("mixture-of-experts layers are modelled for mixer='attention' without CED only")
+            if self.ced_encoder_layers:
+                raise ValueError("mixture-of-experts layers are modelled without CED only")
             if not 1 <= self.top_k <= self.n_experts:
                 raise ValueError("top_k must be between 1 and n_experts")
 
@@ -253,33 +156,6 @@ class ModelSpec:
         """QK^T and AV FLOPs of the last w positions of an s-token prompt, over ``layers`` causal
         layers: sum of 4 d c for c = s - w + 1 .. s (integers, so every language agrees)."""
         return 2 * layers * self.d_model * w * (2 * s - w + 1)
-
-    # ── layer structure (all-attention models: every layer is attention) ──
-    def layer_is_attention(self, i: int) -> bool:
-        return self.mixer == "attention" or (self.mixer == "hybrid" and i % self.attn_every == 0)
-
-    @cached_property
-    def n_attention_layers(self) -> int:
-        return sum(1 for i in range(self.n_layers) if self.layer_is_attention(i))
-
-    @cached_property
-    def n_hyena_layers(self) -> int:
-        return self.n_layers - self.n_attention_layers
-
-    @cached_property
-    def is_transformer(self) -> bool:
-        """True for the original models: every number they produce is unchanged."""
-        return self.mixer == "attention"
-
-    def _matrices(self) -> list[tuple[int, int]]:
-        """(rows, cols) of each weight matrix in one Hyena layer: in-, out-projection, MLP."""
-        d, n, ff = self.d_model, self.hyena_order, self.d_ff
-        return [((n + 1) * d, d), (d, d), (ff, d), (ff, d), (d, ff)]
-
-    @cached_property
-    def hyena_params_per_layer(self) -> int:
-        k = self.circulant_block
-        return sum(m * n // k if k else m * n for m, n in self._matrices())
 
     @cached_property
     def params_per_layer(self) -> int:
@@ -318,9 +194,8 @@ class ModelSpec:
 
     @cached_property
     def layer_params(self) -> int:
-        """Parameters of all layers (attention layers: params_per_layer)."""
-        return (self.n_attention_layers * self.params_per_layer
-                + self.n_hyena_layers * self.hyena_params_per_layer)
+        """Parameters of all layers."""
+        return self.n_layers * self.params_per_layer
 
     @cached_property
     def params(self) -> int:
@@ -369,171 +244,18 @@ class ModelSpec:
 
     @cached_property
     def kv_bytes_per_token(self) -> float:
-        """K and V, for every attention layer, for one token; plus, for Hyena layers decoded
-        directly, the N cached projection inputs of width d (4x GQA's KV for Llama-3-8B)."""
-        conv = self.n_hyena_layers * self.hyena_order * self.d_model if self.decode_style == "direct" else 0
-        return (2 * self.n_attention_layers * self.n_kv_heads * self.head_dim + conv) * self.kv_bytes
-
-    @cached_property
-    def state_bytes_per_seq(self) -> float:
-        """Distilled Hyena decode: a constant complex state (4 bytes per value) per sequence."""
-        if self.decode_style != "distilled":
-            return 0.0
-        return self.n_hyena_layers * self.hyena_order * self.d_model * self.distill_state * 4.0
+        """K and V, for every layer, for one token."""
+        return (2 * self.n_layers * self.n_kv_heads * self.head_dim) * self.kv_bytes
 
     def handoff_bytes(self, prompt_len: int) -> float:
-        """What prefill hands to decode over the KV link: KV, a conv cache or a constant state."""
-        if self.state_bytes_per_seq:
-            return self.state_bytes_per_seq
+        """What prefill hands to decode over the KV link: the prompt's KV."""
         return prompt_len * self.kv_bytes_per_token
-
-    @cached_property
-    def cache_unit_bytes(self) -> float:
-        """Admission control's unit: one token of KV (as before), or one sequence's state."""
-        return self.kv_bytes_per_token if self.kv_bytes_per_token else self.state_bytes_per_seq
-
-    def cache_units(self, prompt_len: int, output_len: int) -> int:
-        """Units a request reserves: the whole sequence's tokens, or one state."""
-        return prompt_len + output_len if self.kv_bytes_per_token else 1
-
-    # ── op ledger (FFT-mixing variants; flop_share.py's conventions, same float order) ──
-    def _dense_matrix(self, m: int, n: int, tokens: int) -> Ops:
-        k = self.circulant_block
-        if not k:
-            return Ops(dense=2.0 * m * n * tokens)
-        bins = k // 2 + 1
-        # FFT each of the n/k input blocks, multiply by (m/k)(n/k) block spectra, accumulate,
-        # IFFT each of the m/k output blocks (CirCNN's FFT -> multiply -> IFFT)
-        return Ops(transform=tokens * ((n // k) * rfft_flops(k) + (m // k) * rfft_flops(k)),
-                   spectral=tokens * (m // k) * (n // k) * bins * 6.0,
-                   other=tokens * (m // k) * (n // k - 1) * bins * 2.0)
-
-    def _mlp(self, tokens: int) -> Ops:
-        o = Ops()
-        d, ff = self.d_model, self.d_ff
-        for m, n in ((ff, d), (ff, d), (d, ff)):          # gate, up, down
-            o += self._dense_matrix(m, n, tokens)
-        return o
-
-    def _attention_layer(self, lens: list[int]) -> Ops:
-        d, kv = self.d_model, self.n_kv_heads * self.head_dim
-        o = Ops(dense=2.0 * sum(lens) * (2 * d * d + 2 * d * kv))
-        for s in lens:
-            o.attention += 2.0 * d * s * (s + 1)
-        return o
-
-    def _hyena_layer(self, lens: list[int]) -> Ops:
-        d, n = self.d_model, self.hyena_order
-        tokens = sum(lens)
-        o = Ops()
-        o += self._dense_matrix((n + 1) * d, d, tokens)                 # in-projection
-        o += self._dense_matrix(d, d, tokens)                           # out-projection
-        o.other += tokens * 2.0 * self.short_taps * (n + 1) * d         # short depthwise conv
-        o.other += tokens * n * d                                       # gating multiplies
-        for s in lens:
-            f = pow2_at_least(2 * s)        # zero-padded to >= 2L: causal, no circular wrap
-            o.transform += n * d * 2 * rfft_flops(f)
-            o.spectral += n * d * (f // 2 + 1) * 6.0
-        return o
-
-    def prefill_ops(self, prompt_lens: list[int]) -> Ops:
-        """Prefill FLOPs by class, layer by layer (equals CostModel.prefill's total for
-        transformers, and flop_share.prefill for every variant)."""
-        tokens = sum(prompt_lens)
-        o = Ops()
-        for i in range(self.n_layers):
-            o += self._attention_layer(prompt_lens) if self.layer_is_attention(i) else self._hyena_layer(prompt_lens)
-            o += self._mlp(tokens)
-        head = tokens if self.prefill_lm_head == "all" else len(prompt_lens)
-        o += Ops(dense=2.0 * self.vocab * self.d_model * head)
-        return o
-
-    def decode_ops(self, ctx: int, batch: int) -> Ops:
-        """Decode FLOPs for ``batch`` new tokens over ``ctx`` cached positions (FFT-mixing
-        variants; matches flop_share.decode_per_token at batch 1). No transforms at decode:
-        a direct cached dot product or a distilled recurrence."""
-        d, n = self.d_model, self.hyena_order
-        kv = self.n_kv_heads * self.head_dim
-        proj_in, proj_out, mlp, head = self._decode_parts(batch)
-        o = Ops()
-        for i in range(self.n_layers):
-            if self.layer_is_attention(i):
-                o += Ops(dense=2.0 * batch * (2 * d * d + 2 * d * kv), attention=4.0 * d * (ctx + batch))
-            else:
-                o += proj_in
-                o += proj_out
-                if self.decode_style == "direct":
-                    o.other += n * d * 2.0 * (ctx + batch)
-                else:
-                    o.other += n * d * 8.0 * self.distill_state * batch
-            o += mlp
-        o += head
-        return o
-
-    def _decode_parts(self, batch: int) -> tuple:
-        """The weight-matrix Ops of one decode step depend only on the batch: computed once per
-        batch size (the same values, added in the same order, so results are unchanged)."""
-        cache = self.__dict__.setdefault("_parts_cache", {})
-        parts = cache.get(batch)
-        if parts is None:
-            d, n = self.d_model, self.hyena_order
-            parts = (self._dense_matrix((n + 1) * d, d, batch), self._dense_matrix(d, d, batch),
-                     self._mlp(batch), Ops(dense=2.0 * self.vocab * self.d_model * batch))
-            cache[batch] = parts
-        return parts
-
-    # ── what a transform engine needs (FOptInf A§7, A§8) ──
-    @cached_property
-    def conversion_pairs_per_token(self) -> int:
-        """DAC+ADC sample pairs per prompt token for the transform work (one pass): each long
-        convolution converts one input and one output; a circulant matrix n in, m out."""
-        if self.is_transformer:
-            return 0
-        per = self.hyena_order * self.d_model
-        if self.circulant_block:
-            per += sum(max(m, n) for m, n in self._matrices())
-        return self.n_hyena_layers * per
-
-    def mask_values(self, prompt_lens: list[int]) -> int:
-        """Complex Fourier-plane mask values one forward pass needs: every long-convolution
-        filter spectrum for each distinct padded length, plus every circulant block spectrum."""
-        if self.is_transformer:
-            return 0
-        d, n = self.d_model, self.hyena_order
-        vals = 0
-        for f in sorted({pow2_at_least(2 * s) for s in prompt_lens}):
-            vals += self.n_hyena_layers * n * d * (f // 2 + 1)
-        k = self.circulant_block
-        if k:
-            vals += self.n_hyena_layers * sum((m // k) * (c // k) * (k // 2 + 1) for m, c in self._matrices())
-        return vals
-
-    def filter_spectrum_bytes(self, prompt_lens: list[int]) -> float:
-        """On a digital device the cached filter spectra are read once per step (complex,
-        4 bytes per value); on a transform engine they are mask loads instead."""
-        if self.is_transformer:
-            return 0.0
-        d, n = self.d_model, self.hyena_order
-        vals = 0
-        for f in sorted({pow2_at_least(2 * s) for s in prompt_lens}):
-            vals += self.n_hyena_layers * n * d * (f // 2 + 1)
-        return vals * 4.0
 
 
 LLAMA3_8B = ModelSpec("Llama-3-8B", n_layers=32, d_model=4096, n_heads=32,
                       n_kv_heads=8, d_ff=14336, vocab=128256)
 LLAMA3_70B = ModelSpec("Llama-3-70B", n_layers=80, d_model=8192, n_heads=64,
                        n_kv_heads=8, d_ff=28672, vocab=128256)
-
-# FFT-mixing variants of the Llama-3-8B shape (FOptInf phase A). Transform share of prefill
-# FLOPs at 2,048 tokens: Hyena 0.20%, hybrid 0.15%, circulant 14.0% (84.5% with the LM head
-# on the last token only). The circulant LLM is speculative: none of this size is published.
-LLAMA3_8B_HYENA = replace(LLAMA3_8B, name="Llama-3-8B-shape Hyena-2", mixer="hyena")
-LLAMA3_8B_HYENA_DIST = replace(LLAMA3_8B_HYENA, name="Llama-3-8B-shape Hyena-2 (distilled decode)",
-                               decode_style="distilled")
-LLAMA3_8B_HYBRID = replace(LLAMA3_8B, name="Llama-3-8B-shape hybrid 1:3", mixer="hybrid")
-LLAMA3_8B_HYENA_CIRC = replace(LLAMA3_8B_HYENA, name="Llama-3-8B-shape Hyena-2 + block-circulant 256",
-                               circulant_block=256)
 
 # CED proxies (brief 11): the same dense shapes split half encoder, half decoder, as
 # DeepSeek-V4.1-Flash splits its 40 layers 20/20 (arXiv:2609.19969, section 4.2.1). Illustrative:
@@ -557,54 +279,13 @@ MIXTRAL_8X7B = ModelSpec("Mixtral-8x7B", n_layers=32, d_model=4096, n_heads=32, 
                          n_experts=8, top_k=2)
 LLAMA32_1B = ModelSpec("Llama-3.2-1B", n_layers=16, d_model=2048, n_heads=32, n_kv_heads=8, d_ff=8192, vocab=128256)
 
-MODELS = {"llama3-8b": LLAMA3_8B, "llama3-70b": LLAMA3_70B, "llama3-8b-hyena": LLAMA3_8B_HYENA,
-          "llama3-8b-hyena-dist": LLAMA3_8B_HYENA_DIST, "llama3-8b-hybrid": LLAMA3_8B_HYBRID,
-          "llama3-8b-hyena-circ": LLAMA3_8B_HYENA_CIRC,
+MODELS = {"llama3-8b": LLAMA3_8B, "llama3-70b": LLAMA3_70B,
           "llama3-8b-ced": LLAMA3_8B_CED, "llama3-70b-ced": LLAMA3_70B_CED,
           "mistral-7b": MISTRAL_7B, "yi-34b": YI_34B, "opt-13b": OPT_13B,
           "mixtral-8x7b": MIXTRAL_8X7B, "llama3.2-1b": LLAMA32_1B}
 
 
 # ──────────────────────────────────────────────────────────── hardware ──
-@dataclass(frozen=True)
-class TransformEngine:
-    """A Fourier-optical transform engine (4f system), co-packaged with a digital part.
-
-    Illustrative throughout. It takes FFT and Fourier-plane work only; each forward pass
-    converts every transform input in (DAC) and output out (ADC), at Walden-rule energy
-    (FoM x 2^ENOB per sample, FHESim 04's FoMs). Below the ENOB a format needs, passes are
-    repeated and averaged: 4^(required - ENOB) passes (averaging k passes buys half a bit
-    per doubling; Garg et al., arXiv:2102.06365). Intensity detection doubles the passes
-    (sign recovery). The Fourier-plane mask holds ``mask_values`` complex values and is
-    rewritten at ``mask_rate_hz`` (a 2 MP DMD at 8-bit depth, Miscuglio et al., Optica 2020).
-    Lasers and thermal tuning burn ``laser_w + tuning_w`` whether or not work arrives.
-    """
-
-    samples_per_s: float = 1e12   # converter throughput per direction (as FHE OpticalEngine)
-    enob: int = 8                 # effective bits of the DAC -> optics -> ADC chain
-    fom_dac_fj: float = 10.0      # Walden FoM, fJ per conversion step
-    fom_adc_fj: float = 20.0
-    laser_w: float = 10.0         # static, per device
-    tuning_w: float = 10.0        # static, per device
-    mask_values: int = 2_000_000  # complex values the mask holds at once
-    mask_rate_hz: float = 1031.0  # rewrites per second (about 20 kHz at 1-bit; LC SLMs tens of Hz)
-    detection: str = "coherent"   # "coherent" | "intensity" (doubles the passes)
-    overlap: bool = False         # True: optical and digital time overlap (max); False: they add
-
-    def passes(self, act_format: str) -> int:
-        k = 4 ** max(0, ENOB_REQUIRED[act_format] - self.enob)
-        return 2 * k if self.detection == "intensity" else k
-
-    @property
-    def pj_per_pair(self) -> float:
-        """One DAC sample plus one ADC sample, picojoules."""
-        return self.fom_dac_fj * 2 ** self.enob * 1e-3 + self.fom_adc_fj * 2 ** self.enob * 1e-3
-
-    @property
-    def static_w(self) -> float:
-        return self.laser_w + self.tuning_w
-
-
 @dataclass(frozen=True)
 class Accelerator:
     """One device. Peak numbers are datasheet values; efficiencies derate them."""
@@ -621,11 +302,6 @@ class Accelerator:
     idle_w: float = 100.0      # static power: leakage, clocks, fans' share, HBM refresh
     pj_per_flop: float = 1.0   # dynamic energy per FLOP, incl. on-chip SRAM/register traffic
     pj_per_byte: float = 60.0  # dynamic energy per HBM byte, incl. controller, PHY, on-chip moves
-    transform: TransformEngine | None = None   # a co-packaged optical transform engine, if any
-    # Fraction of the matmul rate this device's FFT and Fourier-domain work achieves (FFT-mixing
-    # models only). 1.0 (the default) is optimistic for GPUs: FlashFFTConv (arXiv:2311.05908)
-    # exists because FFTs use matmul units poorly. Time and dynamic energy both scale by 1/x.
-    fft_efficiency: float = 1.0
     # Brief 20A2. Dense tensor-core rate of each native low-precision compute format as a multiple of BF16 (from the
     # datasheet; a format not listed runs weight-only: dequantised to BF16 before the multiply). The scale-up link
     # (a LINKS key) carries tensor-, pipeline- and expert-parallel traffic inside an instance.
@@ -651,21 +327,6 @@ H100_SXM = Accelerator("H100-SXM", peak_flops=989 * TB, mem_bw=3.35 * TB, mem_ca
 A100_SXM = Accelerator("A100-SXM", peak_flops=312 * TB, mem_bw=2.039 * TB, mem_capacity=80 * GB,
                        tdp_w=400.0, idle_w=60.0, pj_per_flop=1.6, pj_per_byte=70.0,
                        native_formats=(("int8", 2.0),), scale_up="nvlink3")
-# A deliberately hypothetical part: abundant matmul throughput, ordinary memory.
-# Use it to ask "what if compute were nearly free?" -- the answer is that decode
-# barely moves, because decode is bandwidth-bound.
-HYPOTHETICAL_OPTICAL = Accelerator("Hypothetical-optical-MAC", peak_flops=4000 * TB,
-                                   mem_bw=3.35 * TB, mem_capacity=80 * GB, flops_eff=0.4,
-                                   # cheap multiplies, but lasers, thermal tuning and
-                                   # converters burn power whether or not work arrives
-                                   idle_w=180.0, pj_per_flop=0.1, pj_per_byte=60.0)
-
-# The transform engine, co-packaged with an H100-class digital part (``optical-fft``) or an
-# A100-class one (``optical-fft-small``). Not HYPOTHETICAL_OPTICAL: that one speeds up every
-# matmul; these speed up only FFT and Fourier-plane work, so they help only FFT-mixing models.
-OPTICAL_FFT = replace(H100_SXM, name="Optical-FFT + H100-class", transform=TransformEngine())
-OPTICAL_FFT_SMALL = replace(A100_SXM, name="Optical-FFT + A100-class", transform=TransformEngine())
-
 # The 40 GB A100 (HBM2, 1,555 GB/s; NVIDIA A100 datasheet): vLLM's OPT-13B server (arXiv:2309.06180, Table 1).
 A100_40G = replace(A100_SXM, name="A100-SXM-40GB", mem_bw=1.555 * TB, mem_capacity=40 * GB)
 
@@ -685,8 +346,7 @@ B200 = Accelerator("B200", peak_flops=2250 * TB, mem_bw=8 * TB, mem_capacity=180
 # a scale-up domain, on any device (see results.md section 28).
 GB200 = replace(B200, name="GB200", peak_flops=2500 * TB, mem_capacity=186 * GB, tdp_w=1200.0)
 
-ACCELERATORS = {"h100": H100_SXM, "a100": A100_SXM, "a100-40g": A100_40G, "optical": HYPOTHETICAL_OPTICAL,
-                "optical-fft": OPTICAL_FFT, "optical-fft-small": OPTICAL_FFT_SMALL, "h200": H200_SXM, "b200": B200,
+ACCELERATORS = {"h100": H100_SXM, "a100": A100_SXM, "a100-40g": A100_40G, "h200": H200_SXM, "b200": B200,
                 "gb200": GB200}
 
 
@@ -712,10 +372,9 @@ LINKS = {
     "pcie4": Link("PCIe Gen4 x16", bandwidth=32 * GB, latency=5e-6, pj_per_bit=6.0),
     "eth-100g": Link("100 GbE", bandwidth=12.5 * GB, latency=20e-6, pj_per_bit=15.0),
     "eth-25g": Link("25 GbE", bandwidth=3.125 * GB, latency=20e-6, pj_per_bit=15.0),
-    # Photonic interconnect (NOT Fourier optics): an illustrative co-packaged-optics link.
-    # Round numbers, not a product: multi-Tb/s optical I/O chiplets exist (Wade et al., TeraPHY,
-    # IEEE Micro 2020); 1.6 Tb/s and 3 pJ/bit are this simulator's assumptions.
-    "cpo-optical": Link("Co-packaged optics (illustrative)", bandwidth=200 * GB, latency=5e-6, pj_per_bit=3.0),
+    # An illustrative co-packaged-optics switch link. Round numbers, not a product: multi-Tb/s optical I/O
+    # chiplets exist (Wade et al., TeraPHY, IEEE Micro 2020); 1.6 Tb/s and 3 pJ/bit are this simulator's assumptions.
+    "cpo-optical": Link("Co-packaged optics switch (illustrative)", bandwidth=200 * GB, latency=5e-6, pj_per_bit=3.0),
     # Scale-up links inside an instance (brief 20A2): an A100's NVLink 3 (600 GB/s both ways) and a B200's NVLink 5.
     "nvlink3": Link("NVLink 3 (one direction)", bandwidth=300 * GB, latency=5e-6, pj_per_bit=5.0),
     "nvlink5": Link("NVLink 5 (one direction)", bandwidth=900 * GB, latency=5e-6, pj_per_bit=5.0),
@@ -725,295 +384,26 @@ LINKS = {
 # ─────────────────────────────────────────── KV hand-off compression ──
 @dataclass(frozen=True)
 class KVCompression:
-    """A compression of the KV hand-off (BF16 in). ``ratio`` = bytes in / bytes out.
-    ``ops_per_value``: elementwise work per BF16 value (amax, scale, round, select);
-    ``fft``: also a transform along the token axis (forward and inverse, FreqKV-style)."""
+    """A compression of the KV hand-off (BF16 in), run on the prefill GPU before the hand-off is sent.
+    ``ratio`` = bytes in / bytes out; ``ops_per_value``: elementwise work per BF16 value (amax, scale, round)."""
 
     name: str
     ratio: float
     ops_per_value: float
-    fft: bool = False
 
-    def fft_ops_per_value(self, prompt_len: int) -> float:
-        """Forward plus inverse real transform along the token axis, per value."""
-        if not self.fft:
-            return 0.0
-        n = pow2_at_least(prompt_len)
-        return 2 * rfft_flops(n) / n
+    def ops(self, nbytes: float, kv_bytes: float) -> float:
+        """Operations to compress ``nbytes`` of hand-off."""
+        values = nbytes / kv_bytes
+        return self.ops_per_value * values
 
 
 # Tolerable KV widths come from independent KV-quantisation work: KIVI (arXiv:2402.02750,
 # 2-bit) and KVQuant (arXiv:2401.18079, 3-bit with < 0.1 perplexity loss), so 8- and 4-bit
-# are within what they report. FreqKV (arXiv:2505.00570) keeps half the DCT components by
-# default (needs light fine-tuning). The simulator does not model accuracy.
+# are within what they report. The simulator does not model accuracy.
 KV_PRESETS = {
     "none": KVCompression("none", 1.0, 0.0),
     "fp8": KVCompression("fp8", 2.0, 1.0),                     # scale + round per value
     "fp4-block": KVCompression("fp4-block", 64 / 17, 2.0),     # E2M1, 32-value blocks + 8-bit scale
-    "freq-keep-k": KVCompression("freq-keep-k", 2.0, 1.0, fft=True),   # keep half the bins
-}
-
-
-@dataclass(frozen=True)
-class KVTransit:
-    """Where the hand-off is compressed, and the in-transit stage's budget (illustrative,
-    representative of published 2026 compute-in-transit prototypes; speculative mapping).
-
-    ``where="transit"``: a stage in the link compresses the stream as it passes, at no GPU
-    cost, with a compute budget of ``ops_per_byte`` per line byte, ``pj_per_bit`` per input
-    bit and ``latency`` added. Its transforms are passive (``native_fft``). If the stage
-    cannot keep up, the transfer takes its compute time instead (flagged as transit-bound).
-    ``where="endpoint"``: the prefill GPU compresses (an elementwise pass over the KV: HBM
-    read + write, plus the FLOPs) before sending."""
-
-    compression: KVCompression
-    where: str = "transit"
-    ops_per_byte: float = 1.6
-    pj_per_bit: float = 1.0
-    latency: float = 1e-6
-    native_fft: bool = True
-    # Brief 06C: the stage as a declared link kernel (``LinkKernel``). None (the default) keeps the model above
-    # exactly; set, it replaces ``ops_per_byte``, ``pj_per_bit``, ``latency`` and ``native_fft`` (Python only).
-    kernel: LinkKernel | None = None
-
-    def __post_init__(self):
-        if self.where not in ("transit", "endpoint"):
-            raise ValueError(f"unknown kv compression site {self.where!r}")
-        if self.kernel is not None:
-            if self.where != "transit":
-                raise ValueError("a link kernel compresses in transit: not with where='endpoint'")
-            self.kernel.check(kv_work(self.compression, 2, self.kernel.planes))
-
-    def ops(self, nbytes: float, prompt_len: int, kv_bytes: float, on_gpu: bool) -> float:
-        """Operations to compress ``nbytes`` of hand-off."""
-        values = nbytes / kv_bytes
-        c = self.compression
-        per = c.ops_per_value
-        if c.fft and (on_gpu or not self.native_fft):
-            per = per + c.fft_ops_per_value(prompt_len)
-        return per * values
-
-
-# ─────────────────────────────────── link kernel: compute in transit, declared (brief 06C) ──
-# A general model of an in-transit stage: which operations it has, how fast each of its pipelined stages
-# runs, and what it costs in energy. Off by default (``KVTransit.kernel = None``); Python only (the JS port does
-# not model it, and the Rust port rejects any ``kv_transit``). Calibrated to a photonic link module (Kundu et
-# al., arXiv:2608.21536) with the definitions of the Compute in Transit hub's ``analysis/cit_budget.py`` and of
-# Training_Transit_Sim's module model, both of which pin this simulator at 69ffd2b:
-#
-# * port rate 25 GB/s: QSFP56 (200 Gb/s), the module's host port in the paper;
-# * optics 56 Gb/s: four modulators at 14 GBaud with NRZ input (the paper's section II). 4 x 14 Gb/s = 7 GB/s is
-#   the series' arithmetic, not a figure the paper states. A value quantised to ``planes`` bits takes ``planes``
-#   symbols (one optical pass per bit plane);
-# * compute budget 10 or 99 GFLOP/s: the series' bracket on the paper's "tens of GFLOPs", a reading, not a
-#   measurement: 0.40-3.96 operations per byte at the port, 1.43-14.14 at the optics. Whether the optical
-#   transform is charged against it is not public, so it is a switch (``transform_charged``);
-# * operations: FFT and NTT (radix-4), add and subtract, multiply, MAC, floating-point MAC, modular arithmetic (in
-#   the FPGA driver logic), plus gathers (a fixed selection: no arithmetic). No comparisons and no rounding, so
-#   top-k and requantisation are refused;
-# * static 9.7 W (the paper); dynamic 2.76 pJ per input bit (the developer's website: estimated for 45 nm silicon
-#   photonics, excluding the laser);
-# * laser power, FPGA rate, FPGA work per value and latency: illustrative.
-#
-# FLOPs of a length-n transform: 2.5 log2 n per value (FFTW's convention, as ``rfft_flops``); a separable 2-D
-# c x c transform: 2 x 2.5 log2 c per value.
-LINK_OP_TYPES = ("fft", "ntt", "add", "mul", "mac", "fp_mac", "modular", "gather", "compare", "round")
-LINK_OPTICAL_OPS = ("fft", "ntt")                    # the optical transform (charged or not)
-LINK_DIGITAL_OPS = ("add", "mul", "mac", "fp_mac")   # charged against the compute budget
-LINK_FPGA_OPS = ("modular",)                         # the FPGA stage
-PUBLISHED_LINK_OPS = frozenset(LINK_OPTICAL_OPS + LINK_DIGITAL_OPS + LINK_FPGA_OPS + ("gather",))
-
-
-def transform_per_value(n: int) -> float:
-    """FLOPs per value of a length-n transform (n a power of two): 2.5 log2 n, log2 as an integer."""
-    return 2.5 * (n.bit_length() - 1)
-
-
-@dataclass(frozen=True)
-class KernelWork:
-    """What a link kernel is asked to do to a stream: operations per input value by type, the compression ratio
-    (bytes in / bytes out), how many streams it combines at one point, and the FPGA stage's work.
-
-    Counts are per value of one input stream (BF16: 2 bytes), as in the hub's ledger: summing two streams is one
-    add per value, 0.5 per byte (Training_Transit_Sim counts the bytes of both streams: 0.25)."""
-
-    name: str
-    ops: tuple = ()                   # ((operation type, operations per input value), ...)
-    ratio: float = 1.0
-    streams: int = 1                  # more than one: the streams must meet, so a switch, not a pluggable
-    fpga_ops_per_value: float = 0.0   # digital work around the optics: quantise, rescale, recombine (illustrative)
-    bytes_per_value: float = 2.0      # BF16 in
-
-    def __post_init__(self):
-        bad = {k for k, _ in self.ops} - set(LINK_OP_TYPES)
-        if bad:
-            raise ValueError(f"unknown operation types {sorted(bad)}")
-
-    def needs(self) -> frozenset:
-        return frozenset(k for k, _ in self.ops)
-
-    def per_byte(self, kinds) -> float:
-        return sum(v for k, v in self.ops if k in kinds) / self.bytes_per_value
-
-    @property
-    def transform_per_byte(self) -> float:
-        return self.per_byte(LINK_OPTICAL_OPS)
-
-    @property
-    def other_per_byte(self) -> float:
-        """Everything that is neither the transform nor FPGA work (the hub's "other")."""
-        return self.per_byte(set(LINK_OP_TYPES) - set(LINK_OPTICAL_OPS) - set(LINK_FPGA_OPS))
-
-    @property
-    def fpga_per_byte(self) -> float:
-        return self.per_byte(LINK_FPGA_OPS) + self.fpga_ops_per_value / self.bytes_per_value
-
-    @property
-    def optical(self) -> bool:
-        return any(k in LINK_OPTICAL_OPS for k, _ in self.ops)
-
-
-def band_work(n: int, keep: float, planes: int = 8) -> KernelWork:
-    """A length-n transform of each chunk keeping a fixed band (a gather): Training_Transit_Sim's ``band_kernel``.
-    The FPGA stage (illustrative) quantises each value to ``planes`` bits (1 multiply), tracks the full scale (1
-    multiply-accumulate) and recombines the ``planes`` bit-plane outputs of each kept value."""
-    return KernelWork(f"1-D transform, length {n}, keep {keep:g}", (("fft", transform_per_value(n)), ("gather", 0.0)),
-                      ratio=1 / keep, fpga_ops_per_value=2.0 + planes * keep)
-
-
-def kv_work(c: KVCompression, prompt_len: int, planes: int = 8) -> KernelWork:
-    """A KV hand-off compression as link-kernel work. ``freq-keep-k``: a transform along the token axis (length
-    the next power of two) keeping a fixed band. Quantising presets need a block maximum (a comparison) and
-    rounding, which the module lacks (the hub's "Requantise BF16 to FP8": 2 operations per value)."""
-    if c.fft:
-        w = band_work(pow2_at_least(prompt_len), 1 / c.ratio, planes)
-        return replace(w, name=c.name)
-    if c.ratio == 1.0 and not c.ops_per_value:
-        return KernelWork(c.name)
-    return KernelWork(c.name, (("compare", 1.0), ("mul", 1.0), ("round", 0.0)), ratio=c.ratio)
-
-
-# The hub's kernel ledger (``analysis/cit_budget.py``, ``kernels()``), as declared work.
-CIT_LEDGER = (
-    KernelWork("Sum two gradient streams (in-network aggregation)", (("add", 1.0),), streams=2),
-    *(KernelWork(f"1-D FFT, length {n}, keep a fixed band", (("fft", transform_per_value(n)), ("gather", 0.0)))
-      for n in (8, 64, 1024)),
-    *(KernelWork(f"2-D DCT of {c}x{c} chunks, keep a fixed band (DeMo-like)",
-                 (("fft", 2 * transform_per_value(c)), ("gather", 0.0))) for c in (16, 64)),
-    KernelWork("2-D DCT of 64x64 chunks + top-k (DeMo as published)",
-               (("fft", 2 * transform_per_value(64)), ("compare", 2.0))),
-    KernelWork("Requantise BF16 to FP8 (per-block scale)", (("compare", 1.0), ("mul", 1.0), ("round", 0.0)), ratio=2.0),
-    KernelWork("Score a KV key against the query (dot product, head dim 128)", (("mul", 1.0), ("add", 1.0))),
-)
-
-
-@dataclass(frozen=True)
-class LinkKernel:
-    """A compute-in-transit stage as a link kernel: operation set, precision, rates, budget, power, placement.
-
-    A stream of b input bytes takes ``link latency + latency + max(stage times)``: the link (b / ratio on the
-    wire), the module's port (b / port rate), its optics (values x planes / optics bit rate, if the work uses the
-    transform), its compute budget (charged operations / GFLOP/s) and its FPGA stage. The stages are pipelined, so
-    the slowest sets the rate and is reported as the binding stage. Energy while streaming: (static + laser)
-    power x streaming time + dynamic pJ per input bit; idle power between streams is not charged.
-
-    ``placement``: ``"pluggable"`` (in one host's port) or ``"switch"`` (at a switch port, where streams from
-    several hosts meet). Work that combines streams needs a switch."""
-
-    name: str = "photonic link module, pluggable, 10 GFLOP/s (illustrative)"
-    placement: str = "pluggable"
-    port_rate: float = 25 * GB             # QSFP56, bytes/s
-    optics_bits_per_s: float = 4 * 14e9    # 4 modulators x 14 GBaud NRZ (the series' arithmetic: 7 GB/s)
-    planes: int = 8                        # precision through the optics: bits per value, one pass per plane
-    gflops: float = 10e9                   # compute budget, FLOP/s (the series' bracket: 10 to 99)
-    transform_charged: bool = True         # is the optical transform charged against ``gflops``? (not public)
-    fpga_ops_per_s: float = 50e9           # illustrative
-    latency: float = 1e-6                  # illustrative, per stream
-    static_w: float = 9.7                  # the paper
-    laser_w: float = 2.0                   # illustrative
-    pj_per_bit: float = 2.76               # the developer's website (45 nm estimate, excluding the laser)
-    ops: frozenset = PUBLISHED_LINK_OPS
-
-    def __post_init__(self):
-        if self.placement not in ("pluggable", "switch"):
-            raise ValueError(f"unknown placement {self.placement!r}")
-        if self.planes < 1:
-            raise ValueError("planes must be at least 1")
-        bad = set(self.ops) - set(LINK_OP_TYPES)
-        if bad:
-            raise ValueError(f"unknown operation types {sorted(bad)}")
-
-    @property
-    def optics_rate(self) -> float:
-        """The optics' own bit stream in bytes/s (7 GB/s at the defaults)."""
-        return self.optics_bits_per_s / 8
-
-    @property
-    def budget(self) -> float:
-        """Operations per byte at the port's line rate (0.40 at 10 GFLOP/s, 3.96 at 99)."""
-        return self.gflops / self.port_rate
-
-    @property
-    def optics_budget(self) -> float:
-        """Operations per byte at the optics' rate (1.43 at 10 GFLOP/s, 14.14 at 99)."""
-        return self.gflops / self.optics_rate
-
-    def check(self, work: KernelWork) -> None:
-        """Refuse work that needs an operation the kernel lacks, or streams a pluggable cannot see."""
-        missing = work.needs() - self.ops
-        if missing:
-            why = " (no comparisons: top-k and block maxima need them)" if "compare" in missing else ""
-            raise ValueError(f"{work.name!r} needs {sorted(missing)}, which the link kernel {self.name!r} "
-                             f"does not have{why}")
-        if work.streams > 1 and self.placement != "switch":
-            raise ValueError(f"{work.name!r} combines {work.streams} streams: they meet at a switch, "
-                             "not in a pluggable")
-
-    def charged_per_byte(self, work: KernelWork) -> float:
-        """Operations per input byte charged against the compute budget."""
-        return work.other_per_byte + (work.transform_per_byte if self.transform_charged else 0.0)
-
-    def fits(self, work: KernelWork) -> bool:
-        """Does the work fit the budget at the port's line rate?"""
-        return self.charged_per_byte(work) <= self.budget
-
-    def stage_times(self, nbytes: float, work: KernelWork) -> dict:
-        """Seconds each of the module's pipelined stages needs for ``nbytes`` of input (latency excluded)."""
-        values = nbytes / work.bytes_per_value
-        return {
-            "module port": nbytes / self.port_rate,
-            "module optics": values * self.planes / self.optics_bits_per_s if work.optical else 0.0,
-            "module compute": nbytes * self.charged_per_byte(work) / self.gflops,
-            "FPGA": nbytes * work.fpga_per_byte / self.fpga_ops_per_s,
-        }
-
-    def stream(self, nbytes: float, work: KernelWork, link: Link) -> tuple[float, str, dict]:
-        """(seconds, binding stage, every stage's seconds) for one stream through the module onto ``link``."""
-        st = {"link": nbytes / work.ratio / link.bandwidth, **self.stage_times(nbytes, work)}
-        stage = max(st, key=st.get)            # ties go to the link (listed first): not module-bound
-        return link.latency + self.latency + st[stage], stage, st
-
-    def energy(self, nbytes: float, seconds: float) -> dict:
-        """Joules for one stream of ``nbytes`` input that keeps the module busy for ``seconds``."""
-        return {"static": self.static_w * seconds, "laser": self.laser_w * seconds,
-                "dynamic": nbytes * 8 * self.pj_per_bit * 1e-12}
-
-
-def link_kernel(placement: str = "pluggable", gflops: float = 10e9, transform_charged: bool = True,
-                **kw) -> LinkKernel:
-    """A named LinkKernel (illustrative; a photonic link module, Kundu et al., arXiv:2608.21536)."""
-    name = (f"photonic link module, {placement}, {gflops / 1e9:g} GFLOP/s"
-            + ("" if transform_charged else ", transform free") + " (illustrative)")
-    return LinkKernel(name=name, placement=placement, gflops=gflops, transform_charged=transform_charged, **kw)
-
-
-LINK_KERNELS = {
-    "pluggable-10": link_kernel("pluggable", 10e9),
-    "pluggable-99": link_kernel("pluggable", 99e9),
-    "pluggable-10-free": link_kernel("pluggable", 10e9, transform_charged=False),
-    "pluggable-99-free": link_kernel("pluggable", 99e9, transform_charged=False),
-    "switch-10": link_kernel("switch", 10e9),
-    "switch-99": link_kernel("switch", 99e9),
 }
 
 
@@ -1063,8 +453,8 @@ class Parallel:
             raise ValueError(f"{at}expert_imbalance is the busiest GPU's load over the mean: at least 1")
         if model.n_layers % self.pp:
             raise ValueError(f"{at}{model.name} has {model.n_layers} layers: not divisible into {self.pp} stages")
-        if not model.is_transformer or model.is_ced:
-            raise ValueError(f"{at}parallelism is modelled for attention models without CED only")
+        if model.is_ced:
+            raise ValueError(f"{at}parallelism is modelled for models without CED only")
         if self.link is not None and self.link not in LINKS:
             raise ValueError(f"{at}unknown scale-up link {self.link!r}")
 
@@ -1083,21 +473,11 @@ class StepCost:
     energy: float = 0.0        # dynamic joules for this step (static power is added per instance)
     compute_j: float = 0.0
     memory_j: float = 0.0
-    # Not fields: ordinary steps construct as fast as before 2026-10-04 (the simulator's hot path).
-    optical_j = 0.0            # transform engine: conversion energy (DAC + ADC)
-    optical_flops = 0.0        # transform engine: FFT and Fourier-plane FLOPs it took
+    # Not fields: ordinary steps construct as fast as before (the simulator's hot path).
     lever = False              # brief 20A2: a LeverStepCost (scale-up traffic, draft passes)
     comm_time = 0.0
     comm_j = 0.0
     draft_time = 0.0
-
-
-@dataclass(frozen=True)
-class OpticalStepCost(StepCost):
-    """A prefill step with transform-engine work."""
-
-    optical_j: float = 0.0
-    optical_flops: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -1161,13 +541,13 @@ class CostModel:
 
     @property
     def kv_capacity_tokens(self) -> int:
-        """Admission units that fit beside the weights: KV tokens (or distilled states)."""
+        """KV tokens that fit beside the weights."""
         if self.parallel is not None or self.draft is not None:
             return self._kv_capacity_levers()
         free = self.device.mem_capacity * self.n_devices * self.mem_util - self.resident_weight_bytes
         if free <= 0:
             raise ValueError(f"{self.model.name} does not fit on {self.n_devices}x {self.device.name}")
-        return int(free // self.model.cache_unit_bytes)
+        return int(free // self.model.kv_bytes_per_token)
 
     def _kv_capacity_levers(self) -> int:
         """Brief 20A2: memory checked per GPU. Each pipeline stage holds its layers' weights (the first also the
@@ -1203,12 +583,6 @@ class CostModel:
     @cached_property
     def idle_w(self) -> float:
         return self.device.idle_w * self.n_devices
-
-    @cached_property
-    def optical_static_w(self) -> float:
-        """Lasers and thermal tuning of a co-packaged transform engine (0 without one)."""
-        eng = self.device.transform
-        return eng.static_w * self.n_devices if eng is not None else 0.0
 
     @cached_property
     def dynamic_budget_w(self) -> float | None:
@@ -1279,8 +653,6 @@ class CostModel:
         tokens = sum(prompt_lens)
         if m.is_ced:
             return self._prefill_ced(prompt_lens, tokens)
-        if not m.is_transformer:
-            return self._prefill_ops(prompt_lens, tokens)
         # The LM head is charged for every prompt token, as a plain forward pass computes
         # (HF transformers by default, and Torch_Sim_Frontend's trace of it); serving
         # engines that keep only the last position's logits do less.
@@ -1334,42 +706,6 @@ class CostModel:
         nbytes += sum(s for s, _ in replay) * m.kv_bytes_per_token
         return self._time(flops, nbytes)
 
-    def _digital_flops(self, ops: Ops) -> float:
-        """Effective FLOPs on the digital part: FFT and spectral work at ``fft_efficiency``."""
-        eff = self.device.fft_efficiency
-        return ops.total if eff == 1.0 else ops.digital + ops.optical / eff
-
-    def optical_terms(self, prompt_lens: list[int], tokens: int) -> tuple[int, int, int, float]:
-        """(passes, conversions, mask rewrites, optical seconds) of one prefill step on the
-        transform engine. All counts are integers, so every language agrees exactly."""
-        m, eng = self.model, self.device.transform
-        k = eng.passes(m.act_format)
-        conversions = m.conversion_pairs_per_token * tokens * k
-        rewrites = -(-m.mask_values(prompt_lens) // eng.mask_values)   # integer ceil
-        return k, conversions, rewrites, conversions / eng.samples_per_s + rewrites / eng.mask_rate_hz
-
-    def _prefill_ops(self, prompt_lens: list[int], tokens: int) -> StepCost:
-        """FFT-mixing variants: the op ledger, on the digital part or the transform engine."""
-        m = self.model
-        ops = m.prefill_ops(prompt_lens)
-        nbytes = m.weight_bytes_read(tokens) + tokens * m.kv_bytes_per_token
-        if m.state_bytes_per_seq:
-            nbytes += len(prompt_lens) * m.state_bytes_per_seq
-        eng = self.device.transform
-        if eng is None:            # all digital: the filter spectra are read from memory
-            return self._time(self._digital_flops(ops), nbytes + m.filter_spectrum_bytes(prompt_lens))
-        # The engine takes the transforms and the Fourier-plane multiplies; the digital part
-        # runs the rest (its DVFS and power cap apply to its share only).
-        _, conversions, _, t_opt = self.optical_terms(prompt_lens, tokens)
-        flops = ops.digital
-        t_dig, ec, em, bound = self.step_time_raw(flops, nbytes)
-        t = max(t_dig, t_opt) if eng.overlap else t_dig + t_opt
-        if t_opt > t_dig:
-            bound = "optical"
-        oj = conversions * eng.pj_per_pair * 1e-12
-        return OpticalStepCost(flops, nbytes, t + self.step_overhead, bound, ec + em + oj, ec, em, oj,
-                               ops.optical)
-
     def decode(self, context_lens: list[int]) -> StepCost:
         """One decode step: every running sequence produces one token."""
         return self.decode_sum(sum(context_lens), len(context_lens))
@@ -1382,13 +718,6 @@ class CostModel:
         hence ``ctx + batch`` positions (the self term was missing before 2026-10-03).
         """
         m = self.model
-        if not m.is_transformer:
-            # FFT-mixing variants decode digitally (a transform engine's part is idle):
-            # direct cached dot products, or a distilled recurrence with constant state.
-            nbytes = m.weight_bytes_read(batch) + (ctx + batch) * m.kv_bytes_per_token
-            if m.state_bytes_per_seq:
-                nbytes += batch * m.state_bytes_per_seq
-            return self._time(self._digital_flops(m.decode_ops(ctx, batch)), nbytes)
         flops = 2 * m.matmul_params * batch + 4 * m.n_layers * m.d_model * (ctx + batch)
         if self.parallel is not None:
             return self._parallel(flops, m.weight_bytes_read(batch), (ctx + batch) * m.kv_bytes_per_token, batch)

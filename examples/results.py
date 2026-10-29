@@ -12,14 +12,15 @@ with ``git archive`` into a temporary directory, so both sides come from real ru
 
 Timings are wall-clock on whatever machine runs this; the header records which one.
 
-Sections 10-15 (added 2026-10-04, FOptInf deck 03) run only on the current code: heterogeneous
-pools, FFT-mixing models on an optical transform engine, the KV hand-off links, and compressing
-the hand-off in transit or at the GPU. Their coefficients are illustrative (see each section).
+Sections 10, 14 and 15 (added 2026-10-04) run only on the current code: heterogeneous pools, the KV hand-off links,
+and compressing the hand-off on the prefill GPU. Their coefficients are illustrative (see each section).
+``--pools-from-json`` re-renders them from examples/results_pools.json. Sections 11-13 and 27 were retired on
+2026-10-29; the other sections keep their numbers so links into this file still land.
 
 Sections 16-18 (added 2026-10-05, brief 11) measure the Causal Encoder-Decoder option (DeepSeek-V4.1-Flash,
 arXiv:2609.19969) on a dense Llama-3-70B-shape proxy: prefill cost, pool split and capacity across prompt:output
 ratios. ``--ced-from-json`` re-renders them from examples/results_ced.json; with ``--keep-timings
---optical-from-json --ced-from-json`` nothing is rerun except sections 1-8.
+--pools-from-json --ced-from-json`` nothing is rerun except sections 1-8.
 
 Sections 19-21 (added 2026-10-06, brief 20A1) validate the simulator levers against their papers: batching policy
 and chunked prefill (Sarathi-Serve, arXiv:2403.02310), paged KV and preemption (vLLM, arXiv:2309.06180) and prefix
@@ -29,10 +30,6 @@ Sections 23-25 (added 2026-10-06, brief 20A2): the levers in disaggregated pools
 and speculative decoding against Leviathan et al. (arXiv:2211.17192); ``--levers2-from-json`` re-renders them from
 examples/results_levers2.json. Section 26 is rendered from examples/tradeoffs.json (written by examples/tradeoffs.py,
 the trade-off sweep), never rerun here.
-
-Section 27 (added 2026-10-11, Compute in Transit brief 06C): the link kernel, a declared in-transit stage, off by default
-and calibrated illustratively to a photonic link module (arXiv:2608.21536); ``--link-kernel-from-json`` re-renders it
-from examples/results_link_kernel.json.
 
 Section 28 (added 2026-10-14, brief 34): the device presets (H100, H200, B200 and the new GB200) on the standard
 workload of sections 3-8. It is always rerun (twelve short runs).
@@ -142,9 +139,8 @@ def collect() -> dict:
                     for mode in ("colocated", "disagg")}
     out["sweep_2p1d"] = {r: row(run(["--prefill", "2"], r)[0]) for r in SWEEP_2P1D}
 
-    # 6. energy proportionality, and the static-heavy optical part
+    # 6. energy proportionality
     out["proportionality"] = {r: row(run([], r)[0]) for r in PROPORTIONALITY_RATES}
-    out["optical"] = row(run(["--device", "optical"])[0])
 
     # 7. the example report
     m, _ = run(["--prefill", "2", "--rate", "6", "--link", "eth-25g"])
@@ -334,9 +330,6 @@ def render(new: dict, old: dict, timings: str | None) -> str:
         rows.append([f"{r:g} req/s", f"{b['avg_w']:,.0f} W", f"{b['j_tok']:.1f}", f"{b['static']:.0%}",
                      f"{a['j_tok']:.2f} → {b['j_tok']:.2f}"])
     table(L, ["Offered load", "Avg power", "J / output token", "Static share of energy", "J/token before → after"], rows)
-    o, oo = new["optical"], old["optical"]
-    p(f"* Hypothetical optical part, 4 req/s: static share {o['static']:.0%}, {o['j_tok']:.2f} J/token"
-      f" (before: {oo['static']:.0%}, {oo['j_tok']:.2f}); TTFT p99 {ms(o['ttft_p99'])}, TPOT p99 {ms(o['tpot_p99'])}.")
     cap = new["power_table"]["1P1D --power-cap 400 --dvfs"]["j_tok"]
     p(f"* For comparison, the GPU under a 400 W cap with DVFS: {cap:.2f} J/token.")
     p("")
@@ -367,42 +360,22 @@ def render(new: dict, old: dict, timings: str | None) -> str:
     return "\n".join(L) + "\n"
 
 
-# ───────────────────────────────────── sections 10-15: FOptInf phase B ──
+# ─────────────────────── sections 10, 14, 15: pools, hand-off links, hand-off compression ──
+# Sections 11-13 were retired on 2026-10-29; the section numbers are kept so links into this file still land.
 OPT_RATE, OPT_N = 8.0, 800          # Llama-3-8B shape, 1 device per instance, 1P1D unless stated
-R16 = 1 / 16                        # illustrative GPU FFT efficiency (FOptInf A§3)
-VARIANTS = [("Transformer (Llama-3-8B)", "llama3-8b", "all"), ("Hyena-2", "llama3-8b-hyena", "all"),
-            ("Hybrid 1:3", "llama3-8b-hybrid", "all"), ("Hyena-2, distilled decode", "llama3-8b-hyena-dist", "all"),
-            ("Hyena-2 + circulant 256", "llama3-8b-hyena-circ", "all"),
-            ("Hyena-2 + circulant 256, last-token head", "llama3-8b-hyena-circ", "last")]
 LINK_KEYS = ["nvlink4", "ib-ndr", "cpo-optical", "eth-100g", "eth-25g"]
-HANDOFFS = [("GQA KV cache", "llama3-8b"), ("Hyena direct cache", "llama3-8b-hyena"),
-            ("Hyena distilled state", "llama3-8b-hyena-dist")]
-PRESETS = ["none", "fp8", "fp4-block", "freq-keep-k"]
-TRANSIT_RATES = [8, 10, 12, 14]
+PRESETS = ["none", "fp8", "fp4-block"]
+COMPRESS_RATES = [8, 10, 12, 14]
 
 
-def collect_optical() -> dict:
+def collect_pools() -> dict:
     from dataclasses import replace
 
-    from disagg_sim.hardware import (A100_SXM, H100_SXM, KV_PRESETS, LINKS, MODELS, OPTICAL_FFT, CostModel,
-                                     KVTransit)
+    from disagg_sim.hardware import A100_SXM, H100_SXM, KV_PRESETS, LINKS, MODELS
     from disagg_sim.metrics import percentile, summarise
     from disagg_sim.ppa import device_area, ppa_report
     from disagg_sim.sim import SimConfig, simulate
     from disagg_sim.workload import LengthDist, poisson_workload
-
-    def model(key, head="all", **kw):
-        return replace(MODELS[key], prefill_lm_head=head, **kw)
-
-    def gpu(r=1.0, dev=H100_SXM):
-        return dev if r == 1.0 else replace(dev, fft_efficiency=r)
-
-    def engine(enob=8, mask=1031.0, overlap=False, static=20.0, detection="coherent"):
-        return replace(OPTICAL_FFT, transform=replace(OPTICAL_FFT.transform, enob=enob, mask_rate_hz=mask,
-                                                      overlap=overlap, laser_w=static / 2, tuning_w=static / 2,
-                                                      detection=detection))
-
-    DEFAULT, OPTIMISTIC = engine(), engine(enob=11, mask=20000.0, overlap=True)
 
     def go(cfg, rate=OPT_RATE):
         """One full run; the hand-off latency is first token -> KV on the decode pool (DistServe's
@@ -412,23 +385,20 @@ def collect_optical() -> dict:
         m = summarise(res)
         e, lat, ss = m["energy"], m["latency_s"], m["stage_share"]
         p = ppa_report(cfg, m)
-        opt = m.get("optical", {}).get("prefill-0", {})
         lk = m["kv_link"]
         return {"ttft_p99": lat["ttft"]["p99"], "tpot_p99": lat["tpot"]["p99"], "slo": m["throughput"]["slo_attainment"],
                 "goodput": m["throughput"]["goodput_req_per_s"], "tok_s": m["throughput"]["output_tok_per_s"],
                 "j_tok": e["J_per_output_token"], "avg_w": e["avg_power_W"], "tok_j": e["output_tokens_per_J"],
                 "breakdown": e["breakdown"], "kv_share": ss.get("kv_wait", 0.0) + ss.get("kv_transfer", 0.0),
                 "link_util": m["utilisation"].get("kv-link", 0.0), "link_GB": lk["bytes_GB"],
-                "link_j_req": (res.link.energy + res.link.transit_j) / max(1, res.link.transfers),
-                "transit_bound": lk.get("transit", {}).get("transit_bound_frac", 0.0),
-                "optical_bound": opt.get("optical_bound_frac", 0.0),
+                "link_j_req": res.link.energy / max(1, res.link.transfers),
                 "usd": p["total_usd"], "tok_s_kusd": p["perf_per_kusd"], "tok_s_mm2": p["perf_per_mm2"],
                 "handoff_p99": percentile([r.kv_ready - r.first_token for r in res.requests
                                            if r.kv_ready is not None], 99) if cfg.mode == "disagg" else 0.0,
                 "stamps": [(r.first_token, r.finish) for r in res.requests]}
 
     out: dict = {}
-    L8 = model("llama3-8b")
+    L8 = MODELS["llama3-8b"]
     base = SimConfig(model=L8, devices_per_instance=1)
 
     # 10. heterogeneous pools
@@ -443,114 +413,22 @@ def collect_optical() -> dict:
                                                         n_prefill=2))}
     out["hetero"] = {"rows": rows, "identical": same["stamps"] == homo["stamps"]
                      and {k: v for k, v in same.items() if k != "stamps"} == {k: v for k, v in homo.items() if k != "stamps"}}
+    out["areas"] = {d.name: device_area(d) for d in (H100_SXM, A100_SXM)}
 
-    # 11. baselines against an optical prefill pool
-    t11 = {}
-    for label, key, head in VARIANTS:
-        m = model(key, head)
-        b = SimConfig(model=m, devices_per_instance=1)
-        t11[label] = {"Colocated x2, H100": go(replace(b, mode="colocated", n_colocated=2)),
-                      "1P1D H100": go(b),
-                      "1P1D H100, GPU FFT at 1/16": go(replace(b, device=gpu(R16))),
-                      "optical-fft prefill (defaults) + H100 decode": go(replace(b, prefill_device=DEFAULT)),
-                      "optical-fft prefill (optimistic) + H100 decode": go(replace(b, prefill_device=OPTIMISTIC))}
-    out["baselines"] = t11
-
-    # 12. sweeps
-    def step(m, dev):
-        c = CostModel(m, dev).prefill([2048])
-        return {"ms": 1e3 * c.time, "bound": c.bound, "dyn_j": c.energy, "opt_j": c.optical_j}
-
-    shares = {}
-    for label, key, head, blk in [("Hyena-2", "llama3-8b-hyena", "all", 0), ("Hybrid 1:3", "llama3-8b-hybrid", "all", 0),
-                                  ("circulant 256, all-token head", "llama3-8b-hyena-circ", "all", 256),
-                                  ("circulant 1024, last-token head", "llama3-8b-hyena-circ", "last", 1024),
-                                  ("circulant 256, last-token head", "llama3-8b-hyena-circ", "last", 256),
-                                  ("circulant 64, last-token head", "llama3-8b-hyena-circ", "last", 64)]:
-        m = model(key, head, **({"circulant_block": blk} if blk else {}))
-        o = m.prefill_ops([2048])
-        shares[label] = {"share": o.optical / o.total, "gflop": o.total / 1e9, "gpu": step(m, gpu()),
-                         "gpu16": step(m, gpu(R16)), "default": step(m, DEFAULT), "optimistic": step(m, OPTIMISTIC),
-                         "mask_values": m.mask_values([2048]), "pairs": m.conversion_pairs_per_token}
-    CIRC = model("llama3-8b-hyena-circ", "last")
-    enob = {}
-    for e in range(6, 15):
-        dev = engine(enob=e, mask=20000.0, overlap=True)
-        k, conv, rew, t_opt = CostModel(CIRC, dev).optical_terms([2048], 2048)
-        enob[e] = {"passes": k, "conversions": conv, "t_opt_ms": 1e3 * t_opt, **step(CIRC, dev),
-                   "pj_pair": dev.transform.pj_per_pair}
-    mask = {}
-    for hz in (30.0, 1031.0, 20000.0, 1e5, 1e6):
-        dev = engine(enob=11, mask=hz, overlap=True)
-        k, conv, rew, t_opt = CostModel(CIRC, dev).optical_terms([2048], 2048)
-        mask[hz] = {"rewrites": rew, "t_mask_ms": 1e3 * rew / hz, **step(CIRC, dev),
-                    "run": go(SimConfig(model=CIRC, devices_per_instance=1, prefill_device=dev))}
-    cb = SimConfig(model=CIRC, devices_per_instance=1)
-    static = {w: go(replace(cb, prefill_device=engine(enob=11, mask=20000.0, overlap=True, static=w)))
-              for w in (0.0, 10.0, 20.0, 50.0, 100.0, 200.0)}
-    out["sweeps"] = {"shares": shares, "enob": enob, "mask": mask, "static": static,
-                     "gpu_ref": {"r1": go(cb), "r16": go(replace(cb, device=gpu(R16)))}}
-
-    # 13. break-even, by bisection on the simulator (as search.py does for load)
-    def bisect(f, lo, hi, iters=40, log=False):
-        """Largest x in [lo, hi] with f(x) true, f monotone (true then false)."""
-        import math as _m
-        for _ in range(iters):
-            mid = _m.sqrt(lo * hi) if log else (lo + hi) / 2
-            lo, hi = (mid, hi) if f(mid) else (lo, mid)
-        return lo
-
-    be = {}
-    for rlabel, r in [("GPU FFT at 1x", 1.0), ("GPU FFT at 1/4", 0.25), ("GPU FFT at 1/16", R16)]:
-        ref = go(replace(cb, device=gpu(r)))
-        opt = lambda **kw: go(replace(cb, device=gpu(r), prefill_device=engine(**{"enob": 11, "mask": 20000.0,
-                                                                                  "overlap": True, **kw})))
-        row = {"gpu": ref, "optical": opt()}
-        cheaper = lambda w: opt(static=w)["j_tok"] <= ref["j_tok"]
-        row["static_w"] = (None if not cheaper(0.0) else (">1000" if cheaper(1000.0) else bisect(cheaper, 0.0, 1000.0, 20)))
-        faster = lambda e: opt(enob=e)["ttft_p99"] <= ref["ttft_p99"]
-        row["enob"] = next((e for e in range(6, 17) if faster(e)), None)
-        fmask = lambda hz: opt(mask=hz)["ttft_p99"] <= ref["ttft_p99"]
-        row["mask_hz"] = (None if not fmask(1e9) else bisect(lambda hz: not fmask(hz), 1.0, 1e9, 30, log=True))
-        be[rlabel] = row
-    # optical wins at low GPU FFT efficiency r and loses at high r: the largest r where it still wins
-    fr = lambda r: go(replace(cb, device=gpu(r), prefill_device=OPTIMISTIC))["ttft_p99"] <= go(replace(cb, device=gpu(r)))["ttft_p99"]
-    out["breakeven"] = {"rows": be, "gpu_fft_eff": (None if not fr(1 / 64) else (">=1" if fr(1.0) else bisect(fr, 1 / 64, 1.0, 20, log=True)))}
-
-    # 14. the KV hand-off: link x what is handed off
-    out["links"] = {h: {lk: go(SimConfig(model=model(key), devices_per_instance=1, link=LINKS[lk])) for lk in LINK_KEYS}
-                    for h, key in HANDOFFS}
+    # 14. the KV hand-off: which link
+    out["links"] = {lk: go(SimConfig(model=L8, devices_per_instance=1, link=LINKS[lk])) for lk in LINK_KEYS}
     out["link_specs"] = {k: {"name": LINKS[k].name, "GBps": LINKS[k].bandwidth / 1e9, "us": LINKS[k].latency * 1e6,
                              "pj": LINKS[k].pj_per_bit} for k in LINK_KEYS}
-    out["handoff_MB"] = {h: MODELS[key].handoff_bytes(2048) / 1e6 for h, key in HANDOFFS}
+    out["handoff_MB"] = L8.handoff_bytes(2048) / 1e6
 
-    # 15. compute in transit vs the same compression at the GPU
-    cit = {}
-    for h, key in HANDOFFS:
-        for lk in LINK_KEYS:
-            for pr in PRESETS:
-                if pr == "freq-keep-k" and key.endswith("dist"):
-                    continue                       # a recurrence state has no token axis to transform
-                for where in ("transit", "endpoint"):
-                    cfg = SimConfig(model=model(key), devices_per_instance=1, link=LINKS[lk],
-                                    kv_transit=KVTransit(KV_PRESETS[pr], where=where))
-                    cit[f"{h}|{lk}|{pr}|{where}"] = go(cfg)
-    out["transit"] = cit
-    # load sweep where the GQA KV hand-off saturates 25 GbE (one transfer of a 2,048-token prompt: 86 ms)
-    sweep = {}
-    for rate in TRANSIT_RATES:
-        for pr in PRESETS:
-            for where in ("transit", "endpoint"):
-                if pr == "none" and where == "endpoint":
-                    continue
-                cfg = SimConfig(model=L8, devices_per_instance=1, link=LINKS["eth-25g"],
-                                kv_transit=None if pr == "none" else KVTransit(KV_PRESETS[pr], where=where))
-                sweep[f"{rate}|{pr}|{where}"] = go(cfg, rate)
-    out["transit_sweep"] = sweep
-    out["presets"] = {k: {"ratio": v.ratio, "ops": v.ops_per_value, "fft": v.fft} for k, v in KV_PRESETS.items()}
-    tr = KVTransit(KV_PRESETS["none"])
-    out["transit_stage"] = {"ops_per_byte": tr.ops_per_byte, "pj_per_bit": tr.pj_per_bit, "latency_us": tr.latency * 1e6}
-    out["areas"] = {d.name: device_area(d) for d in (H100_SXM, A100_SXM, OPTICAL_FFT)}
+    # 15. compressing the hand-off on the prefill GPU, per link and over a load sweep on 25 GbE
+    out["compress"] = {f"{lk}|{pr}": go(SimConfig(model=L8, devices_per_instance=1, link=LINKS[lk],
+                                                  kv_compression=KV_PRESETS[pr]))
+                       for lk in LINK_KEYS for pr in PRESETS}
+    out["compress_sweep"] = {f"{rate}|{pr}": go(SimConfig(model=L8, devices_per_instance=1, link=LINKS["eth-25g"],
+                                                          kv_compression=None if pr == "none" else KV_PRESETS[pr]), rate)
+                             for rate in COMPRESS_RATES for pr in PRESETS}
+    out["presets"] = {k: {"ratio": v.ratio, "ops": v.ops_per_value} for k, v in KV_PRESETS.items()}
     for sec in out.values():                       # drop per-request stamps before rendering
         _strip(sec)
     return out
@@ -563,7 +441,7 @@ def _strip(x):
             _strip(v)
 
 
-def render_optical(o: dict) -> str:
+def render_pools(o: dict) -> str:
     L: list[str] = []
     p = L.append
     ms2 = lambda x: f"{1e3 * x:,.1f} ms" if x < 10 else f"{x:,.1f} s"
@@ -575,9 +453,9 @@ def render_optical(o: dict) -> str:
         return [ms2(r["ttft_p99"]), ms(r["tpot_p99"]), f"{r['goodput']:.2f}", pp(r["slo"]), f"{r['j_tok']:.3f}",
                 f"{r['avg_w']:,.0f} W"]
 
-    common = (f"Workload for sections 10-15: Llama-3-8B shape, 1 device per instance, 1 prefill + 1 decode instance unless"
-              f" stated, Poisson arrivals at {OPT_RATE:g} req/s, {OPT_N} requests, prompts 2,048 tokens (cv 0.5), outputs 256"
-              " (cv 0.5), seed 1, InfiniBand NDR unless stated; SLOs TTFT 1 s and TPOT 25 ms. Exact fast path on.")
+    common = (f"Workload for sections 10, 14 and 15: Llama-3-8B shape, 1 device per instance, 1 prefill + 1 decode instance"
+              f" unless stated, Poisson arrivals at {OPT_RATE:g} req/s, {OPT_N} requests, prompts 2,048 tokens (cv 0.5),"
+              " outputs 256 (cv 0.5), seed 1, InfiniBand NDR unless stated; SLOs TTFT 1 s and TPOT 25 ms. Exact fast path on.")
 
     # 10
     p("## 10. Heterogeneous pools (the Splitwise idea, arXiv:2311.18677)")
@@ -591,177 +469,73 @@ def render_optical(o: dict) -> str:
     p(f"* Setting `--prefill-device h100 --decode-device h100` explicitly reproduces the `--device h100` run"
       f" bit-identically (every request's timestamps and every summary number): {h['identical']}.")
     p("")
-    rows = [[k, f"{v['die_mm2']:,.0f}", f"{v['photonic_mm2']:,.0f}", f"{v['total_mm2']:,.0f}", f"${v['usd']:,.0f}"]
-            for k, v in o["areas"].items()]
-    table(L, ["Device", "Digital die mm²", "Photonic die mm²", "Total mm²", "Silicon $ per good device"], rows)
+    rows = [[k, f"{v['die_mm2']:,.0f}", f"${v['usd']:,.0f}"] for k, v in o["areas"].items()]
+    table(L, ["Device", "Die mm²", "Silicon $ per good device"], rows)
     p("* Silicon $ = GPU dies only (GH100 814 mm², GA100 826 mm², NVIDIA's architecture posts), Murphy yield at"
       " D0 = 0.1/cm², $10,000 per wafer: brief 03's illustrative method, not a price.")
     p("")
-
-    # 11
-    p("## 11. All-GPU baselines against an optical prefill pool")
-    p("")
-    p("Optical prefill = `optical-fft` (a Fourier-optical transform engine co-packaged with an H100-class part) in"
-      " the prefill pool, H100 decode. *Defaults*: ENOB 8, 8-bit DMD mask at 1,031 Hz, coherent detection, optical and"
-      " digital time added, 20 W of lasers and tuning per device. *Optimistic*: ENOB 11 (one pass for BF16), 20 kHz"
-      " mask (the 1-bit DMD rate), times overlapped. *GPU FFT at 1/16*: the GPU runs FFT and Fourier-domain work at"
-      " 1/16 of its matmul rate (illustrative, FOptInf A§3). All coefficients are illustrative.")
-    p("")
-    for model_label, cfgs in o["baselines"].items():
-        p(f"**{model_label}**")
-        p("")
-        rows = [[k] + latrow(r) + [pp(r["optical_bound"]), f"{r['tok_j']:.2f}", kusd(r["tok_s_kusd"])]
-                for k, r in cfgs.items()]
-        table(L, ["Configuration", "TTFT p99", "TPOT p99", "Goodput (req/s)", "SLO met", "J / token", "Avg power",
-                  "Prefill optical-bound", "tok/J", "tok/s per $1000"], rows)
-
-    # 12
-    s = o["sweeps"]
-    p("## 12. Sweeps: transform share, ENOB, mask rate and static power")
-    p("")
-    p("One 2,048-token prefill step (closed form). Optical share = FFT plus Fourier-plane FLOPs over all FLOPs"
-      " (FOptInf A§2).")
-    p("")
-    rows = [[k, pp(v["share"]), f"{v['gflop']:,.1f}", f"{v['gpu']['ms']:.2f} ms", f"{v['gpu16']['ms']:.2f} ms",
-             f"{v['default']['ms']:,.1f} ms", f"{v['optimistic']['ms']:.2f} ms", f"{v['mask_values']:,}"]
-            for k, v in s["shares"].items()]
-    table(L, ["Variant", "Optical share", "GFLOP", "H100", "H100 FFT at 1/16", "optical-fft defaults",
-              "optical-fft optimistic", "Mask values"], rows)
-    p("ENOB (circulant 256, last-token head; 20 kHz mask, overlapped). Passes = 4^(11 - ENOB) for BF16; conversion"
-      " energy per pair = Walden FoM x 2^ENOB (10 + 20 fJ):")
-    p("")
-    rows = [[e, f"{v['passes']:,}", f"{v['conversions']:,}", f"{v['pj_pair']:.2f}", f"{v['t_opt_ms']:,.2f} ms",
-             f"{v['ms']:,.2f} ms", f"{v['opt_j']:.3f} J"] for e, v in s["enob"].items()]
-    table(L, ["ENOB", "Passes", "Conversion pairs", "pJ per pair", "Optical time", "Step time", "Conversion energy"], rows)
-    p("Mask rewrite rate (same model, ENOB 11, overlapped). 30 Hz is a liquid-crystal SLM, 1,031 Hz an 8-bit DMD,"
-      " 20 kHz a 1-bit DMD (Miscuglio et al., Optica 2020); 100 kHz and 1 MHz are hypothetical:")
-    p("")
-    rows = [[f"{float(hz):,.0f} Hz", f"{v['rewrites']:,}", f"{v['t_mask_ms']:,.2f} ms", f"{v['ms']:,.2f} ms",
-             ms2(v["run"]["ttft_p99"]), pp(v["run"]["slo"])] for hz, v in s["mask"].items()]
-    table(L, ["Mask rate", "Rewrites per step", "Mask time", "Step time", "TTFT p99 (full run)", "SLO met"], rows)
-    g1, g16 = s["gpu_ref"]["r1"], s["gpu_ref"]["r16"]
-    p(f"Static power of the engine (lasers + tuning per device; optimistic engine; full runs). All-GPU 1P1D for"
-      f" comparison: {g1['j_tok']:.3f} J/token (GPU FFT at 1x), {g16['j_tok']:.3f} J/token (at 1/16).")
-    p("")
-    rows = [[f"{float(w):g} W", f"{r['j_tok']:.3f}", pp(r["breakdown"].get("optical_static", 0.0)),
-             pp(r["breakdown"].get("optical_conversions", 0.0)), ms2(r["ttft_p99"])] for w, r in s["static"].items()]
-    table(L, ["Lasers + tuning", "J / token", "Optical static share", "Conversion share", "TTFT p99"], rows)
-
-    # 13
-    b = o["breakeven"]
-    p("## 13. Break-even: where an optical prefill pool stops paying")
-    p("")
-    p("Circulant 256 with the last-token LM head (the most transform-heavy variant), optimistic engine unless the"
-      " row varies it. Each break-even point is found by bisection on full simulator runs (the J/token and TTFT p99"
-      " of the whole cluster). *Never* = the optical pool is worse at every value tried: static power 0-1,000 W,"
-      " ENOB 6-16, mask rate 1 Hz-1 GHz.")
-    p("")
-    f = lambda x, unit, fmt: "never" if x is None else (x if isinstance(x, str) else f"{x:{fmt}} {unit}")
-    rows = []
-    for k, r in b["rows"].items():
-        rows.append([k, ms2(r["gpu"]["ttft_p99"]), ms2(r["optical"]["ttft_p99"]), f"{r['gpu']['j_tok']:.3f}",
-                     f"{r['optical']['j_tok']:.3f}", f(r["static_w"], "W", ".1f"),
-                     "never" if r["enob"] is None else f"ENOB {r['enob']}", f(r["mask_hz"], "Hz", ",.0f")])
-    table(L, ["GPU baseline", "GPU TTFT p99", "Optical TTFT p99", "GPU J/token", "Optical J/token",
-              "Static power at equal J/token", "Lowest ENOB with TTFT p99 <= GPU", "Mask rate at equal TTFT p99"], rows)
-    ge = b["gpu_fft_eff"]
-    p(f"* GPU FFT efficiency below which the optimistic optical pool wins TTFT p99: "
-      + ("none in [1/64, 1]" if ge is None else (f"{ge}" if isinstance(ge, str) else f"{ge:.3f} (1/{1 / ge:.1f})")) + ".")
+    p("Sections 11-13 were retired on 2026-10-29; the other sections keep their numbers.")
     p("")
 
     # 14
-    p("## 14. The KV hand-off: which link, and what is handed off")
+    p("## 14. The KV hand-off: which link")
     p("")
-    p("Photonic interconnect is *not* Fourier optics: `cpo-optical` is an illustrative co-packaged-optics link (round"
-      " numbers; optical I/O chiplets reach multi-Tb/s, Wade et al., IEEE Micro 2020). Hand-off for a 2,048-token"
-      " prompt: " + "; ".join(f"{h} {mb:,.1f} MB" for h, mb in o["handoff_MB"].items()) + ". All-H100 pools.")
+    p("`cpo-optical` is an illustrative co-packaged-optics switch link (round numbers; optical I/O chiplets reach"
+      f" multi-Tb/s, Wade et al., IEEE Micro 2020). Hand-off for a 2,048-token prompt: {o['handoff_MB']:,.1f} MB of"
+      " GQA KV cache. All-H100 pools.")
     p("")
     rows = [[k, v["name"], f"{v['GBps']:,.1f}", f"{v['us']:g}", f"{v['pj']:g}"] for k, v in o["link_specs"].items()]
     table(L, ["Link", "Name", "GB/s", "Latency (us)", "pJ/bit"], rows)
-    for hlabel, links in o["links"].items():
-        p(f"**{hlabel}**")
-        p("")
-        rows = [[lk, pp(r["kv_share"]), pp(r["link_util"]), ms2(r["ttft_p99"]), ms(r["tpot_p99"]), pp(r["slo"]),
-                 f"{r['link_j_req']:.3f}", f"{r['j_tok']:.3f}"] for lk, r in links.items()]
-        table(L, ["Link", "KV wait + transfer share of E2E", "Link busy", "TTFT p99", "TPOT p99", "SLO met",
-                  "Link J / request", "J / token"], rows)
+    rows = [[lk, pp(r["kv_share"]), pp(r["link_util"]), ms2(r["ttft_p99"]), ms(r["tpot_p99"]), pp(r["slo"]),
+             f"{r['link_j_req']:.3f}", f"{r['j_tok']:.3f}"] for lk, r in o["links"].items()]
+    table(L, ["Link", "KV wait + transfer share of E2E", "Link busy", "TTFT p99", "TPOT p99", "SLO met",
+              "Link J / request", "J / token"], rows)
 
     # 15
-    st = o["transit_stage"]
-    p("## 15. Compute in the transport: compressing the hand-off in transit or at the GPU")
+    p("## 15. Compressing the hand-off on the prefill GPU")
     p("")
-    p(f"An in-transit stage compresses the hand-off as it crosses the link: no GPU time, {st['pj_per_bit']:g} pJ per input"
-      f" bit, {st['latency_us']:g} us added, and a compute budget of {st['ops_per_byte']:g} operations per line byte"
-      " (illustrative, representative of published 2026 compute-in-transit prototypes; the mapping to KV hand-off is"
-      " speculation). Its transforms are passive (an optical FFT costs no budget). If its work does not fit the"
-      " budget, its compute time sets the transfer time (*transit-bound*). *Endpoint* = the same compression on the"
-      " prefill GPU: an elementwise pass (read the KV, write the compressed copy, plus the FLOPs, FFT included).")
+    p("The prefill GPU compresses each request's KV before it is sent: an elementwise pass after the prefill step (read"
+      " the KV, write the compressed copy, plus the FLOPs), with its own roofline time and energy. The link carries the"
+      " compressed bytes.")
     p("")
-    rows = [[k, f"{v['ratio']:.3f}", f"{v['ops']:g}", "yes" if v["fft"] else "no"] for k, v in o["presets"].items()]
-    table(L, ["Preset", "Compression ratio", "Ops per value (besides any FFT)", "FFT along tokens"], rows)
+    rows = [[k, f"{v['ratio']:.3f}", f"{v['ops']:g}"] for k, v in o["presets"].items()]
+    table(L, ["Preset", "Compression ratio", "Ops per value"], rows)
     p("Bit widths: 8- and 4-bit KV are within what independent KV-quantisation work reports as tolerable (KIVI,"
-      " arXiv:2402.02750, 2-bit; KVQuant, arXiv:2401.18079, 3-bit with < 0.1 perplexity loss); keeping half the"
-      " frequency components is FreqKV's default (arXiv:2505.00570, which fine-tunes lightly). The simulator does not"
+      " arXiv:2402.02750, 2-bit; KVQuant, arXiv:2401.18079, 3-bit with < 0.1 perplexity loss). The simulator does not"
       " model accuracy, nor the decode side's handling of compressed KV.")
     p("")
-    cit = o["transit"]
     p("Hand-off p99 = first token to the KV landing on the decode pool (queueing for the link plus the transfer), the"
       " 99th percentile over all requests. TTFT does not include it (the first token leaves the prefill pool); TPOT does"
       " (DistServe's definition), so TPOT and SLO are where compressing the hand-off can show.")
     p("")
-    for hlabel, _ in HANDOFFS:
-        p(f"**{hlabel}**")
-        p("")
-        rows = []
-        for lk in LINK_KEYS:
-            for pr in PRESETS:
-                t, e = cit.get(f"{hlabel}|{lk}|{pr}|transit"), cit.get(f"{hlabel}|{lk}|{pr}|endpoint")
-                if t is None:
-                    continue
-                rows.append([lk, pr, ms2(t["handoff_p99"]), ms2(e["handoff_p99"]), ms(t["tpot_p99"]), ms(e["tpot_p99"]),
-                             pp(t["slo"]), pp(e["slo"]), f"{t['j_tok']:.3f}", f"{e['j_tok']:.3f}", pp(t["transit_bound"])])
-        table(L, ["Link", "Preset", "Hand-off p99 in transit", "Hand-off p99 at GPU", "TPOT p99 in transit",
-                  "TPOT p99 at GPU", "SLO in transit", "SLO at GPU", "J/token in transit", "J/token at GPU",
-                  "Transit-bound transfers"], rows)
-    sw = o["transit_sweep"]
+    c = o["compress"]
+    rows = [[lk, pr, ms2(c[f"{lk}|{pr}"]["handoff_p99"]), ms(c[f"{lk}|{pr}"]["tpot_p99"]), pp(c[f"{lk}|{pr}"]["slo"]),
+             f"{c[f'{lk}|{pr}']['j_tok']:.3f}"] for lk in LINK_KEYS for pr in PRESETS]
+    table(L, ["Link", "Preset", "Hand-off p99", "TPOT p99", "SLO met", "J/token"], rows)
+    sw = o["compress_sweep"]
     p("**Load sweep: GQA KV over 25 GbE** (the link saturates near 11.6 req/s uncompressed: 268.4 MB per 2,048-token"
       " prompt at 3.125 GB/s). Same workload otherwise.")
     p("")
-    rows = []
-    for rate in TRANSIT_RATES:
-        for pr in PRESETS:
-            t = sw.get(f"{rate}|{pr}|transit")
-            e = sw.get(f"{rate}|{pr}|endpoint", t)
-            rows.append([f"{rate} req/s", pr, pp(t["link_util"]), ms2(t["handoff_p99"]), ms2(e["handoff_p99"]),
-                         ms(t["tpot_p99"]), ms(e["tpot_p99"]), pp(t["slo"]), pp(e["slo"]), f"{t['j_tok']:.3f}",
-                         f"{e['j_tok']:.3f}", pp(t["transit_bound"])])
-    table(L, ["Load", "Preset", "Link busy (transit)", "Hand-off p99 in transit", "Hand-off p99 at GPU",
-              "TPOT p99 in transit", "TPOT p99 at GPU", "SLO in transit", "SLO at GPU", "J/token in transit",
-              "J/token at GPU", "Transit-bound transfers"], rows)
+    rows = [[f"{rate} req/s", pr, pp(r["link_util"]), ms2(r["handoff_p99"]), ms(r["tpot_p99"]), pp(r["slo"]),
+             f"{r['j_tok']:.3f}"] for rate in COMPRESS_RATES for pr in PRESETS for r in [sw[f"{rate}|{pr}"]]]
+    table(L, ["Load", "Preset", "Link busy", "Hand-off p99", "TPOT p99", "SLO met", "J/token"], rows)
     # headline: the transport-bound regime
-    p("Where serving is transport-bound (the uncompressed hand-off is at least 10% of end-to-end time), the most"
-      " in-transit compression buys and the same compression at the GPU:")
+    p("Where serving is transport-bound (the uncompressed hand-off is at least 10% of end-to-end time), what the best"
+      " preset buys:")
     p("")
     rows = []
-    cases = [(hlabel, lk, OPT_RATE, o["links"][hlabel][lk], lambda pr, w, h=hlabel, l=lk: cit.get(f"{h}|{l}|{pr}|{w}"))
-             for hlabel, _ in HANDOFFS for lk in LINK_KEYS]
-    cases += [("GQA KV cache", "eth-25g", rate, sw[f"{rate}|none|transit"],
-               lambda pr, w, r=rate: sw.get(f"{r}|{pr}|{w}")) for rate in TRANSIT_RATES]
-    seen = set()
-    for hlabel, lk, rate, none, get in cases:
-        if none["kv_share"] < 0.10 or (hlabel, lk, rate) in seen:
+    cases = [(lk, OPT_RATE, c[f"{lk}|none"], lambda pr, l=lk: c[f"{l}|{pr}"]) for lk in LINK_KEYS]
+    cases += [("eth-25g", rate, sw[f"{rate}|none"], lambda pr, r=rate: sw[f"{r}|{pr}"]) for rate in COMPRESS_RATES]
+    for lk, rate, none, get in cases:
+        if none["kv_share"] < 0.10:
             continue
-        seen.add((hlabel, lk, rate))
-        best = min((x for x in PRESETS if x != "none" and get(x, "transit") is not None),
-                   key=lambda x: get(x, "transit")["handoff_p99"])
-        t, e = get(best, "transit"), get(best, "endpoint")
-        rows.append([hlabel, lk, f"{rate:g} req/s", pp(none["kv_share"]), best, ms2(none["handoff_p99"]),
-                     ms2(t["handoff_p99"]), ms2(e["handoff_p99"]), f"{none['handoff_p99'] / t['handoff_p99']:.1f}x",
-                     ms(none["tpot_p99"]), ms(t["tpot_p99"]), ms(e["tpot_p99"]), pp(none["slo"]), pp(t["slo"]),
-                     pp(e["slo"])])
-    table(L, ["Hand-off", "Link", "Load", "Hand-off share uncompressed", "Best preset in transit",
-              "Hand-off p99 uncompressed", "in transit", "at GPU", "Hand-off gain in transit",
-              "TPOT p99 uncompressed", "in transit", "at GPU", "SLO uncompressed", "SLO in transit", "SLO at GPU"], rows)
+        best = min((x for x in PRESETS if x != "none"), key=lambda x: get(x)["handoff_p99"])
+        b = get(best)
+        rows.append([lk, f"{rate:g} req/s", pp(none["kv_share"]), best, ms2(none["handoff_p99"]), ms2(b["handoff_p99"]),
+                     f"{none['handoff_p99'] / b['handoff_p99']:.1f}x", ms(none["tpot_p99"]), ms(b["tpot_p99"]),
+                     pp(none["slo"]), pp(b["slo"])])
+    table(L, ["Link", "Load", "Hand-off share uncompressed", "Best preset", "Hand-off p99 uncompressed", "compressed",
+              "Hand-off gain", "TPOT p99 uncompressed", "compressed", "SLO uncompressed", "SLO compressed"], rows)
     return "\n".join(L) + "\n"
 
 
@@ -1349,7 +1123,7 @@ def collect_levers2() -> dict:
     """Sections 23-25: the levers in disaggregated pools, parallelism / MoE / formats, speculative decoding."""
     from dataclasses import replace
     from disagg_sim.hardware import (A100_40G, A100_SXM, ACCELERATORS, H100_SXM, KV_PRESETS, LINKS, MODELS,
-                                     CostModel, KVTransit, Parallel, QUANT_FORMATS)
+                                     CostModel, Parallel, QUANT_FORMATS)
     from disagg_sim.metrics import summarise
     from disagg_sim.sim import SimConfig, Simulation, simulate
     from disagg_sim.speculative import (Speculative, expected_operations, expected_speedup, expected_tokens)
@@ -1417,15 +1191,11 @@ def collect_levers2() -> dict:
                       ("H100 prefill, A100 decode, reserved", dict(decode_device=A100_SXM, max_num_batched_tokens=8192)),
                       ("H100 prefill, A100 decode, paged", dict(decode_device=A100_SXM, kv_policy="paged")),
                       ("25 GbE link, reserved", dict(link=LINKS["eth-25g"], max_num_batched_tokens=8192)),
-                      ("25 GbE link, fp8 in transit, paged", dict(link=LINKS["eth-25g"], kv_policy="paged",
-                                                                  kv_transit=KVTransit(KV_PRESETS["fp8"]))),
                       ("25 GbE link, fp8 at the GPU, paged", dict(link=LINKS["eth-25g"], kv_policy="paged",
-                                                                  kv_transit=KVTransit(KV_PRESETS["fp8"], where="endpoint")))):
+                                                                  kv_compression=KV_PRESETS["fp8"]))):
         inter[label] = row(replace(base8, **kw), wl8(2.0 if "25 GbE" in label else 4.0))
     rejected = {}
     for label, kw in (("CED model (llama3-70b-ced)", dict(model=MODELS["llama3-70b-ced"], devices_per_instance=4)),
-                      ("Optical prefill pool (Hyena model on optical-fft)", dict(model=MODELS["llama3-8b-hyena"],
-                                                                                prefill_device=ACCELERATORS["optical-fft"])),
                       ("Prefix caching + swap preemption", dict(prefix_caching=True, preemption="swap")),
                       ("fast_forward decode", dict(fast_forward=True))):
         try:
@@ -1434,7 +1204,7 @@ def collect_levers2() -> dict:
         except ValueError as e:
             rejected[label] = str(e)
     try:
-        Simulation(replace(base8, speculative=Speculative(), kv_transit=KVTransit(KV_PRESETS["fp8"])), wl8()[:5])
+        Simulation(replace(base8, speculative=Speculative(), kv_compression=KV_PRESETS["fp8"]), wl8()[:5])
         rejected["Speculative decoding + hand-off compression"] = "runs"
     except ValueError as e:
         rejected["Speculative decoding + hand-off compression"] = str(e)
@@ -1606,9 +1376,8 @@ def render_levers2(v: dict) -> str:
     for k, e in v["rejected"].items():
         p(f"- {k}: \"{e}\"")
     p("")
-    p("So heterogeneous pools and in-transit or endpoint hand-off compression combine with the levers. The CED option"
-      " and the FFT-mixing models (the only ones an optical prefill pool speeds up) do not: the levers are modelled for"
-      " attention models without CED.")
+    p("So heterogeneous pools and hand-off compression on the prefill GPU combine with the levers. The CED option does"
+      " not: the levers are modelled for models without CED.")
     p("")
 
     p("## 24. Parallelism, mixture of experts and storage formats")
@@ -1836,214 +1605,6 @@ def render_tradeoffs(t: dict) -> str:
     return "\n".join(L) + "\n"
 
 
-# ───────────────────────── section 27: the link kernel (Compute in Transit brief 06C) ──
-# A declared in-transit stage (``LinkKernel``), calibrated illustratively to a photonic link module (Kundu et al.,
-# arXiv:2608.21536) with the Compute in Transit hub's definitions (analysis/cit_budget.py). Off by default: nothing
-# in sections 1-26 uses it.
-LK_RATE, LK_N = 8.0, 800             # section 15's workload: Llama-3-8B shape, 1 device per instance, 1P1D
-LK_PRESETS = ["pluggable-10", "pluggable-99", "pluggable-10-free", "pluggable-99-free"]
-LK_LINKS = ["eth-25g", "eth-100g", "ib-ndr"]
-LK_PROMPT = 2048
-
-
-def collect_link_kernel() -> dict:
-    from disagg_sim.hardware import (CIT_LEDGER, KV_PRESETS, LINK_KERNELS, LINKS, MODELS, KVTransit, kv_work)
-    from disagg_sim.metrics import percentile, summarise
-    from disagg_sim.sim import SimConfig, simulate
-    from disagg_sim.workload import LengthDist, poisson_workload
-
-    out: dict = {"presets": {}, "ledger": [], "refused_kv": {}, "stream": {}, "runs": {}}
-    for key, k in LINK_KERNELS.items():
-        out["presets"][key] = {"name": k.name, "placement": k.placement, "gflops": k.gflops,
-                               "charged": k.transform_charged, "port": k.budget, "optics": k.optics_budget,
-                               "port_GBps": k.port_rate / 1e9, "optics_GBps": k.optics_rate / 1e9, "planes": k.planes,
-                               "static_w": k.static_w, "laser_w": k.laser_w, "pj": k.pj_per_bit,
-                               "fpga_ops": k.fpga_ops_per_s, "latency_us": k.latency * 1e6}
-    low, high, sw = LINK_KERNELS["pluggable-10"], LINK_KERNELS["pluggable-99"], LINK_KERNELS["switch-10"]
-    free = LINK_KERNELS["pluggable-10-free"]
-    for w in CIT_LEDGER:
-        refusal = {}
-        for k in (low, sw):
-            try:
-                k.check(w)
-                refusal[k.placement] = None
-            except ValueError as e:
-                refusal[k.placement] = str(e)
-        out["ledger"].append({"kernel": w.name, "transform": w.transform_per_byte, "other": w.other_per_byte,
-                              "needs": sorted(w.needs()), "streams": w.streams, "refused": refusal,
-                              "fits_low": low.fits(w), "fits_high": high.fits(w), "fits_free_low": free.fits(w)})
-    for pr in ("fp8", "fp4-block"):
-        try:
-            KVTransit(KV_PRESETS[pr], kernel=low)
-            out["refused_kv"][pr] = None
-        except ValueError as e:
-            out["refused_kv"][pr] = str(e)
-
-    # one 2,048-token GQA hand-off, stage by stage
-    m = MODELS["llama3-8b"]
-    nb = m.handoff_bytes(LK_PROMPT)
-    c = KV_PRESETS["freq-keep-k"]
-    out["handoff_MB"] = nb / 1e6
-    out["fft_per_byte"] = kv_work(c, LK_PROMPT).transform_per_byte
-    legacy = KVTransit(c)
-    for lk in LK_LINKS:
-        link = LINKS[lk]
-        wire = nb / c.ratio
-        t_wire = wire / link.bandwidth
-        t_ops = legacy.ops(nb, LK_PROMPT, m.kv_bytes, False) / (legacy.ops_per_byte * link.bandwidth)
-        out["stream"][f"{lk}|legacy"] = {"t": link.latency + legacy.latency + max(t_wire, t_ops),
-                                         "stages": {"link": t_wire, "section 15 stage": t_ops},
-                                         "binding": "link" if t_ops <= t_wire else "section 15 stage",
-                                         "energy": {"dynamic": nb * 8 * legacy.pj_per_bit * 1e-12}}
-        for key in LK_PRESETS:
-            k = LINK_KERNELS[key]
-            t, stage, st = k.stream(nb, kv_work(c, LK_PROMPT, k.planes), link)
-            out["stream"][f"{lk}|{key}"] = {"t": t, "stages": st, "binding": stage, "energy": k.energy(nb, st[stage])}
-
-    def go(tr, lk):
-        wl = poisson_workload(LK_RATE, LK_N, LengthDist(2048, 0.5), LengthDist(256, 0.5), seed=1)
-        cfg = SimConfig(model=m, devices_per_instance=1, link=LINKS[lk], kv_transit=tr, fast_forward=True)
-        res = simulate(cfg, wl)
-        s = summarise(res)
-        t = s["kv_link"].get("transit", {})
-        return {"ttft_p99": s["latency_s"]["ttft"]["p99"], "tpot_p99": s["latency_s"]["tpot"]["p99"],
-                "slo": s["throughput"]["slo_attainment"], "j_tok": s["energy"]["J_per_output_token"],
-                "link_util": s["utilisation"].get("kv-link", 0.0),
-                "handoff_p99": percentile([r.kv_ready - r.first_token for r in res.requests
-                                           if r.kv_ready is not None], 99),
-                "transit_j_req": res.link.transit_j / max(1, res.link.transfers),
-                "transit_bound": t.get("transit_bound_frac", 0.0),
-                "binding": t.get("kernel", {}).get("binding_stages", {})}
-
-    for lk in LK_LINKS:
-        out["runs"][f"{lk}|none"] = go(None, lk)
-        out["runs"][f"{lk}|legacy"] = go(KVTransit(c), lk)
-        for key in LK_PRESETS:
-            out["runs"][f"{lk}|{key}"] = go(KVTransit(c, kernel=LINK_KERNELS[key]), lk)
-    return out
-
-
-def render_link_kernel(v: dict) -> str:
-    L: list[str] = []
-    p = L.append
-    pr = v["presets"]
-    d = pr["pluggable-10"]
-    p("## 27. A general link kernel: compute in transit as a declared stage (illustrative)")
-    p("")
-    p("Brief 06C (Compute in Transit). `LinkKernel` (`disagg_sim.hardware`) generalises section 15's in-transit stage:"
-      " it declares an operation set, a precision (bits per value through the optics, one pass per bit plane), the"
-      " work's compression ratio, a placement (`pluggable` in a host's port, or `switch`) and pipelined stages: the"
-      " link, the module's port, its optics, its compute budget and an FPGA stage. The slowest stage sets the"
-      " transfer time and is reported as the *binding* stage. Energy while streaming is (static + laser) power x"
-      " streaming time + dynamic pJ per input bit. It is off by default (`KVTransit.kernel = None`): sections 1-26"
-      " do not use it, and it is Python only (the JavaScript port does not model it; the Rust port rejects any"
-      " KV hand-off compression).")
-    p("")
-    p(f"Calibration, a photonic link module (Kundu et al., arXiv:2608.21536) with the Compute in Transit hub's"
-      f" definitions (`analysis/cit_budget.py`): port {d['port_GBps']:g} GB/s (QSFP56); optics {d['optics_GBps']:g} GB/s"
-      f" (4 modulators x 14 GBaud NRZ, the series' arithmetic); compute budget 10 or 99 GFLOP/s (the series' reading of"
-      f" the paper's \"tens of GFLOPs\", not a measurement); operations FFT/NTT, add, multiply, MAC, floating-point MAC,"
-      f" modular arithmetic in the FPGA stage, and gathers: no comparisons and no rounding; static {d['static_w']:g} W"
-      f" (the paper); dynamic {d['pj']:g} pJ/bit (the developer's website, a 45 nm estimate excluding the laser)."
-      f" **Illustrative:** laser {d['laser_w']:g} W, FPGA {d['fpga_ops'] / 1e9:g} G operations/s, latency"
-      f" {d['latency_us']:g} us, the FPGA work per value, and the mapping onto a KV hand-off. The transform costs"
-      f" 2.5 log2 n FLOPs per value (FFTW's convention); whether the optics' transform is charged against the budget"
-      f" is not public, so the `-free` presets do not charge it.")
-    p("")
-    p("| Preset | Placement | GFLOP/s | Transform charged | Ops per byte at the port | Ops per byte at the optics |")
-    p("|---|---|---|---|---|---|")
-    for key, x in pr.items():
-        p(f"| `{key}` | {x['placement']} | {x['gflops'] / 1e9:g} | {'yes' if x['charged'] else 'no'} |"
-          f" {x['port']:.2f} | {x['optics']:.2f} |")
-    p("")
-    p("The budget reproduces the hub's results.md section 1 (0.40-3.96 operations per byte at the QSFP56 port,"
-      " 1.43-14.14 at the prototype optics); `tests/test_link_kernel.py` checks every row against the hub's"
-      " results.json.")
-    p("")
-    p("**The hub's kernel ledger as declared work.** Work per input byte (BF16); *refused* = the kernel lacks an"
-      " operation, or (pluggable only) the work combines streams that meet only at a switch. *Fits* = the charged"
-      " work per byte is within the budget at the port.")
-    p("")
-    p("| Kernel | Transform / byte | Other / byte | Pluggable | Switch | Fits 10 GFLOP/s | Fits 99 GFLOP/s |"
-      " Fits 10 GFLOP/s, transform free |")
-    p("|---|---|---|---|---|---|---|---|")
-    yn = lambda b: "yes" if b else "no"
-
-    def why(msg):
-        if msg is None:
-            return "accepted"
-        return "refused: comparisons" if "compare" in msg else ("refused: needs a switch" if "switch" in msg
-                                                                 else "refused")
-    for r in v["ledger"]:
-        p(f"| {r['kernel']} | {r['transform']:.2f} | {r['other']:.2f} | {why(r['refused']['pluggable'])} |"
-          f" {why(r['refused']['switch'])} | {yn(r['fits_low'])} | {yn(r['fits_high'])} | {yn(r['fits_free_low'])} |")
-    p("")
-    p("KV hand-off presets: " + "; ".join(f"`{k}` {'accepted' if m is None else 'refused'}"
-                                           + ("" if m is None else " (needs a block maximum and rounding)")
-                                           for k, m in v["refused_kv"].items())
-      + ". `freq-keep-k` (a transform along the token axis keeping a fixed band, a gather) is the only compressing"
-      " preset the kernel can run.")
-    p("")
-    p(f"**One hand-off, stage by stage.** A {LK_PROMPT:,}-token Llama-3-8B GQA hand-off ({v['handoff_MB']:,.1f} MB),"
-      " `freq-keep-k` (ratio 2), milliseconds per stage, link latency included in the total. *Section 15 stage* = the"
-      " existing in-transit stage (1.6 operations per line byte, passive FFT). Energy in millijoules.")
-    p("")
-    stages = ["link", "module port", "module optics", "module compute", "FPGA"]
-    p("| Link | Stage model | Link | Port | Optics | Compute | FPGA | Binding | Transfer (ms) | Static + laser (mJ) |"
-      " Dynamic (mJ) |")
-    p("|---|---|---|---|---|---|---|---|---|---|---|")
-    for lk in LK_LINKS:
-        for key in ["legacy"] + LK_PRESETS:
-            s = v["stream"][f"{lk}|{key}"]
-            st, e = s["stages"], s["energy"]
-            if key == "legacy":
-                cells = [f"{st['link'] * 1e3:.2f}", "-", "-", f"{st['section 15 stage'] * 1e3:.2f}", "-"]
-                stat = "-"
-            else:
-                cells = [f"{st[x] * 1e3:.2f}" for x in stages]
-                stat = f"{(e['static'] + e['laser']) * 1e3:.1f}"
-            name = "section 15 stage" if key == "legacy" else f"`{key}`"
-            p(f"| {lk} | {name} | " + " | ".join(cells) + f" | {s['binding']} | {s['t'] * 1e3:.2f} | {stat} |"
-              f" {e['dynamic'] * 1e3:.1f} |")
-    p("")
-    p(f"**In the simulator.** Section 15's workload: Llama-3-8B shape, 1 H100 per instance, 1P1D, {LK_N} Poisson"
-      f" requests at {LK_RATE:g}/s, prompts 2,048 (CV 0.5), outputs 256 (CV 0.5), seed 1. Hand-off p99 = first token to"
-      " the KV landing on the decode pool. *Binding* = transfers per binding stage.")
-    p("")
-    p("| Link | Hand-off | Hand-off p99 | TPOT p99 | SLO met | Link busy | Module-bound | Binding | In-transit J /"
-      " request | J / token |")
-    p("|---|---|---|---|---|---|---|---|---|---|")
-    for lk in LK_LINKS:
-        for key in ["none", "legacy"] + LK_PRESETS:
-            r = v["runs"][f"{lk}|{key}"]
-            name = {"none": "uncompressed", "legacy": "section 15 stage"}.get(key, f"`{key}`")
-            bind = ", ".join(f"{s} {n}" for s, n in r["binding"].items()) or "-"
-            p(f"| {lk} | {name} | {ms(r['handoff_p99'])} | {ms(r['tpot_p99'])} | {pct(r['slo'])} |"
-              f" {pct(r['link_util'])} | {pct(r['transit_bound'])} | {bind} | {r['transit_j_req']:.3f} |"
-              f" {r['j_tok']:.3f} |")
-    p("")
-    x = v["fft_per_byte"]
-    p(f"* A transform along a {LK_PROMPT:,}-token axis costs {x:.2f} FLOPs per BF16 byte: {x / pr['pluggable-10']['port']:.1f}x"
-      f" the 10 GFLOP/s budget at the port and {x / pr['pluggable-99']['port']:.1f}x the 99 GFLOP/s one. Charged, the"
-      " module's compute is its slowest stage, and binds unless the link is slower still; free, the optics (one pass"
-      " per bit plane) or the link binds.")
-    faster, slower = [], []
-    for lk in LK_LINKS:
-        base = v["runs"][f"{lk}|none"]["handoff_p99"]
-        key = min(LK_PRESETS, key=lambda k: v["runs"][f"{lk}|{k}"]["handoff_p99"])
-        best = v["runs"][f"{lk}|{key}"]["handoff_p99"]
-        (faster if best < base else slower).append(f"{lk} ({ms(base)} uncompressed, {ms(best)} with `{key}`)")
-    if faster:
-        p("* Hand-off p99 with the best kernel preset is lower than sending uncompressed on " + "; ".join(faster) + ".")
-    if slower:
-        p("* It is higher on " + "; ".join(slower) + ": there the module's own stages are slower than the link it"
-          " would relieve.")
-    p("* Every number in this section comes from the declared model above; the coefficients marked illustrative"
-      " set where each stage binds. *Link busy* includes time the module holds the link. Accuracy is not modelled.")
-    p("")
-    return "\n".join(L)
-
-
 def cpu_name() -> str:
     try:
         for line in Path("/proc/cpuinfo").read_text().splitlines():
@@ -2145,16 +1706,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-timings", action="store_true")
     ap.add_argument("--keep-timings", action="store_true", help="reuse section 9 from the current results.md")
-    ap.add_argument("--optical-from-json", action="store_true",
-                    help="render sections 10-15 from examples/results_optical.json instead of rerunning them")
+    ap.add_argument("--pools-from-json", action="store_true",
+                    help="render sections 10, 14 and 15 from examples/results_pools.json instead of rerunning them")
     ap.add_argument("--ced-from-json", action="store_true",
                     help="render sections 16-18 from examples/results_ced.json instead of rerunning them")
     ap.add_argument("--levers-from-json", action="store_true",
                     help="render sections 19-21 from examples/results_levers.json instead of rerunning them")
     ap.add_argument("--levers2-from-json", action="store_true",
                     help="render sections 23-25 from examples/results_levers2.json instead of rerunning them")
-    ap.add_argument("--link-kernel-from-json", action="store_true",
-                    help="render section 27 from examples/results_link_kernel.json instead of rerunning it")
     a = ap.parse_args()
     sys.path.insert(0, str(ROOT / "src"))
     new = json.loads(json.dumps(collect()))          # same key types as the legacy side
@@ -2166,12 +1725,12 @@ def main():
     elif not a.no_timings:
         timings = subprocess.run([sys.executable, str(ROOT / "examples" / "benchmark_acceleration.py")],
                                  check=True, capture_output=True, text=True).stdout
-    oj = ROOT / "examples" / "results_optical.json"
-    if a.optical_from_json:
-        optical = json.loads(oj.read_text())
+    pj = ROOT / "examples" / "results_pools.json"
+    if a.pools_from_json:
+        pools = json.loads(pj.read_text())
     else:
-        optical = json.loads(json.dumps(collect_optical()))
-        oj.write_text(json.dumps(optical, indent=1))
+        pools = json.loads(json.dumps(collect_pools()))
+        pj.write_text(json.dumps(pools, indent=1))
     cj = ROOT / "examples" / "results_ced.json"
     if a.ced_from_json:
         ced = json.loads(cj.read_text())
@@ -2194,15 +1753,8 @@ def main():
     tj = ROOT / "examples" / "tradeoffs.json"
     if tj.exists():
         tail += "\n" + render_tradeoffs(json.loads(tj.read_text()))
-    kj = ROOT / "examples" / "results_link_kernel.json"
-    if a.link_kernel_from_json:
-        link_kernel = json.loads(kj.read_text())
-    else:
-        link_kernel = json.loads(json.dumps(collect_link_kernel()))
-        kj.write_text(json.dumps(link_kernel, indent=1))
-    tail += render_link_kernel(link_kernel)
     tail += "\n" + render_devices(json.loads(json.dumps(collect_devices())))
-    OUT.write_text(render(new, old, timings) + render_optical(optical) + "\n" + render_ced(ced) + "\n"
+    OUT.write_text(render(new, old, timings) + render_pools(pools) + "\n" + render_ced(ced) + "\n"
                    + render_levers(levers) + tail)
     print(f"wrote {OUT}")
 

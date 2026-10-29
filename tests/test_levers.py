@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 
 from disagg_sim.cli import build_parser, config_from_args, workload_from_args
-from disagg_sim.hardware import (A100_40G, A100_SXM, H100_SXM, LINKS, LLAMA3_8B, LLAMA3_8B_CED, LLAMA3_8B_HYENA,
+from disagg_sim.hardware import (A100_40G, A100_SXM, H100_SXM, LINKS, LLAMA3_8B, LLAMA3_8B_CED,
                                  LLAMA3_70B, MISTRAL_7B, MODELS, OPT_13B, CostModel)
 from disagg_sim.metrics import format_report, summarise
 from disagg_sim.sim import PrefixCache, ScheduledInstance, SimConfig, Simulation, simulate
@@ -301,8 +301,7 @@ def test_reuse_distance_lowers_the_hit_rate_under_lru():
 # ── validation, CLI, I/O ────────────────────────────────────────────────
 @pytest.mark.parametrize("kw, msg", [
     (dict(mode="disagg", batch_policy="chunked", fast_forward=True), "fast_forward"),   # disagg: brief 20A2
-    (dict(model=LLAMA3_8B_HYENA, kv_policy="paged"), "attention models"),
-    (dict(model=LLAMA3_8B_CED, prefix_caching=True), "attention models"),
+    (dict(model=LLAMA3_8B_CED, prefix_caching=True), "without CED"),
     (dict(prefix_caching=True, kv_policy="paged", preemption="swap"), "swap"),
     (dict(batch_policy="sjf"), "batch_policy"),
     (dict(kv_policy="buddy"), "kv_policy"),

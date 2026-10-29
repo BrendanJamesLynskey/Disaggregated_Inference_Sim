@@ -425,24 +425,6 @@
    "flops": 2.125069909753856e+16,
    "out_tokens": 154896
   },
-  "25 GbE link, fp8 in transit, paged": {
-   "ttft_p50": 0.051436817749277,
-   "ttft_p99": 0.26380042460063063,
-   "tpot_p50": 0.00670115381172802,
-   "tpot_p99": 0.007798005494705426,
-   "itl_p99": 0.007002418340306349,
-   "tok_s": 488.34303433156845,
-   "req_s": 1.8916293551734136,
-   "j_tok": 0.8411757130658271,
-   "kv_wait": 0.002018977625179901,
-   "completed": 600,
-   "link_GB": 78.079131648,
-   "mean_running": 3.311654265829986,
-   "preemptions": 0,
-   "computed_prefill_tokens": 1191393,
-   "flops": 2.125069909753856e+16,
-   "out_tokens": 154896
-  },
   "25 GbE link, fp8 at the GPU, paged": {
    "ttft_p50": 0.051568134286597456,
    "ttft_p99": 0.2644113751572885,
@@ -463,8 +445,7 @@
   }
  },
  "rejected": {
-  "CED model (llama3-70b-ced)": "the scheduling levers (batch_policy, max_num_batched_tokens, kv_policy, prefix_caching, speculative) are modelled for attention models without CED only",
-  "Optical prefill pool (Hyena model on optical-fft)": "the scheduling levers (batch_policy, max_num_batched_tokens, kv_policy, prefix_caching, speculative) are modelled for attention models without CED only",
+  "CED model (llama3-70b-ced)": "the scheduling levers (batch_policy, max_num_batched_tokens, kv_policy, prefix_caching, speculative) are modelled for models without CED only",
   "Prefix caching + swap preemption": "prefix caching with swap preemption is not modelled: use preemption='recompute'",
   "fast_forward decode": "fast_forward is the plain decode instance's fast path: not with the scheduling levers",
   "Speculative decoding + hand-off compression": "speculative decoding with KV hand-off compression is not modelled (the draft's KV would cross uncompressed)"
